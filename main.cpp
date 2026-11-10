@@ -1,11 +1,12 @@
 // Mazda 2 Smart Gauge - ESP32 CYD (ESP32-2432S028R), 320x240 landscape
-// OBD-II over ELM327 Bluetooth Classic, demo mode, Thai/English UI.
+// OBD-II over ELM327 (Bluetooth Classic or BLE), demo mode, Thai/English UI.
 #include <Arduino.h>
 #include <SPI.h>
 #include <math.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <BluetoothSerial.h>
+#include <BLEDevice.h>
 #include <Preferences.h>
 #include <string>
 #include "ui_strings.h"
@@ -131,12 +132,13 @@ static float getVal(uint8_t pid, bool& ok) {
 }
 
 // ---------- ELM327 communication (runs in obdTask) ----------
+static int linkAvail(); static int linkRead(); static void linkSend(const char* cmd);   // Classic or BLE, see the Bluetooth section
 static String elmQuery(const char* cmd, uint32_t tmo = 1500) {
-  while (BT.available()) BT.read();
-  BT.print(cmd); BT.print('\r');
+  while (linkAvail()) linkRead();
+  linkSend(cmd);
   String r; uint32_t t0 = millis();
   while (millis() - t0 < tmo) {
-    while (BT.available()) { char c = BT.read(); if (c == '>') return r; r += c; }
+    while (linkAvail()) { char c = (char)linkRead(); if (c == '>') return r; r += c; }
     vTaskDelay(1);
   }
   return r;
@@ -192,8 +194,11 @@ static void discoverPids() {
   }
 }
 
+static bool elmAlive = false;                // set by elmInit: the adapter answered like an ELM327 (so the link itself is fine, even if the car is off)
 static bool elmInit() {
-  elmQuery("ATZ", 2500); elmQuery("ATE0"); elmQuery("ATL0"); elmQuery("ATS0"); elmQuery("ATH0"); elmQuery("ATSP0", 1000);
+  String z = elmQuery("ATZ", 2500), e = elmQuery("ATE0");
+  elmAlive = z.indexOf("ELM") >= 0 || e.indexOf("OK") >= 0;
+  elmQuery("ATL0"); elmQuery("ATS0"); elmQuery("ATH0"); elmQuery("ATSP0", 1000);
   String p = cleanPayload(elmQuery("0100", 9000), true);
   return p.indexOf("4100") >= 0;
 }
@@ -254,19 +259,29 @@ static void pollPid(uint8_t pid, int& fails) {
   } else fails++;
 }
 
-// ---------- Bluetooth: nearby-device scan, chosen adapter, background link ----------
+// ---------- Bluetooth: nearby-device scan (Classic + BLE), chosen adapter, background link ----------
 #ifndef OBD_PIN
-#define OBD_PIN "1234"                       // pairing PIN of most ELM327 adapters (a few use 0000)
+#define OBD_PIN "1234"                       // first pairing PIN tried for Classic adapters (some use 0000 or 6789)
 #endif
-struct BtDev { char addr[18]; char name[26]; int8_t rssi; bool obd; };
-static const int MAXBT = 12;
+static const char* const PINS[] = {OBD_PIN, "0000", "6789", "1111"};
+static const int NPINS = 4;
+static volatile int pinIdx = 0, pinSaved = 0;     // PIN that works for the chosen adapter (saved); the next one is tried after a failed connect
+static volatile bool pinDirty = false;            // PIN state changed: save it from the UI loop
+static volatile bool pinOk = false;               // this adapter has connected with pinIdx at least once: stop guessing PINs
+
+struct BtDev { char addr[18]; char name[26]; int8_t rssi; bool obd; bool ble; uint8_t atype; };
+static const int MAXBT = 24;
 static BtDev btList[MAXBT];
 static volatile int btCount = 0, btVer = 0;
 static volatile int scanState = 0;           // 0 idle, 1 scanning, 2 done, 3 failed
 static volatile bool scanReq = false, scanStop = false, reconnectReq = false;
 static char selAddr[18] = "", selName[26] = "";   // adapter picked by the user (saved in flash)
+static bool selBle = false; static uint8_t selAType = 0;   // ... its radio (Classic or BLE) and BLE address type
+static volatile uint32_t selGen = 0;              // counts picks, so a connect attempt that was already running for the old pick cannot change the new pick's PIN / GATT choice
 static portMUX_TYPE btMux = portMUX_INITIALIZER_UNLOCKED;
-static bool btReady = false;
+static bool btReady = false, bleReady = false, linkActiveBle = false;
+static BLEClient* bleClient = nullptr;             // the one BLE client (created with the BLE stack)
+static BLERemoteCharacteristic* bleTx = nullptr;   // characteristic that takes our commands
 
 static void cleanName(char* d, size_t n, const char* s) {     // printable ASCII only
   size_t k = 0; bool gap = false;
@@ -278,7 +293,7 @@ static void cleanName(char* d, size_t n, const char* s) {     // printable ASCII
   d[k] = 0;
 }
 static bool looksObd(const char* nm) {                        // names that look like an OBD-II adapter are listed first
-  static const char* const K[] = {"OBD", "ELM", "V-LINK", "VLINK", "VGATE", "VEEPEAK", "ICAR", "VIECAR", "KONNWEI", "CARISTA"};
+  static const char* const K[] = {"OBD", "ELM", "V-LINK", "VLINK", "VGATE", "VEEPEAK", "ICAR", "VIECAR", "KONNWEI", "KW90", "CARISTA", "LELINK", "FIXD", "BAFX"};
   char u[26]; size_t i = 0;
   for (; nm[i] && i + 1 < sizeof u; i++) u[i] = (char)toupper((unsigned char)nm[i]);
   u[i] = 0;
@@ -291,8 +306,27 @@ static bool parseAddr(const char* s, uint8_t* a) {
   for (int i = 0; i < 6; i++) { if (v[i] > 255) return false; a[i] = (uint8_t)v[i]; }
   return true;
 }
+static bool btBetter(const BtDev& a, const BtDev& b, bool byRssi) {   // OBD-looking names first, then strongest signal
+  if (a.obd != b.obd) return a.obd;
+  if (!byRssi) return false;
+  return (a.rssi ? a.rssi : -127) > (b.rssi ? b.rssi : -127);
+}
+// Add or refresh one device (same address on the same radio = same entry). When the list is full a better device replaces the weakest.
+static void btInsert(const BtDev& t) {                        // caller holds btMux
+  for (int i = 0; i < btCount; i++) {
+    if (btList[i].ble != t.ble || strcmp(btList[i].addr, t.addr)) continue;
+    if (t.name[0]) { memcpy(btList[i].name, t.name, sizeof t.name); btList[i].obd = btList[i].obd || t.obd; }
+    if (t.rssi) btList[i].rssi = t.rssi;
+    if (t.ble) btList[i].atype = t.atype;
+    return;
+  }
+  if (btCount < MAXBT) { btList[btCount] = t; btCount = btCount + 1; return; }
+  int w = 0;
+  for (int i = 1; i < btCount; i++) if (btBetter(btList[w], btList[i], true)) w = i;
+  if (btBetter(t, btList[w], true)) btList[w] = t;
+}
 
-// Called by the Bluetooth stack for every inquiry result (not on the UI core): copy under a lock, never draw here.
+// Called by the Bluetooth stack for every Classic inquiry result (not on the UI core): copy under a lock, never draw here.
 static void onBtFound(BTAdvertisedDevice* d) {
   auto as = d->getAddress().toString();       // Arduino String on this core (std::string on others): auto + c_str() fits both
   auto ns = d->getName();
@@ -302,68 +336,204 @@ static void onBtFound(BTAdvertisedDevice* d) {
   for (int i = 0; i < 17; i++) t.addr[i] = (char)toupper((unsigned char)ac[i]);
   cleanName(t.name, sizeof t.name, ns.c_str());
   t.rssi = (int8_t)d->getRSSI(); t.obd = looksObd(t.name);
-  portENTER_CRITICAL(&btMux);
-  int k = -1;
-  for (int i = 0; i < btCount; i++) if (!strcmp(btList[i].addr, t.addr)) { k = i; break; }
-  if (k < 0) { if (btCount < MAXBT) { btList[btCount] = t; btCount = btCount + 1; } }
-  else { if (t.name[0]) { memcpy(btList[k].name, t.name, sizeof t.name); btList[k].obd = t.obd; } if (t.rssi) btList[k].rssi = t.rssi; }
-  portEXIT_CRITICAL(&btMux);
+  portENTER_CRITICAL(&btMux); btInsert(t); portEXIT_CRITICAL(&btMux);
   btVer = btVer + 1;
 }
 
-static void btUp() { if (!btReady) { BT.begin("MAZDA-GAUGE", true); BT.setPin(OBD_PIN); btReady = true; } }
+static void btUp() { if (!btReady) { BT.begin("MAZDA-GAUGE", true); BT.setPin(PINS[pinIdx]); btReady = true; } }
 
 // forget the library's list of earlier scans (only if this core has discoverClear(); otherwise nothing happens)
 template <class T> static auto btForget(T& b, int) -> decltype(b.discoverClear(), void()) { b.discoverClear(); }
 template <class T> static void btForget(T&, long) {}
 
-// Start an inquiry. Some cores refuse a new one after an earlier connect attempt, so retry with a cleaner state each time.
+// BLEDevice::deinit() if this core has it (it lets BLEDevice::init() run again after the shared Bluetooth stack was restarted)
+template <class T> static auto bleDeinit(int) -> decltype(T::deinit(false), void()) { T::deinit(false); }
+template <class T> static void bleDeinit(long) {}
+
+// Start a Classic inquiry. Some cores refuse a new one after an earlier connect attempt, so retry with a cleaner state each time.
 static bool startDiscovery() {
   btForget(BT, 0);
   if (BT.discoverAsync(onBtFound)) return true;
   BT.discoverAsyncStop(); vTaskDelay(400);                 // an unfinished earlier inquiry can block a new one
   if (BT.discoverAsync(onBtFound)) return true;
+  if (bleReady) { bleDeinit<BLEDevice>(0); bleReady = false; bleClient = nullptr; bleTx = nullptr; }   // the restart below takes BLE down too; it is set up again when needed
   BT.end(); btReady = false; vTaskDelay(400);              // last resort: restart the Bluetooth stack
   btUp(); vTaskDelay(400);
   btForget(BT, 0);
   return BT.discoverAsync(onBtFound);
 }
 
-static void doScan() {
-  portENTER_CRITICAL(&btMux); btCount = 0; portEXIT_CRITICAL(&btMux);
-  scanStop = false; scanState = 1; btVer = btVer + 1;
-  if (BT.connected()) { BT.disconnect(); vTaskDelay(200); }
-  if (!startDiscovery()) { scanState = 3; btVer = btVer + 1; return; }
+static bool classicScan() {
+  btUp();
+  if (!startDiscovery()) return false;
   uint32_t t0 = millis();
   while (millis() - t0 < 10500 && !scanStop) vTaskDelay(50);
   BT.discoverAsyncStop();
   vTaskDelay(500);                            // let the last results arrive
   BTScanResults* res = BT.getScanResults();   // final names / signal of everyone heard during the scan
   if (res) for (int i = 0, n = res->getCount(); i < n; i++) { BTAdvertisedDevice* d = res->getDevice(i); if (d) onBtFound(d); }
-  scanState = 2; btVer = btVer + 1;
+  return true;
+}
+
+// ---- BLE (Bluetooth Low Energy): many "Bluetooth 4.0 / 5.0, iOS + Android" adapters (KONNWEI KW90x, ...) are BLE, not Classic ----
+static bool bleTxResp = true;                      // write with response (only if it has no write-without-response)
+static int bleTry = 0;                             // which GATT UART candidate to use; advances after a failed ELM handshake
+static uint8_t bleRx[1024]; static uint16_t bleHead = 0, bleTail = 0;   // notification bytes -> ELM reader (guarded by btMux)
+
+static void bleUp() {
+  if (bleReady) return;
+  BLEDevice::init("MAZDA-GAUGE");
+  bleClient = BLEDevice::createClient();           // one client for the whole run (each createClient() takes a GATT slot)
+  bleReady = true;
+}
+static void bleNotify(BLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {   // BLE task: just store the bytes
+  portENTER_CRITICAL(&btMux);
+  for (size_t i = 0; i < n; i++) { uint16_t nx = (uint16_t)((bleHead + 1) & 1023); if (nx == bleTail) break; bleRx[bleHead] = d[i]; bleHead = nx; }
+  portEXIT_CRITICAL(&btMux);
+}
+static int bleAvail() { portENTER_CRITICAL(&btMux); int n = (bleHead - bleTail) & 1023; portEXIT_CRITICAL(&btMux); return n; }
+static int bleReadByte() {
+  int c = -1;
+  portENTER_CRITICAL(&btMux);
+  if (bleHead != bleTail) { c = bleRx[bleTail]; bleTail = (uint16_t)((bleTail + 1) & 1023); }
+  portEXIT_CRITICAL(&btMux);
+  return c;
+}
+static void bleFlush() { portENTER_CRITICAL(&btMux); bleTail = bleHead; portEXIT_CRITICAL(&btMux); }
+
+// scan results: the library returns either an object or a pointer depending on its version - these helpers take both
+template <class R> static int bleCount(R& r) { return r.getCount(); }
+template <class R> static int bleCount(R* r) { return r ? r->getCount() : 0; }
+template <class R> static auto bleDevAt(R& r, int i) -> decltype(r.getDevice(i)) { return r.getDevice(i); }
+template <class R> static auto bleDevAt(R* r, int i) -> decltype(r->getDevice(i)) { return r->getDevice(i); }
+
+static bool bleScan() {
+  bleUp();
+  BLEScan* sc = bleReady ? BLEDevice::getScan() : nullptr;
+  if (!sc) return false;
+  sc->setActiveScan(true);                         // scan responses carry the names
+  sc->setInterval(100); sc->setWindow(99);
+  auto found = sc->start(5, false);                // blocks for 5 s
+  for (int i = 0, n = bleCount(found); i < n; i++) {
+    auto d = bleDevAt(found, i);
+    auto as = d.getAddress().toString();
+    auto ns = d.getName();
+    const char* ac = as.c_str();
+    if (strlen(ac) != 17) continue;
+    BtDev t; memset(&t, 0, sizeof t);
+    for (int k = 0; k < 17; k++) t.addr[k] = (char)toupper((unsigned char)ac[k]);
+    cleanName(t.name, sizeof t.name, ns.c_str());
+    bool uart = d.isAdvertisingService(BLEUUID((uint16_t)0xFFF0)) || d.isAdvertisingService(BLEUUID((uint16_t)0xFFE0)) || d.isAdvertisingService(BLEUUID((uint16_t)0x18F0));
+    if (!t.name[0] && !uart) continue;             // anonymous BLE beacons are just noise
+    t.rssi = (int8_t)d.getRSSI(); t.ble = true; t.atype = (uint8_t)d.getAddressType(); t.obd = uart || looksObd(t.name);
+    portENTER_CRITICAL(&btMux); btInsert(t); portEXIT_CRITICAL(&btMux);
+  }
+  btVer = btVer + 1;
+  sc->clearResults();
+  return true;
+}
+
+static bool svcSkip(const char* u) {               // firmware-update services also look like "notify + write"
+  return strstr(u, "0000fe59") || strstr(u, "00010203-0405-0607-0809-0a0b0c0d1912") || strstr(u, "8d53dc1d");
+}
+static int svcPrio(const char* u) {                // typical ELM327 BLE adapters: FFF0, FFE0, 18F0, Nordic UART, "BLE serial"
+  static const char* const K[] = {"0000fff0", "0000ffe0", "000018f0", "6e400001", "e7810a71"};
+  for (const char* k : K) if (strstr(u, k)) return 2;
+  return 1;
+}
+static bool chCanWrite(BLERemoteCharacteristic* c) { return c->canWrite() || c->canWriteNoResponse(); }
+static bool chCanNotify(BLERemoteCharacteristic* c) { return c->canNotify() || c->canIndicate(); }
+
+// Find the serial-over-GATT pair (one characteristic that notifies, one that takes writes) and subscribe to the notifications.
+static bool bleSetupUart() {
+  bleTx = nullptr; bleFlush();
+  auto* svcs = bleClient->getServices();           // discovers the services on first use
+  if (!svcs) return false;
+  struct Cand { BLERemoteCharacteristic* nf; BLERemoteCharacteristic* wr; int prio; };
+  Cand cand[8]; int nc = 0;
+  for (auto& sv : *svcs) {
+    BLERemoteService* s = sv.second; if (!s) continue;
+    auto su = s->getUUID().toString();
+    char us[48]; { size_t k = 0; for (const char* q = su.c_str(); *q && k + 1 < sizeof us; q++) us[k++] = (char)tolower((unsigned char)*q); us[k] = 0; }
+    if (svcSkip(us)) continue;
+    auto* chs = s->getCharacteristics(); if (!chs) continue;
+    BLERemoteCharacteristic *nf = nullptr, *wr = nullptr;
+    for (auto& cv : *chs) { BLERemoteCharacteristic* c = cv.second; if (c && !nf && chCanNotify(c)) nf = c; }
+    for (auto& cv : *chs) { BLERemoteCharacteristic* c = cv.second; if (c && c != nf && chCanWrite(c)) { wr = c; break; } }
+    if (!wr && nf && chCanWrite(nf)) wr = nf;      // one characteristic does both (HM-10 style FFE1)
+    if (nf && wr && nc < 8) { cand[nc].nf = nf; cand[nc].wr = wr; cand[nc].prio = svcPrio(us); nc++; }
+  }
+  if (!nc) return false;
+  Cand ord[8]; int no = 0;                         // known UART services first; a failed handshake moves on to the next one
+  for (int p = 2; p >= 1; p--) for (int i = 0; i < nc; i++) if (cand[i].prio == p) ord[no++] = cand[i];
+  const Cand& pick = ord[bleTry % no];
+  bleTx = pick.wr; bleTxResp = !bleTx->canWriteNoResponse();
+  pick.nf->registerForNotify(bleNotify, pick.nf->canNotify());
+  return true;
+}
+
+// ---- one interface for the ELM327 code: Classic SPP or BLE, whichever radio the chosen adapter uses ----
+static int linkAvail() { return linkActiveBle ? bleAvail() : BT.available(); }
+static int linkRead() { return linkActiveBle ? bleReadByte() : BT.read(); }
+static void linkSend(const char* cmd) {            // command text + carriage return
+  if (!linkActiveBle) { BT.print(cmd); BT.print('\r'); return; }
+  if (!bleTx) return;
+  uint8_t b[40]; size_t n = strlen(cmd); if (n > 30) n = 30;
+  memcpy(b, cmd, n); b[n++] = '\r';
+  for (size_t o = 0; o < n; o += 20) bleTx->writeValue(b + o, (n - o) > 20 ? 20 : (n - o), bleTxResp);   // default BLE payload is 20 bytes
+}
+static bool linkIsUp() { return linkActiveBle ? (bleClient && bleClient->isConnected()) : (btReady && BT.connected()); }
+static void linkDown() {
+  if (linkActiveBle) { if (bleClient && bleClient->isConnected()) bleClient->disconnect(); bleTx = nullptr; bleFlush(); }
+  else if (btReady && BT.connected()) BT.disconnect();
+}
+static bool linkConnect(const char* sa, bool ble, uint8_t atype) {
+  uint8_t a[6];
+  if (!parseAddr(sa, a)) return false;
+  linkDown();                                      // the chosen adapter may use the other radio than the last link
+  linkActiveBle = ble;
+  if (!ble) { btUp(); BT.setPin(PINS[pinIdx]); return BT.connect(a); }
+  bleUp();
+  BLEAddress ad(a);
+  if (!bleClient->connect(ad, (esp_ble_addr_type_t)atype)) return false;
+  if (!bleSetupUart()) { bleClient->disconnect(); return false; }
+  return true;
+}
+
+static void doScan() {
+  portENTER_CRITICAL(&btMux); btCount = 0; portEXIT_CRITICAL(&btMux);
+  scanStop = false; scanState = 1; btVer = btVer + 1;
+  bool was = linkIsUp(); linkDown(); if (was) vTaskDelay(200);   // no inquiry while a link is up
+  bool okC = classicScan();
+  bool okB = scanStop ? false : bleScan();         // a tap on a device during the Classic part skips the BLE part
+  scanState = (okC || scanStop || (okB && btCount > 0)) ? 2 : 3; btVer = btVer + 1;   // failed = nothing could be scanned and nothing was found
 }
 
 void obdTask(void*) {
   int rr = 0, fails = 0; uint32_t lastMil = 0;
   for (;;) {
-    if (scanReq) { scanReq = false; btUp(); doScan(); continue; }
+    if (scanReq) { scanReq = false; doScan(); continue; }
     if (demoMode || !selAddr[0]) {            // demo, or OBD mode with no adapter chosen yet
-      if (btReady && BT.connected()) BT.disconnect();
+      linkDown();
       linkState = demoMode ? 0 : 3; vTaskDelay(200); continue;
     }
-    if (reconnectReq) { reconnectReq = false; if (BT.connected()) BT.disconnect(); }
-    btUp();
-    if (!BT.connected()) {
+    if (reconnectReq) { reconnectReq = false; linkDown(); }
+    if (!linkIsUp()) {
       linkState = 1;
-      uint8_t a[6]; char sa[18];
-      portENTER_CRITICAL(&btMux); memcpy(sa, selAddr, sizeof sa); portEXIT_CRITICAL(&btMux);
-      bool ok = parseAddr(sa, a) && BT.connect(a);
-      if (!ok) { if (!scanReq && !reconnectReq) vTaskDelay(3000); continue; }
+      char sa[18]; bool sb; uint8_t st; uint32_t gen;
+      portENTER_CRITICAL(&btMux); memcpy(sa, selAddr, sizeof sa); sb = selBle; st = selAType; gen = selGen; portEXIT_CRITICAL(&btMux);
+      bool ok = linkConnect(sa, sb, st);
+      if (!ok) {
+        if (!sb && !pinOk && gen == selGen) pinIdx = (pinIdx + 1) % NPINS;   // wrong PIN? the next common one is tried on the next attempt
+        if (!scanReq && !reconnectReq) vTaskDelay(3000);
+        continue;
+      }
       if (demoMode || scanReq || reconnectReq) continue;
-      if (!elmInit()) { BT.disconnect(); vTaskDelay(2000); continue; }
+      if (!elmInit()) { if (sb && !elmAlive && gen == selGen) bleTry = bleTry + 1; linkDown(); vTaskDelay(2000); continue; }   // silent: try the next GATT candidate (an ELM that talks but has no car yet is not a reason)
+      if (!sb && gen == selGen && (!pinOk || pinIdx != pinSaved)) { pinOk = true; pinDirty = true; }   // this PIN works: remember it
       discoverPids(); readVin(); fails = 0; linkState = 2; lastMil = 0;
     }
-    while (!demoMode && BT.connected() && fails < 8 && !scanReq && !reconnectReq) {
+    while (!demoMode && linkIsUp() && fails < 8 && !scanReq && !reconnectReq) {
       if (req == 1) { req = 0; doReadCodes(); }
       else if (req == 2) { req = 0; doClearCodes(); }
       pollPid(0x0C, fails); pollPid(0x0D, fails);
@@ -376,7 +546,7 @@ void obdTask(void*) {
       if (millis() - lastMil > 5000) { pollPid(0x01, fails); lastMil = millis(); }
       vTaskDelay(1);
     }
-    if (BT.connected()) BT.disconnect();
+    linkDown();
     linkState = 1; if (!scanReq && !reconnectReq) vTaskDelay(1000);
   }
 }
@@ -452,19 +622,26 @@ static void loadPrefs() {
   shiftRpm = prefs.getInt("shift", 6000); bright = prefs.getInt("bright", 80); theme = prefs.getInt("theme", 0);
   crpMain = prefs.getBool("crpm", false);
   String ba = prefs.getString("btaddr", ""), bn = prefs.getString("btname", "");
+  int bk = prefs.getInt("btkind", 0), bp = prefs.getInt("btpin", 0); bool bo = prefs.getBool("btpinok", false);
   uint8_t s[6]; if (prefs.getBytes("slots", s, 6) == 6) { bool good = true; for (int i = 0; i < 6; i++) if (s[i] >= NMET) good = false; if (good) memcpy(slots, s, 6); }
   prefs.end();
   if (theme < 0 || theme >= NTHEME) theme = 0;
   applyTheme(theme);
   uint8_t tmp[6];
-  if (ba.length() == 17 && parseAddr(ba.c_str(), tmp)) { strncpy(selAddr, ba.c_str(), sizeof selAddr - 1); cleanName(selName, sizeof selName, bn.c_str()); }
+  pinIdx = pinSaved = (bp >= 0 && bp < NPINS) ? bp : 0; pinOk = bo;
+  if (ba.length() == 17 && parseAddr(ba.c_str(), tmp)) {
+    strncpy(selAddr, ba.c_str(), sizeof selAddr - 1); cleanName(selName, sizeof selName, bn.c_str());
+    selBle = bk >= 1 && bk <= 5; selAType = selBle ? (uint8_t)(bk - 1) : 0;
+  }
 }
 static void savePrefs() {
   prefs.begin("gauge", false);
   prefs.putBool("thai", thai); prefs.putBool("demo", demoMode); prefs.putBool("warn", warnOn); prefs.putBool("crpm", crpMain);
   prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6);
   prefs.putString("btaddr", selAddr); prefs.putString("btname", selName);
+  prefs.putInt("btkind", selBle ? 1 + selAType : 0); prefs.putInt("btpin", pinIdx); prefs.putBool("btpinok", pinOk);
   prefs.end();
+  pinSaved = pinIdx;
 }
 static void applyBright() { ledcWrite(0, map(bright, 0, 100, 5, 255)); }
 
@@ -792,14 +969,13 @@ static void btSrcRow() {
 static void btDevRow() {
   int y = 77, by = y + 2; card(4, y, 312, 24); label(S_BTDEV, 10, y + 4, cTEXT, cPANEL);
   const char* nm = selName[0] ? selName : selAddr;
-  if (nm[0]) { char t[32]; fitText(t, sizeof t, nm, 2, 150); txt(t, 92, y + 4, 2, cICE, cPANEL, TL_DATUM); }
+  if (nm[0]) {
+    int x = 92;
+    if (selBle) { tft.drawRoundRect(92, y + 5, 26, 13, 3, cICE); txt("BLE", 105, y + 11, 1, cICE, cPANEL, MC_DATUM); x = 122; }
+    char t[32]; fitText(t, sizeof t, nm, 2, 246 - x); txt(t, x, y + 4, 2, cICE, cPANEL, TL_DATUM);
+  }
   else label(S_NOSEL, 92, y + 4, cDIM, cPANEL);
   btn(250, by, 62, 20, S_SCAN, scanState == 1);
-}
-static bool btBetter(const BtDev& a, const BtDev& b, bool byRssi) {   // OBD-looking names first, then strongest signal
-  if (a.obd != b.obd) return a.obd;
-  if (!byRssi) return false;
-  return (a.rssi ? a.rssi : -127) > (b.rssi ? b.rssi : -127);
 }
 static void btBuildView() {
   portENTER_CRITICAL(&btMux); nBtView = btCount; memcpy(btView, btList, sizeof(BtDev) * nBtView); portEXIT_CRITICAL(&btMux);
@@ -815,12 +991,13 @@ static void btRow(int r) {
   int y = 122 + r * 21, i = btOff + r;
   tft.fillRect(4, y, 270, 21, cBG);
   if (i >= nBtView) return;
-  const BtDev& d = btView[i]; bool sel = !strcmp(d.addr, selAddr); uint16_t bg = sel ? cPANEL2 : cPANEL;
+  const BtDev& d = btView[i]; bool sel = d.ble == selBle && !strcmp(d.addr, selAddr); uint16_t bg = sel ? cPANEL2 : cPANEL;
   card(4, y, 270, 19, bg, sel ? cBLUE : cLINE);
   int x = 10;
   if (d.obd) { tft.fillRoundRect(9, y + 3, 28, 13, 3, cBLUE); txt("OBD", 23, y + 9, 1, cBG, cBLUE, MC_DATUM); x = 42; }
-  char t[32]; fitText(t, sizeof t, d.name[0] ? d.name : d.addr, 2, 200 - x);
+  char t[32]; fitText(t, sizeof t, d.name[0] ? d.name : d.addr, 2, (d.ble ? 190 : 200) - x);
   txt(t, x, y + 2, 2, d.name[0] ? (sel ? cTEXT : cICE) : cDIM, bg, TL_DATUM);
+  if (d.ble) { tft.drawRoundRect(194, y + 3, 26, 13, 3, cICE); txt("BLE", 207, y + 9, 1, cICE, bg, MC_DATUM); }
   if (sel) { tft.drawLine(224, y + 10, 228, y + 14, cICE); tft.drawLine(225, y + 10, 229, y + 14, cICE); tft.drawLine(229, y + 14, 237, y + 4, cICE); tft.drawLine(230, y + 14, 238, y + 4, cICE); }
   int lv = !d.rssi ? 0 : d.rssi >= -55 ? 4 : d.rssi >= -67 ? 3 : d.rssi >= -78 ? 2 : 1;
   for (int k = 0; k < 4; k++) { int h = 3 + k * 2; tft.fillRect(246 + k * 5, y + 16 - h, 3, h, k < lv ? cICE : cDARK); }
@@ -859,7 +1036,10 @@ static void btDyn() {
 static void btPick(int i) {                  // user tapped a device: remember it, switch to OBD mode and connect
   BtDev d = btView[i];
   portENTER_CRITICAL(&btMux);
+  bool same = !strcmp(d.addr, selAddr);                         // tapping the adapter that is already chosen (either radio) keeps what we learned about its PIN
   memcpy(selAddr, d.addr, sizeof selAddr); strcpy(selName, d.name[0] ? d.name : d.addr);
+  selBle = d.ble; selAType = d.atype; bleTry = 0; selGen = selGen + 1;
+  if (!same) { pinIdx = 0; pinOk = false; }
   portEXIT_CRITICAL(&btMux);
   demoMode = false; carBuf[0] = 0; linkState = 1;
   scanStop = true; reconnectReq = true;
@@ -1040,7 +1220,7 @@ void setup() {
   txt("MAZDA 2", 160, 100, 4, cTEXT, cBG, MC_DATUM);
   txt("SMART GAUGE", 160, 132, 2, cBLUE, cBG, MC_DATUM);
   updateWants(); delay(900);
-  xTaskCreatePinnedToCore(obdTask, "obd", 8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(obdTask, "obd", 16384, nullptr, 1, nullptr, 0);   // BLE service discovery runs on this stack too
 }
 
 void loop() {
@@ -1053,6 +1233,7 @@ void loop() {
     if (!wasTouched || (scr == SC_DATA && now - lastAct > 400)) { handleTouch(x, y); lastAct = now; }
   }
   wasTouched = t;
+  if (pinDirty) { pinDirty = false; savePrefs(); }       // the Classic PIN that worked, found on the OBD core, is stored from here
 
   static uint32_t tSim = 0, tUI = 0, tGraph = 0;
   if (now - tSim >= 100) {
