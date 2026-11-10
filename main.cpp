@@ -294,10 +294,12 @@ static bool parseAddr(const char* s, uint8_t* a) {
 
 // Called by the Bluetooth stack for every inquiry result (not on the UI core): copy under a lock, never draw here.
 static void onBtFound(BTAdvertisedDevice* d) {
-  std::string as = d->getAddress().toString(), ns = d->getName();
-  if (as.size() != 17) return;
+  auto as = d->getAddress().toString();       // Arduino String on this core (std::string on others): auto + c_str() fits both
+  auto ns = d->getName();
+  const char* ac = as.c_str();
+  if (strlen(ac) != 17) return;
   BtDev t; memset(&t, 0, sizeof t);
-  for (int i = 0; i < 17; i++) t.addr[i] = (char)toupper((unsigned char)as[i]);
+  for (int i = 0; i < 17; i++) t.addr[i] = (char)toupper((unsigned char)ac[i]);
   cleanName(t.name, sizeof t.name, ns.c_str());
   t.rssi = (int8_t)d->getRSSI(); t.obd = looksObd(t.name);
   portENTER_CRITICAL(&btMux);
@@ -315,12 +317,23 @@ static void btUp() { if (!btReady) { BT.begin("MAZDA-GAUGE", true); BT.setPin(OB
 template <class T> static auto btForget(T& b, int) -> decltype(b.discoverClear(), void()) { b.discoverClear(); }
 template <class T> static void btForget(T&, long) {}
 
+// Start an inquiry. Some cores refuse a new one after an earlier connect attempt, so retry with a cleaner state each time.
+static bool startDiscovery() {
+  btForget(BT, 0);
+  if (BT.discoverAsync(onBtFound)) return true;
+  BT.discoverAsyncStop(); vTaskDelay(400);                 // an unfinished earlier inquiry can block a new one
+  if (BT.discoverAsync(onBtFound)) return true;
+  BT.end(); btReady = false; vTaskDelay(400);              // last resort: restart the Bluetooth stack
+  btUp(); vTaskDelay(400);
+  btForget(BT, 0);
+  return BT.discoverAsync(onBtFound);
+}
+
 static void doScan() {
   portENTER_CRITICAL(&btMux); btCount = 0; portEXIT_CRITICAL(&btMux);
   scanStop = false; scanState = 1; btVer = btVer + 1;
-  if (BT.connected()) BT.disconnect();
-  btForget(BT, 0);
-  if (!BT.discoverAsync(onBtFound)) { scanState = 3; btVer = btVer + 1; return; }
+  if (BT.connected()) { BT.disconnect(); vTaskDelay(200); }
+  if (!startDiscovery()) { scanState = 3; btVer = btVer + 1; return; }
   uint32_t t0 = millis();
   while (millis() - t0 < 10500 && !scanStop) vTaskDelay(50);
   BT.discoverAsyncStop();
