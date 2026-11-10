@@ -401,16 +401,16 @@ static void drawTop() {
 }
 
 // ---------- dashboard ----------
-static const int TX[6] = {4, 4, 4, 228, 228, 228}, TY[6] = {28, 83, 138, 28, 83, 138};
+static const int TILE_X[6] = {4, 4, 4, 228, 228, 228}, TILE_Y[6] = {28, 83, 138, 28, 83, 138};
 static char lastTile[6][12], lastSpd[8], lastRpm[14];
 static uint16_t lastTileCol[6], lastArcCol;
 static int lastArc, lastLit, lastCrpPx;
 
 static void tileStatic(int i) {
   const Met& m = MET[slots[i]];
-  card(TX[i], TY[i], 88, 50);
-  label(m.lab, TX[i] + 6, TY[i] + 3, cDIM, cPANEL);
-  txt(m.unit, TX[i] + 83, TY[i] + 6, 1, cDIM, cPANEL, TR_DATUM);
+  card(TILE_X[i], TILE_Y[i], 88, 50);
+  label(m.lab, TILE_X[i] + 6, TILE_Y[i] + 3, cDIM, cPANEL);
+  txt(m.unit, TILE_X[i] + 83, TILE_Y[i] + 6, 1, cDIM, cPANEL, TR_DATUM);
   lastTile[i][0] = 0;
 }
 static uint16_t valCol(const Met& m, float v) { return v >= m.b ? cBAD : v >= m.w ? cWARN : v < m.lo ? cWARN : cTEXT; }
@@ -419,7 +419,7 @@ static void tileDyn(int i) {
   if (m.pid) v = getVal(m.pid, ok) * m.mul;
   if (ok) { fmtv(b, sizeof b, v, m.dec); col = valCol(m, v); } else strcpy(b, "--");
   if (!strcmp(b, lastTile[i]) && col == lastTileCol[i]) return;
-  txt(b, TX[i] + 8, TY[i] + 22, 4, col, cPANEL, TL_DATUM, 72);
+  txt(b, TILE_X[i] + 8, TILE_Y[i] + 22, 4, col, cPANEL, TL_DATUM, 72);
   strcpy(lastTile[i], b); lastTileCol[i] = col;
 }
 static void dashStatic() {
@@ -677,7 +677,7 @@ static void handleTouch(int x, int y) {
   }
   switch (scr) {
     case SC_DASH:
-      for (int i = 0; i < 6; i++) if (hit(x, y, TX[i], TY[i], 88, 50)) {
+      for (int i = 0; i < 6; i++) if (hit(x, y, TILE_X[i], TILE_Y[i], 88, 50)) {
         slots[i] = (slots[i] + 1) % NMET; savePrefs(); tileStatic(i); updateWants();
       }
       break;
