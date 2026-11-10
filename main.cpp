@@ -7,6 +7,7 @@
 #include <XPT2046_Touchscreen.h>
 #include <BluetoothSerial.h>
 #include <Preferences.h>
+#include <string>
 #include "ui_strings.h"
 
 #ifndef CRP_PIN
@@ -23,9 +24,20 @@ BluetoothSerial BT;
 Preferences prefs;
 
 constexpr uint16_t C(uint8_t r, uint8_t g, uint8_t b) { return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); }
-static const uint16_t cBG = C(3, 6, 13), cPANEL = C(10, 20, 38), cPANEL2 = C(14, 28, 53), cLINE = C(23, 49, 92),
-                      cDARK = C(18, 36, 74), cBLUE = C(47, 140, 255), cICE = C(155, 216, 255), cDIM = C(111, 136, 179),
-                      cTEXT = C(232, 241, 255), cWARN = C(255, 176, 32), cBAD = C(255, 77, 94), cWBG = C(30, 8, 16);
+// Themes (black background in both): bg, panel, panel2, line, dark, accent, accent-light, dim, text, hot
+// 0 = black-blue, 1 = black-red
+static const int NTHEME = 2;
+static const uint16_t THEMES[NTHEME][10] = {
+  {C(0, 0, 0), C(9, 15, 28), C(14, 24, 44), C(26, 52, 98), C(17, 32, 66), C(47, 140, 255), C(155, 216, 255), C(111, 136, 179), C(232, 241, 255), C(255, 77, 94)},
+  {C(0, 0, 0), C(26, 9, 12), C(40, 13, 18), C(96, 28, 38), C(70, 20, 28), C(255, 59, 70), C(255, 150, 150), C(179, 120, 125), C(255, 238, 238), C(255, 176, 32)},
+};
+static uint16_t cBG, cPANEL, cPANEL2, cLINE, cDARK, cBLUE, cICE, cDIM, cTEXT, cHOT;
+static const uint16_t cWARN = C(255, 176, 32), cBAD = C(255, 77, 94), cWBG = C(30, 8, 16);
+static int theme = 0;
+static void applyTheme(int t) {
+  const uint16_t* p = THEMES[t];
+  cBG = p[0]; cPANEL = p[1]; cPANEL2 = p[2]; cLINE = p[3]; cDARK = p[4]; cBLUE = p[5]; cICE = p[6]; cDIM = p[7]; cTEXT = p[8]; cHOT = p[9];
+}
 
 enum Screen { SC_DASH, SC_DATA, SC_GRAPH, SC_TRIP, SC_CODES, SC_SETUP };
 static Screen scr = SC_DASH;
@@ -35,6 +47,8 @@ static bool redraw = true;
 static bool thai = false, demoMode = true, warnOn = true;
 static int shiftRpm = 6000, bright = 80;
 static uint8_t slots[6] = {0, 1, 2, 3, 4, 5};
+static bool crpMain = false;                     // dash centre shows CRP volts (true) or speed (false)
+static int setupTab = 0;                         // 0 = General, 1 = Bluetooth
 
 // ---------- PID table ----------
 struct Pid { uint8_t id; const char* name; const char* unit; uint8_t dec; float mn, mx; char drv; };
@@ -240,22 +254,103 @@ static void pollPid(uint8_t pid, int& fails) {
   } else fails++;
 }
 
-static const char* const BT_NAMES[] = {"OBDII", "V-LINK", "OBD2", "Vgate", "VEEPEAK", "OBDLink", "ELM327", "iCar"};
+// ---------- Bluetooth: nearby-device scan, chosen adapter, background link ----------
+#ifndef OBD_PIN
+#define OBD_PIN "1234"                       // pairing PIN of most ELM327 adapters (a few use 0000)
+#endif
+struct BtDev { char addr[18]; char name[26]; int8_t rssi; bool obd; };
+static const int MAXBT = 12;
+static BtDev btList[MAXBT];
+static volatile int btCount = 0, btVer = 0;
+static volatile int scanState = 0;           // 0 idle, 1 scanning, 2 done, 3 failed
+static volatile bool scanReq = false, scanStop = false, reconnectReq = false;
+static char selAddr[18] = "", selName[26] = "";   // adapter picked by the user (saved in flash)
+static portMUX_TYPE btMux = portMUX_INITIALIZER_UNLOCKED;
 static bool btReady = false;
+
+static void cleanName(char* d, size_t n, const char* s) {     // printable ASCII only
+  size_t k = 0; bool gap = false;
+  for (; *s && k + 1 < n; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c >= 32 && c < 127) { d[k++] = (char)c; gap = false; }
+    else if (!gap) { d[k++] = '?'; gap = true; }
+  }
+  d[k] = 0;
+}
+static bool looksObd(const char* nm) {                        // names that look like an OBD-II adapter are listed first
+  static const char* const K[] = {"OBD", "ELM", "V-LINK", "VLINK", "VGATE", "VEEPEAK", "ICAR", "VIECAR", "KONNWEI", "CARISTA"};
+  char u[26]; size_t i = 0;
+  for (; nm[i] && i + 1 < sizeof u; i++) u[i] = (char)toupper((unsigned char)nm[i]);
+  u[i] = 0;
+  for (const char* k : K) if (strstr(u, k)) return true;
+  return false;
+}
+static bool parseAddr(const char* s, uint8_t* a) {
+  unsigned v[6];
+  if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) { if (v[i] > 255) return false; a[i] = (uint8_t)v[i]; }
+  return true;
+}
+
+// Called by the Bluetooth stack for every inquiry result (not on the UI core): copy under a lock, never draw here.
+static void onBtFound(BTAdvertisedDevice* d) {
+  std::string as = d->getAddress().toString(), ns = d->getName();
+  if (as.size() != 17) return;
+  BtDev t; memset(&t, 0, sizeof t);
+  for (int i = 0; i < 17; i++) t.addr[i] = (char)toupper((unsigned char)as[i]);
+  cleanName(t.name, sizeof t.name, ns.c_str());
+  t.rssi = (int8_t)d->getRSSI(); t.obd = looksObd(t.name);
+  portENTER_CRITICAL(&btMux);
+  int k = -1;
+  for (int i = 0; i < btCount; i++) if (!strcmp(btList[i].addr, t.addr)) { k = i; break; }
+  if (k < 0) { if (btCount < MAXBT) { btList[btCount] = t; btCount = btCount + 1; } }
+  else { if (t.name[0]) { memcpy(btList[k].name, t.name, sizeof t.name); btList[k].obd = t.obd; } if (t.rssi) btList[k].rssi = t.rssi; }
+  portEXIT_CRITICAL(&btMux);
+  btVer = btVer + 1;
+}
+
+static void btUp() { if (!btReady) { BT.begin("MAZDA-GAUGE", true); BT.setPin(OBD_PIN); btReady = true; } }
+
+// forget the library's list of earlier scans (only if this core has discoverClear(); otherwise nothing happens)
+template <class T> static auto btForget(T& b, int) -> decltype(b.discoverClear(), void()) { b.discoverClear(); }
+template <class T> static void btForget(T&, long) {}
+
+static void doScan() {
+  portENTER_CRITICAL(&btMux); btCount = 0; portEXIT_CRITICAL(&btMux);
+  scanStop = false; scanState = 1; btVer = btVer + 1;
+  if (BT.connected()) BT.disconnect();
+  btForget(BT, 0);
+  if (!BT.discoverAsync(onBtFound)) { scanState = 3; btVer = btVer + 1; return; }
+  uint32_t t0 = millis();
+  while (millis() - t0 < 10500 && !scanStop) vTaskDelay(50);
+  BT.discoverAsyncStop();
+  vTaskDelay(500);                            // let the last results arrive
+  BTScanResults* res = BT.getScanResults();   // final names / signal of everyone heard during the scan
+  if (res) for (int i = 0, n = res->getCount(); i < n; i++) { BTAdvertisedDevice* d = res->getDevice(i); if (d) onBtFound(d); }
+  scanState = 2; btVer = btVer + 1;
+}
 
 void obdTask(void*) {
   int rr = 0, fails = 0; uint32_t lastMil = 0;
   for (;;) {
-    if (demoMode) { if (btReady && BT.connected()) BT.disconnect(); linkState = 0; vTaskDelay(200); continue; }
-    if (!btReady) { BT.begin("MAZDA-GAUGE", true); BT.setPin("1234"); btReady = true; }
+    if (scanReq) { scanReq = false; btUp(); doScan(); continue; }
+    if (demoMode || !selAddr[0]) {            // demo, or OBD mode with no adapter chosen yet
+      if (btReady && BT.connected()) BT.disconnect();
+      linkState = demoMode ? 0 : 3; vTaskDelay(200); continue;
+    }
+    if (reconnectReq) { reconnectReq = false; if (BT.connected()) BT.disconnect(); }
+    btUp();
     if (!BT.connected()) {
-      linkState = 1; bool ok = false;
-      for (const char* nm : BT_NAMES) { if (demoMode) break; if (BT.connect(String(nm))) { ok = true; break; } }
-      if (!ok) { vTaskDelay(3000); continue; }
+      linkState = 1;
+      uint8_t a[6]; char sa[18];
+      portENTER_CRITICAL(&btMux); memcpy(sa, selAddr, sizeof sa); portEXIT_CRITICAL(&btMux);
+      bool ok = parseAddr(sa, a) && BT.connect(a);
+      if (!ok) { if (!scanReq && !reconnectReq) vTaskDelay(3000); continue; }
+      if (demoMode || scanReq || reconnectReq) continue;
       if (!elmInit()) { BT.disconnect(); vTaskDelay(2000); continue; }
       discoverPids(); readVin(); fails = 0; linkState = 2; lastMil = 0;
     }
-    while (!demoMode && BT.connected() && fails < 8) {
+    while (!demoMode && BT.connected() && fails < 8 && !scanReq && !reconnectReq) {
       if (req == 1) { req = 0; doReadCodes(); }
       else if (req == 2) { req = 0; doClearCodes(); }
       pollPid(0x0C, fails); pollPid(0x0D, fails);
@@ -269,7 +364,7 @@ void obdTask(void*) {
       vTaskDelay(1);
     }
     if (BT.connected()) BT.disconnect();
-    linkState = 1; vTaskDelay(1000);
+    linkState = 1; if (!scanReq && !reconnectReq) vTaskDelay(1000);
   }
 }
 
@@ -341,14 +436,21 @@ static void updateWants() {
 static void loadPrefs() {
   prefs.begin("gauge", true);
   thai = prefs.getBool("thai", false); demoMode = prefs.getBool("demo", true); warnOn = prefs.getBool("warn", true);
-  shiftRpm = prefs.getInt("shift", 6000); bright = prefs.getInt("bright", 80);
+  shiftRpm = prefs.getInt("shift", 6000); bright = prefs.getInt("bright", 80); theme = prefs.getInt("theme", 0);
+  crpMain = prefs.getBool("crpm", false);
+  String ba = prefs.getString("btaddr", ""), bn = prefs.getString("btname", "");
   uint8_t s[6]; if (prefs.getBytes("slots", s, 6) == 6) { bool good = true; for (int i = 0; i < 6; i++) if (s[i] >= NMET) good = false; if (good) memcpy(slots, s, 6); }
   prefs.end();
+  if (theme < 0 || theme >= NTHEME) theme = 0;
+  applyTheme(theme);
+  uint8_t tmp[6];
+  if (ba.length() == 17 && parseAddr(ba.c_str(), tmp)) { strncpy(selAddr, ba.c_str(), sizeof selAddr - 1); cleanName(selName, sizeof selName, bn.c_str()); }
 }
 static void savePrefs() {
   prefs.begin("gauge", false);
-  prefs.putBool("thai", thai); prefs.putBool("demo", demoMode); prefs.putBool("warn", warnOn);
-  prefs.putInt("shift", shiftRpm); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6);
+  prefs.putBool("thai", thai); prefs.putBool("demo", demoMode); prefs.putBool("warn", warnOn); prefs.putBool("crpm", crpMain);
+  prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6);
+  prefs.putString("btaddr", selAddr); prefs.putString("btname", selName);
   prefs.end();
 }
 static void applyBright() { ledcWrite(0, map(bright, 0, 100, 5, 255)); }
@@ -360,12 +462,12 @@ static void card(int x, int y, int w, int h, uint16_t fill = cPANEL, uint16_t bo
 }
 static int strW(StrId id) { return (thai && THB[id].d) ? THB[id].w : tft.textWidth(EN[id], 2); }
 static void label(StrId id, int x, int y, uint16_t fg, uint16_t bg) {
-  if (thai && THB[id].d) tft.drawBitmap(x, y - 2, THB[id].d, THB[id].w, THB[id].h, fg, bg);
+  if (thai && THB[id].d) tft.drawBitmap(x, y - 2, THB[id].d, THB[id].w, THB[id].h, fg);   // transparent: keeps card borders intact
   else { tft.setTextColor(fg, bg); tft.setTextDatum(TL_DATUM); tft.setTextPadding(0); tft.drawString(EN[id], x, y, 2); }
 }
 static void labelC(StrId id, int cx, int y, uint16_t fg, uint16_t bg) { label(id, cx - strW(id) / 2, y, fg, bg); }
 static void labelThai(StrId id, int cx, int y, uint16_t fg, uint16_t bg) {  // always Thai (language button)
-  tft.drawBitmap(cx - THB[id].w / 2, y - 2, THB[id].d, THB[id].w, THB[id].h, fg, bg);
+  tft.drawBitmap(cx - THB[id].w / 2, y - 2, THB[id].d, THB[id].w, THB[id].h, fg);
 }
 static void txt(const char* s, int x, int y, int font, uint16_t fg, uint16_t bg, uint8_t datum = TL_DATUM, int pad = 0) {
   tft.setTextColor(fg, bg); tft.setTextDatum(datum); tft.setTextPadding(pad);
@@ -390,27 +492,41 @@ static void drawNav() {
   }
 }
 
+static void fitText(char* d, size_t n, const char* s, int font, int maxw) {   // shortens with ".." to fit maxw pixels
+  strncpy(d, s, n - 1); d[n - 1] = 0;
+  if (tft.textWidth(d, font) <= maxw) return;
+  int L = (int)strlen(d);
+  while (L > 1) {
+    L--; char t[40]; snprintf(t, sizeof t, "%.*s..", L, d);
+    if (tft.textWidth(t, font) <= maxw) { strncpy(d, t, n - 1); d[n - 1] = 0; return; }
+  }
+}
+
 static void drawTop() {
   tft.fillRect(0, 0, 320, 19, cBG);
-  uint16_t dot = linkState == 2 ? C(53, 224, 176) : linkState == 1 ? cWARN : cBLUE;
+  uint16_t dot = linkState == 2 ? C(53, 224, 176) : (linkState == 1 || linkState == 3) ? cWARN : cBLUE;
   tft.fillCircle(8, 9, 3, dot);
-  label(linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_DEMO, 16, 2, cDIM, cBG);
+  label(linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : linkState == 3 ? S_SELDEV : S_DEMO, 16, 2, cDIM, cBG);
   const char* nm = demoMode ? "MAZDA 2" : carBuf;
   if (nm[0]) txt(nm, 316, 2, 2, cICE, cBG, TR_DATUM);
   else if (!demoMode && linkState == 2) label(S_UNKNOWN, 316 - strW(S_UNKNOWN), 2, cICE, cBG);
+  else if (!demoMode && linkState == 1 && selName[0]) { char t[32]; fitText(t, sizeof t, selName, 2, 130); txt(t, 316, 2, 2, cDIM, cBG, TR_DATUM); }
 }
 
 // ---------- dashboard ----------
 static const int TILE_X[6] = {4, 4, 4, 228, 228, 228}, TILE_Y[6] = {28, 83, 138, 28, 83, 138};
-static char lastTile[6][12], lastSpd[8], lastRpm[14];
+static char lastTile[6][12], lastSpd[8], lastRpm[14], lastStrip[10];
 static uint16_t lastTileCol[6], lastArcCol;
 static int lastArc, lastLit, lastCrpPx;
 
+static bool unitLow(const Met& m) {          // long (Thai) label: put the unit small at the bottom right instead of beside the label
+  return m.unit[0] && 6 + strW(m.lab) + 3 + tft.textWidth(m.unit, 1) > 86;
+}
 static void tileStatic(int i) {
   const Met& m = MET[slots[i]];
   card(TILE_X[i], TILE_Y[i], 88, 50);
   label(m.lab, TILE_X[i] + 6, TILE_Y[i] + 3, cDIM, cPANEL);
-  txt(m.unit, TILE_X[i] + 83, TILE_Y[i] + 6, 1, cDIM, cPANEL, TR_DATUM);
+  txt(m.unit, TILE_X[i] + 83, TILE_Y[i] + (unitLow(m) ? 38 : 6), 1, cDIM, cPANEL, TR_DATUM);
   lastTile[i][0] = 0;
 }
 static uint16_t valCol(const Met& m, float v) { return v >= m.b ? cBAD : v >= m.w ? cWARN : v < m.lo ? cWARN : cTEXT; }
@@ -419,48 +535,71 @@ static void tileDyn(int i) {
   if (m.pid) v = getVal(m.pid, ok) * m.mul;
   if (ok) { fmtv(b, sizeof b, v, m.dec); col = valCol(m, v); } else strcpy(b, "--");
   if (!strcmp(b, lastTile[i]) && col == lastTileCol[i]) return;
-  txt(b, TILE_X[i] + 8, TILE_Y[i] + 22, 4, col, cPANEL, TL_DATUM, 72);
+  txt(b, TILE_X[i] + 8, TILE_Y[i] + 22, 4, col, cPANEL, TL_DATUM, unitLow(m) ? 56 : 72);
   strcpy(lastTile[i], b); lastTileCol[i] = col;
+}
+static void centerLabel() {                  // small caption under the big number
+  if (crpMain) txt("CRP (V)", 160, 142, 1, cICE, cBG, TC_DATUM);
+  else txt("km/h", 160, 142, 1, cDIM, cBG, TC_DATUM);
+}
+static void stripStatic() {                  // bottom strip shows the value that is NOT in the centre
+  card(4, 190, 312, 18); label(crpMain ? S_SPEED : S_CRP, 10, 191, cDIM, cPANEL);
+  txt(crpMain ? "km/h" : "V", 150, 195, 1, cDIM, cPANEL, TL_DATUM);
+  lastStrip[0] = 0; lastCrpPx = -1;
 }
 static void dashStatic() {
   for (int i = 0; i < 6; i++) tileStatic(i);
   tft.drawSmoothArc(160, 108, 64, 56, 30, 330, cDARK, cBG, true);
-  txt("km/h", 160, 142, 1, cDIM, cBG, TC_DATUM);
-  card(4, 190, 312, 18); label(S_CRP, 10, 191, cDIM, cPANEL);
-  lastSpd[0] = lastRpm[0] = 0; lastArc = -100; lastLit = -1; lastCrpPx = -1; lastArcCol = 0;
+  centerLabel(); stripStatic();
+  lastSpd[0] = lastRpm[0] = 0; lastArc = -100; lastLit = -1; lastArcCol = 0;
+}
+static void dashSwap() {                     // tap on the gauge: speed <-> CRP (centre and bottom strip trade places)
+  tft.fillCircle(160, 108, 54, cBG);
+  lastSpd[0] = lastRpm[0] = 0;
+  centerLabel(); stripStatic();
 }
 static void dashDyn() {
   bool ok; float rpm = getVal(0x0C, ok); if (!ok) rpm = 0;
   float spd = getVal(0x0D, ok); if (!ok) spd = 0;
-  int ang = 30 + (int)(300.0f * constrain(rpm / 7000.0f, 0.0f, 1.0f)); uint16_t col = rpm >= shiftRpm ? cBAD : cBLUE;
+  int ang = 30 + (int)(300.0f * constrain(rpm / 7000.0f, 0.0f, 1.0f)); uint16_t col = rpm >= shiftRpm ? cHOT : cBLUE;
   if (abs(ang - lastArc) >= 2 || col != lastArcCol) {
     if (ang < 330) tft.drawSmoothArc(160, 108, 64, 56, ang, 330, cDARK, cBG, true);
     if (ang > 30) tft.drawSmoothArc(160, 108, 64, 56, 30, ang, col, cDARK, true);
     lastArc = ang; lastArcCol = col;
   }
-  char b[14]; snprintf(b, sizeof b, "%d", (int)spd);
-  if (strcmp(b, lastSpd)) { txt(b, 160, 112, 6, cTEXT, cBG, MC_DATUM, 96); strcpy(lastSpd, b); }
+  char b[14]; int cv = (int)lroundf(constrain(crpV, 0.0f, 9.99f) * 100.0f);
+  if (crpMain) snprintf(b, sizeof b, "%d.%02d", cv / 100, cv % 100); else snprintf(b, sizeof b, "%d", (int)spd);
+  if (strcmp(b, lastSpd)) {
+    if (crpMain) {                           // volts: big digit + smaller decimals (always the same width, never touches the arc)
+      char ip[12], dp[12]; snprintf(ip, sizeof ip, "%d", cv / 100); snprintf(dp, sizeof dp, ".%02d", cv % 100);
+      int iw = tft.textWidth("0", 6), dw = tft.textWidth(".00", 4), x0 = 160 - (iw + dw) / 2;
+      txt(ip, x0, 112, 6, cICE, cBG, ML_DATUM);
+      txt(dp, x0 + iw, 136, 4, cICE, cBG, BL_DATUM, dw);
+    } else txt(b, 160, 112, 6, cTEXT, cBG, MC_DATUM, 96);
+    strcpy(lastSpd, b);
+  }
   snprintf(b, sizeof b, "%d rpm", (int)rpm);
-  if (strcmp(b, lastRpm)) { txt(b, 160, 72, 2, cICE, cBG, TC_DATUM, 90); strcpy(lastRpm, b); }
+  if (strcmp(b, lastRpm)) { txt(b, 160, 72, 2, cICE, cBG, TC_DATUM, 84); strcpy(lastRpm, b); }
   int lit = rpm < 3000 ? 0 : min(14, (int)((rpm - 3000) * 14.0f / max(500, shiftRpm - 3000)) + 1);
   if (lit != lastLit) {
-    for (int i = 0; i < 14; i++) tft.fillRoundRect(4 + i * 22, 20, 19, 4, 2, i < lit ? (i >= 11 ? cBAD : cBLUE) : cDARK);
+    for (int i = 0; i < 14; i++) tft.fillRoundRect(4 + i * 22, 20, 19, 4, 2, i < lit ? (i >= 11 ? cHOT : cBLUE) : cDARK);
     lastLit = lit;
   }
   for (int i = 0; i < 6; i++) tileDyn(i);
-  int px = (int)(constrain(crpV / 5.0f, 0.0f, 1.0f) * 132);
-  if (px != lastCrpPx) {
-    char c[12]; snprintf(c, sizeof c, "%.2f V", crpV);
-    txt(c, 112, 191, 2, cTEXT, cPANEL, TL_DATUM, 56);
-    tft.fillRect(176, 195, px, 8, cBLUE); tft.fillRect(176 + px, 195, 132 - px, 8, cDARK);
-    lastCrpPx = px;
-  }
+  char c[10]; int px;
+  if (crpMain) { snprintf(c, sizeof c, "%d", (int)spd); px = (int)(constrain(spd / 180.0f, 0.0f, 1.0f) * 132); }
+  else { snprintf(c, sizeof c, "%.2f", crpV); px = (int)(constrain(crpV / 5.0f, 0.0f, 1.0f) * 132); }
+  if (strcmp(c, lastStrip)) { txt(c, 112, 191, 2, cTEXT, cPANEL, TL_DATUM, 36); strcpy(lastStrip, c); }
+  if (px != lastCrpPx) { tft.fillRect(176, 195, px, 8, cBLUE); tft.fillRect(176 + px, 195, 132 - px, 8, cDARK); lastCrpPx = px; }
 }
 
 // ---------- data screen ----------
 static int listOff = 0, listIds[NPID], nList = 0;
-static char dcache[12][14], rcache[8][22];
+static char dcache[12][14], rcache[8][28];
 static void buildList() { nList = 0; for (int i = 0; i < NPID; i++) if (demoMode || psup[PIDS[i].id]) listIds[nList++] = i; if (listOff > max(0, nList - 8)) listOff = max(0, nList - 8); }
+static int unitY(int i) {                    // unit sits beside the label if it fits there, else small at the bottom right
+  return (5 + strW(DIS[i].lab) + 4 + tft.textWidth(DIS[i].unit, 1) <= 72) ? 6 : 38;
+}
 static void dataStatic() {
   btn(4, 28, 70, 18, S_MAINV, !allMode); btn(78, 28, 90, 18, S_ALLPID, allMode);
   memset(dcache, 0, sizeof dcache); memset(rcache, 0, sizeof rcache);
@@ -468,6 +607,7 @@ static void dataStatic() {
     for (int i = 0; i < 12; i++) {
       int x = 4 + (i % 4) * 78, y = 50 + (i / 4) * 52; card(x, y, 75, 48);
       label(DIS[i].lab, x + 5, y + 3, cDIM, cPANEL);
+      if (DIS[i].unit[0] && unitY(i) == 6) txt(DIS[i].unit, x + 71, y + 6, 1, cDIM, cPANEL, TR_DATUM);
     }
   } else {
     buildList(); tft.fillRect(4, 50, 284, 156, cBG);
@@ -483,8 +623,10 @@ static void dataDyn() {
       float v = getVal(DIS[i].pid, ok) * DIS[i].mul;
       if (ok) fmtv(b, sizeof b, v, DIS[i].dec); else { strcpy(b, "--"); col = cDIM; }
       if (strcmp(b, dcache[i])) {
-        txt(b, x + 6, y + 22, 4, col, cPANEL, TL_DATUM, 75 - 12 - (int)strlen(DIS[i].unit) * 8);
-        txt(DIS[i].unit, x + 71, y + 30, 2, cDIM, cPANEL, TR_DATUM); strcpy(dcache[i], b);
+        bool low = DIS[i].unit[0] && unitY(i) == 38;
+        txt(b, x + 6, y + 22, 4, col, cPANEL, TL_DATUM, low ? 75 - 12 - tft.textWidth(DIS[i].unit, 1) : 63);
+        if (low) txt(DIS[i].unit, x + 71, y + 38, 1, cDIM, cPANEL, TR_DATUM);
+        strcpy(dcache[i], b);
       }
     }
   } else {
@@ -494,7 +636,7 @@ static void dataDyn() {
       if (listOff + r >= nList) { if (rcache[r][0] != '-') { tft.fillRect(4, y, 284, 19, cBG); strcpy(rcache[r], "-"); } continue; }
       const Pid& p = PIDS[listIds[listOff + r]];
       float v = getVal(p.id, ok); if (ok) snprintf(b, sizeof b, "%.*f %s", p.dec, v, p.unit); else strcpy(b, "--");
-      char key[22]; snprintf(key, sizeof key, "%02X%s", p.id, b);
+      char key[28]; snprintf(key, sizeof key, "%02X%s", p.id, b);
       if (strcmp(key, rcache[r])) {
         tft.fillRect(4, y, 284, 18, cBG); tft.drawFastHLine(4, y + 18, 284, cDARK);
         char h[4]; snprintf(h, sizeof h, "%02X", p.id);
@@ -598,22 +740,183 @@ static void codesList() {
 static void codesStatic() { btn(4, 166, 150, 26, S_READ, false); btn(160, 166, 150, 26, S_CLEAR, true); codesList(); }
 static void codesDyn() { if (lastCodeVer != codeVer || lastMil != mil) codesList(); }
 
-// ---------- setup ----------
-static void setupRow(int i) {
-  int y = 28 + i * 30; card(4, y, 312, 28);
-  static const StrId L[6] = {S_LANG, S_SRC, S_SHIFT, S_WARN, S_BRIGHT, S_TEST};
-  label(L[i], 10, y + 6, cTEXT, cPANEL);
+// ---------- setup (two tabs: General | Bluetooth) ----------
+static const int SU_Y = 50, SU_P = 26;       // first row y and row pitch
+static void setupTabs() { btn(4, 28, 100, 18, S_GENERAL, setupTab == 0); btn(108, 28, 100, 18, S_BLUETOOTH, setupTab == 1); }
+
+static void themeChip(int k, int x, int by) {   // each chip previews its own colours
+  const uint16_t* p = THEMES[k]; bool sel = theme == k;
+  tft.fillRoundRect(x, by, 100, 20, 6, p[2]);
+  tft.drawRoundRect(x, by, 100, 20, 6, sel ? p[5] : p[3]);
+  if (sel) tft.drawRoundRect(x + 1, by + 1, 98, 18, 5, p[5]);
+  tft.fillCircle(x + 11, by + 10, 4, p[5]);
+  labelC(k ? S_THRED : S_THBLUE, x + 57, by + 2, p[8], p[2]);
+}
+static void genRow(int i) {
+  int y = SU_Y + i * SU_P, by = y + 2; card(4, y, 312, 24);
+  static const StrId L[6] = {S_LANG, S_THEME, S_SHIFT, S_WARN, S_BRIGHT, S_TEST};
+  label(L[i], 10, y + 4, cTEXT, cPANEL);
   char b[12];
   switch (i) {
-    case 0: card(196, y + 2, 56, 24, thai ? cBLUE : cPANEL2, thai ? cICE : cLINE); labelThai(S_THAI, 224, y + 6, thai ? cBG : cTEXT, thai ? cBLUE : cPANEL2); btnS(258, y + 2, 54, 24, "EN", !thai); break;
-    case 1: btn(196, y + 2, 56, 24, S_DEMO, demoMode); btnS(258, y + 2, 54, 24, "OBD BT", !demoMode); break;
-    case 2: btnS(196, y + 2, 24, 24, "-", false); snprintf(b, sizeof b, "%d", shiftRpm); txt(b, 254, y + 7, 2, cICE, cPANEL, TC_DATUM, 60); btnS(288, y + 2, 24, 24, "+", false); break;
-    case 3: btn(196, y + 2, 56, 24, S_ON, warnOn); btn(258, y + 2, 54, 24, S_OFF, !warnOn); break;
-    case 4: btnS(196, y + 2, 24, 24, "-", false); snprintf(b, sizeof b, "%d%%", bright); txt(b, 254, y + 7, 2, cICE, cPANEL, TC_DATUM, 60); btnS(288, y + 2, 24, 24, "+", false); break;
-    case 5: btn(258, y + 2, 54, 24, S_TESTB, false); break;
+    case 0: card(196, by, 56, 20, thai ? cBLUE : cPANEL2, thai ? cICE : cLINE); labelThai(S_THAI, 224, by + 2, thai ? cBG : cTEXT, thai ? cBLUE : cPANEL2); btnS(258, by, 54, 20, "EN", !thai); break;
+    case 1: themeChip(0, 108, by); themeChip(1, 212, by); break;
+    case 2: btnS(196, by, 24, 20, "-", false); snprintf(b, sizeof b, "%d", shiftRpm); txt(b, 254, by + 2, 2, cICE, cPANEL, TC_DATUM, 60); btnS(288, by, 24, 20, "+", false); break;
+    case 3: btn(196, by, 56, 20, S_ON, warnOn); btn(258, by, 54, 20, S_OFF, !warnOn); break;
+    case 4: btnS(196, by, 24, 20, "-", false); snprintf(b, sizeof b, "%d%%", bright); txt(b, 254, by + 2, 2, cICE, cPANEL, TC_DATUM, 60); btnS(288, by, 24, 20, "+", false); break;
+    case 5: btn(258, by, 54, 20, S_TESTB, false); break;
   }
 }
-static void setupStatic() { for (int i = 0; i < 6; i++) setupRow(i); }
+
+// --- Bluetooth tab: data source, chosen adapter, list of nearby devices ---
+static BtDev btView[MAXBT];
+static int nBtView = 0, btOff = 0, btViewVer = -1, btViewScan = -1;
+static uint32_t lastBtDraw = 0;
+
+static void btSrcRow() {
+  int y = 50, by = y + 2; card(4, y, 312, 24); label(S_SRC, 10, y + 4, cTEXT, cPANEL);
+  btn(196, by, 56, 20, S_DEMO, demoMode); btnS(258, by, 54, 20, "OBD BT", !demoMode);
+}
+static void btDevRow() {
+  int y = 77, by = y + 2; card(4, y, 312, 24); label(S_BTDEV, 10, y + 4, cTEXT, cPANEL);
+  const char* nm = selName[0] ? selName : selAddr;
+  if (nm[0]) { char t[32]; fitText(t, sizeof t, nm, 2, 150); txt(t, 92, y + 4, 2, cICE, cPANEL, TL_DATUM); }
+  else label(S_NOSEL, 92, y + 4, cDIM, cPANEL);
+  btn(250, by, 62, 20, S_SCAN, scanState == 1);
+}
+static bool btBetter(const BtDev& a, const BtDev& b, bool byRssi) {   // OBD-looking names first, then strongest signal
+  if (a.obd != b.obd) return a.obd;
+  if (!byRssi) return false;
+  return (a.rssi ? a.rssi : -127) > (b.rssi ? b.rssi : -127);
+}
+static void btBuildView() {
+  portENTER_CRITICAL(&btMux); nBtView = btCount; memcpy(btView, btList, sizeof(BtDev) * nBtView); portEXIT_CRITICAL(&btMux);
+  bool byRssi = scanState != 1;                 // keep rows still while the scan is running
+  for (int i = 1; i < nBtView; i++) {
+    BtDev t = btView[i]; int j = i - 1;
+    while (j >= 0 && btBetter(t, btView[j], byRssi)) { btView[j + 1] = btView[j]; j--; }
+    btView[j + 1] = t;
+  }
+  if (btOff > max(0, nBtView - 4)) btOff = max(0, nBtView - 4);
+}
+static void btRow(int r) {
+  int y = 122 + r * 21, i = btOff + r;
+  tft.fillRect(4, y, 270, 21, cBG);
+  if (i >= nBtView) return;
+  const BtDev& d = btView[i]; bool sel = !strcmp(d.addr, selAddr); uint16_t bg = sel ? cPANEL2 : cPANEL;
+  card(4, y, 270, 19, bg, sel ? cBLUE : cLINE);
+  int x = 10;
+  if (d.obd) { tft.fillRoundRect(9, y + 3, 28, 13, 3, cBLUE); txt("OBD", 23, y + 9, 1, cBG, cBLUE, MC_DATUM); x = 42; }
+  char t[32]; fitText(t, sizeof t, d.name[0] ? d.name : d.addr, 2, 200 - x);
+  txt(t, x, y + 2, 2, d.name[0] ? (sel ? cTEXT : cICE) : cDIM, bg, TL_DATUM);
+  if (sel) { tft.drawLine(224, y + 10, 228, y + 14, cICE); tft.drawLine(225, y + 10, 229, y + 14, cICE); tft.drawLine(229, y + 14, 237, y + 4, cICE); tft.drawLine(230, y + 14, 238, y + 4, cICE); }
+  int lv = !d.rssi ? 0 : d.rssi >= -55 ? 4 : d.rssi >= -67 ? 3 : d.rssi >= -78 ? 2 : 1;
+  for (int k = 0; k < 4; k++) { int h = 3 + k * 2; tft.fillRect(246 + k * 5, y + 16 - h, 3, h, k < lv ? cICE : cDARK); }
+}
+static void btArrows() {
+  bool up = btOff > 0, dn = btOff + 4 < nBtView;
+  card(278, 122, 38, 40); card(278, 165, 38, 40);
+  tft.fillTriangle(297, 130, 289, 152, 305, 152, up ? cICE : cDARK);
+  tft.fillTriangle(297, 197, 289, 175, 305, 175, dn ? cICE : cDARK);
+}
+static void btListDraw() {
+  btBuildView(); btViewVer = btVer; btViewScan = scanState; lastBtDraw = millis();
+  int st = scanState, n = nBtView;
+  tft.fillRect(4, 104, 312, 17, cBG);
+  label(n > 0 && st != 1 ? S_TAPPICK : S_NEARBY, 8, 104, cDIM, cBG);
+  if (n > 0 && st == 1) label(S_SCANNING, 316 - strW(S_SCANNING), 104, cWARN, cBG);
+  else if (n > 0) {
+    char c[12]; snprintf(c, sizeof c, "%d", n);
+    int w = strW(S_FOUND), cw = tft.textWidth(c, 2);
+    txt(c, 316 - w - 4 - cw, 104, 2, cICE, cBG); label(S_FOUND, 316 - w, 104, cDIM, cBG);
+  }
+  for (int r = 0; r < 4; r++) btRow(r);
+  if (n == 0) {
+    StrId m = st == 1 ? S_SCANNING : st == 2 ? S_NOTFOUND : st == 3 ? S_SCANFAIL : S_PRESSSCAN;
+    labelC(m, 140, 158, st == 3 ? cBAD : cDIM, cBG);
+  }
+  btArrows();
+}
+static void btDyn() {
+  bool stateChg = btViewScan != scanState;
+  if (btViewVer == btVer && !stateChg) return;
+  if (!stateChg && millis() - lastBtDraw < 250) return;
+  btListDraw();
+  if (stateChg) btDevRow();
+}
+static void btPick(int i) {                  // user tapped a device: remember it, switch to OBD mode and connect
+  BtDev d = btView[i];
+  portENTER_CRITICAL(&btMux);
+  memcpy(selAddr, d.addr, sizeof selAddr); strcpy(selName, d.name[0] ? d.name : d.addr);
+  portEXIT_CRITICAL(&btMux);
+  demoMode = false; carBuf[0] = 0; linkState = 1;
+  scanStop = true; reconnectReq = true;
+  savePrefs(); updateWants();
+  drawTop(); btSrcRow(); btDevRow(); btListDraw();
+}
+
+static void setupStatic() {
+  setupTabs();
+  if (setupTab == 0) { for (int i = 0; i < 6; i++) genRow(i); }
+  else { btSrcRow(); btDevRow(); btListDraw(); }
+}
+static void setupSwitch(int t) {
+  if (t == setupTab) return;
+  setupTab = t; tft.fillRect(0, 22, 320, 188, cBG); setupStatic();
+}
+static void genTouch(int x, int y) {
+  if (y < SU_Y) return;
+  int r = (y - SU_Y) / SU_P, off = (y - SU_Y) % SU_P;
+  if (r > 5 || off < 2 || off > 21) return;
+  int by = SU_Y + r * SU_P + 2; bool ch = false;
+  switch (r) {
+    case 0:
+      if (hit(x, y, 196, by, 56, 20)) { thai = true; ch = true; } else if (hit(x, y, 258, by, 54, 20)) { thai = false; ch = true; }
+      if (ch) { savePrefs(); redraw = true; }
+      break;
+    case 1:
+      for (int k = 0; k < NTHEME; k++) if (hit(x, y, k ? 212 : 108, by, 100, 20) && theme != k) { theme = k; applyTheme(k); savePrefs(); redraw = true; }
+      break;
+    case 2:
+      if (hit(x, y, 196, by, 24, 20)) { shiftRpm = max(4000, shiftRpm - 250); ch = true; }
+      else if (hit(x, y, 288, by, 24, 20)) { shiftRpm = min(7000, shiftRpm + 250); ch = true; }
+      if (ch) { savePrefs(); genRow(2); }
+      break;
+    case 3:
+      if (hit(x, y, 196, by, 56, 20)) { warnOn = true; ch = true; } else if (hit(x, y, 258, by, 54, 20)) { warnOn = false; ch = true; }
+      if (ch) { savePrefs(); genRow(3); }
+      break;
+    case 4:
+      if (hit(x, y, 196, by, 24, 20)) { bright = max(10, bright - 10); ch = true; }
+      else if (hit(x, y, 288, by, 24, 20)) { bright = min(100, bright + 10); ch = true; }
+      if (ch) { applyBright(); savePrefs(); genRow(4); }
+      break;
+    case 5:
+      if (hit(x, y, 258, by, 54, 20)) testUntil = millis() + 8000;
+      break;
+  }
+}
+static void btTouch(int x, int y) {
+  if (hit(x, y, 196, 52, 56, 20)) {                                            // Demo
+    demoMode = true; linkState = 0; carBuf[0] = 0; savePrefs(); btSrcRow();
+  } else if (hit(x, y, 258, 52, 54, 20)) {                                      // OBD BT
+    demoMode = false; carBuf[0] = 0; linkState = selAddr[0] ? 1 : 3;
+    if (!selAddr[0] && scanState != 1) { scanState = 1; btVer = btVer + 1; scanReq = true; btOff = 0; }   // nothing chosen yet: look around
+    savePrefs(); btSrcRow();
+  } else if (hit(x, y, 250, 79, 62, 20)) {                                      // Scan
+    if (scanState != 1) { scanState = 1; btVer = btVer + 1; scanReq = true; btOff = 0; btDevRow(); }
+  } else if (hit(x, y, 278, 122, 38, 40)) {                                     // list up
+    if (btOff > 0) { btOff = max(0, btOff - 4); btListDraw(); }
+  } else if (hit(x, y, 278, 165, 38, 40)) {                                     // list down
+    if (btOff + 4 < nBtView) { btOff += 4; btListDraw(); }
+  } else {
+    for (int r = 0; r < 4; r++) if (hit(x, y, 4, 122 + r * 21, 270, 19) && btOff + r < nBtView) { btPick(btOff + r); break; }
+  }
+}
+static void setupTouch(int x, int y) {
+  if (hit(x, y, 4, 28, 100, 18)) { setupSwitch(0); return; }
+  if (hit(x, y, 108, 28, 100, 18)) { setupSwitch(1); return; }
+  if (setupTab == 0) genTouch(x, y); else btTouch(x, y);
+}
 
 // ---------- warnings ----------
 static int warnKind = -1; static bool warnDismissed[3];
@@ -657,7 +960,7 @@ static void updateScreen() {
   if (lastLink != linkState || strcmp(lastCar, carBuf)) { lastLink = linkState; strcpy(lastCar, carBuf); drawTop(); }
   switch (scr) {
     case SC_DASH: dashDyn(); break; case SC_DATA: dataDyn(); break; case SC_GRAPH: graphDyn(); break;
-    case SC_TRIP: tripDyn(); break; case SC_CODES: codesDyn(); break; default: break;
+    case SC_TRIP: tripDyn(); break; case SC_CODES: codesDyn(); break; case SC_SETUP: if (setupTab == 1) btDyn(); break; default: break;
   }
 }
 
@@ -680,6 +983,7 @@ static void handleTouch(int x, int y) {
       for (int i = 0; i < 6; i++) if (hit(x, y, TILE_X[i], TILE_Y[i], 88, 50)) {
         slots[i] = (slots[i] + 1) % NMET; savePrefs(); tileStatic(i); updateWants();
       }
+      if (hit(x, y, 96, 44, 128, 128) || hit(x, y, 4, 190, 312, 18)) { crpMain = !crpMain; savePrefs(); dashSwap(); }
       break;
     case SC_DATA:
       if (hit(x, y, 4, 28, 70, 18)) { allMode = false; redraw = true; updateWants(); }
@@ -702,19 +1006,7 @@ static void handleTouch(int x, int y) {
         else if (linkState == 2) { req = 2; } else { codeCount = 0; codeState = 4; codeVer++; }
       }
       break;
-    case SC_SETUP:
-      if (hit(x, y, 196, 30, 56, 24)) { thai = true; savePrefs(); redraw = true; }
-      else if (hit(x, y, 258, 30, 54, 24)) { thai = false; savePrefs(); redraw = true; }
-      else if (hit(x, y, 196, 60, 56, 24)) { demoMode = true; linkState = 0; carBuf[0] = 0; savePrefs(); setupRow(1); }
-      else if (hit(x, y, 258, 60, 54, 24)) { demoMode = false; linkState = 1; savePrefs(); setupRow(1); }
-      else if (hit(x, y, 196, 90, 24, 24)) { shiftRpm = max(4000, shiftRpm - 250); savePrefs(); setupRow(2); }
-      else if (hit(x, y, 288, 90, 24, 24)) { shiftRpm = min(7000, shiftRpm + 250); savePrefs(); setupRow(2); }
-      else if (hit(x, y, 196, 120, 56, 24)) { warnOn = true; savePrefs(); setupRow(3); }
-      else if (hit(x, y, 258, 120, 54, 24)) { warnOn = false; savePrefs(); setupRow(3); }
-      else if (hit(x, y, 196, 150, 24, 24)) { bright = max(10, bright - 10); applyBright(); savePrefs(); setupRow(4); }
-      else if (hit(x, y, 288, 150, 24, 24)) { bright = min(100, bright + 10); applyBright(); savePrefs(); setupRow(4); }
-      else if (hit(x, y, 258, 180, 54, 24)) { testUntil = millis() + 8000; }
-      break;
+    case SC_SETUP: setupTouch(x, y); break;
   }
 }
 
@@ -731,7 +1023,7 @@ void setup() {
   ledcSetup(0, 5000, 8); ledcAttachPin(21, 0); applyBright();
   tsSPI.begin(25, 39, 32, 33); ts.begin(tsSPI); ts.setRotation(1);
   analogSetPinAttenuation(CRP_PIN, ADC_11db);
-  linkState = demoMode ? 0 : 1;
+  linkState = demoMode ? 0 : (selAddr[0] ? 1 : 3);
   txt("MAZDA 2", 160, 100, 4, cTEXT, cBG, MC_DATUM);
   txt("SMART GAUGE", 160, 132, 2, cBLUE, cBG, MC_DATUM);
   updateWants(); delay(900);
