@@ -241,13 +241,13 @@ static void pollPid(uint8_t pid, int& fails) {
 }
 
 static const char* const BT_NAMES[] = {"OBDII", "V-LINK", "OBD2", "Vgate", "VEEPEAK", "OBDLink", "ELM327", "iCar"};
-static bool btStarted = false;
+static bool btReady = false;
 
 void obdTask(void*) {
   int rr = 0, fails = 0; uint32_t lastMil = 0;
   for (;;) {
-    if (demoMode) { if (btStarted && BT.connected()) BT.disconnect(); linkState = 0; vTaskDelay(200); continue; }
-    if (!btStarted) { BT.begin("MAZDA-GAUGE", true); BT.setPin("1234"); btStarted = true; }
+    if (demoMode) { if (btReady && BT.connected()) BT.disconnect(); linkState = 0; vTaskDelay(200); continue; }
+    if (!btReady) { BT.begin("MAZDA-GAUGE", true); BT.setPin("1234"); btReady = true; }
     if (!BT.connected()) {
       linkState = 1; bool ok = false;
       for (const char* nm : BT_NAMES) { if (demoMode) break; if (BT.connect(String(nm))) { ok = true; break; } }
