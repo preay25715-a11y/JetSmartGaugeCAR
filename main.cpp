@@ -18,7 +18,7 @@
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "V3.0"
+#define FW_VERSION "V4.0"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -26,24 +26,9 @@ XPT2046_Touchscreen ts(33, 36);
 BluetoothSerial BT;
 Preferences prefs;
 
-constexpr uint16_t C(uint8_t r, uint8_t g, uint8_t b) { return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)); }
-static const uint16_t RED_AL = C(255, 48, 56);       // alert red (same in both themes)
-
-// ---------- themes (the background is black in both) ----------
-struct Theme { uint16_t bg, panel, panel2, line, dark, acc, accL, dim, text, hot, good, warn, accDim; };
-static const int NTHEME = 2;
-static const Theme THEMES[NTHEME] = {
-  // 0 = black-blue
-  {C(0, 0, 0), C(8, 12, 18), C(14, 22, 34), C(30, 40, 56), C(17, 25, 36), C(41, 142, 250), C(126, 200, 255), C(138, 152, 170), C(245, 247, 250), C(255, 64, 64), C(48, 224, 120), C(255, 176, 32), C(12, 40, 74)},
-  // 1 = black-red
-  {C(0, 0, 0), C(16, 9, 11), C(30, 14, 18), C(60, 32, 38), C(36, 20, 24), C(238, 44, 56), C(255, 150, 156), C(166, 142, 146), C(250, 246, 246), C(255, 176, 32), C(48, 224, 120), C(255, 228, 110), C(72, 16, 22)},
-};
-static Theme T = THEMES[0];
-static int theme = 0;
-static void applyTheme(int t) { if (t < 0 || t >= NTHEME) t = 0; theme = t; T = THEMES[t]; }
 
 // ---------- settings ----------
-static bool thai = false, demoMode = true, warnOn = true, parkOn = true;
+static bool demoMode = true, warnOn = true, parkOn = true;
 static int shiftRpm = 6500, bright = 80, tankL = 44, fuelCal = 100;
 static bool invScreen = false;                   // panel colour polarity (runtime INVON / INVOFF)
 static bool crpMain = false;                     // dash centre shows CRP volts (true) or speed (false)
@@ -449,11 +434,13 @@ static float decodePid(uint8_t id, const uint8_t* b, int n) {
   }
 }
 
+static bool snapOn = false; static uint32_t snapNow = 0; static float pvS[256]; static bool psupS[256]; static uint32_t pageS[256];   // data snapshot taken once per frame
 static float getVal(uint8_t pid, bool& ok) {
-  if (pid == 0x05 && millis() < testUntil) { ok = true; return 108; }
-  if (demoMode) { ok = true; return pv[pid]; }
-  ok = (linkState == 2) && psup[pid] && (millis() - page[pid] < 8000);
-  return pv[pid];
+  uint32_t now = snapOn ? snapNow : millis();
+  if (pid == 0x05 && now < testUntil) { ok = true; return 108; }
+  if (demoMode) { ok = true; return snapOn ? pvS[pid] : pv[pid]; }
+  ok = (linkState == 2) && (snapOn ? psupS[pid] : psup[pid]) && (now - (snapOn ? pageS[pid] : page[pid]) < 8000);
+  return snapOn ? pvS[pid] : pv[pid];
 }
 
 // ---------- ELM327 communication (runs in obdTask) ----------
@@ -779,175 +766,389 @@ static float readCrp() {
 }
 
 // =====================================================================================
-//  Text engine: anti-aliased fonts (4-bit alpha) from ui_assets.h, drawn through one RGB565 buffer so nothing flickers
+//  Graphics core (V4).  The screen is composed in horizontal bands of BAND_H rows inside tPix and pushed band by band, so every
+//  pixel is written exactly once per frame (no flicker, no stale pixels) and shapes can be anti-aliased and blended freely.
+//  Every drawing call below clips itself to the band that is being composed.
 // =====================================================================================
-enum FontId : uint8_t { F_NXL, F_NHL, F_NL, F_NM, F_NS, F_UL, F_UM, F_US, F_LS, F_LM, F_NFONT };
-static const FontRec* const FNT[F_NFONT] = {&FONT_NXL, &FONT_NHL, &FONT_NL, &FONT_NM, &FONT_NS, &FONT_UL, &FONT_UM, &FONT_US, &FONT_LS, &FONT_LM};
+enum FontId : uint8_t { F_NXL, F_NHL, F_NL, F_NM, F_NS, F_UL, F_UM, F_US, F_LS, F_LM, F_NXM, F_NFONT };
+static const FontRec* const FNT[F_NFONT] = {&FONT_NXL, &FONT_NHL, &FONT_NL, &FONT_NM, &FONT_NS, &FONT_UL, &FONT_UM, &FONT_US, &FONT_LS, &FONT_LM, &FONT_NXM};
 enum { AL_L = 0, AL_C = 1, AL_R = 2 };
 #define DEGC "\x7F" "C"
 #define DEG "\x7F"
 
-static const int TB_CAP = 7000;
-static uint16_t tPix[TB_CAP];
+static const int SCR_W = 320, SCR_H = 240, BAND_H = 20, NBAND = SCR_H / BAND_H;
+alignas(4) static uint16_t tPix[SCR_W * BAND_H];            // the band being composed (12.8 KB)
+static int bandY0 = 0, bandY1 = BAND_H;
+static uint32_t uiNow = 0;                                    // time of the frame being drawn
 
-static inline uint16_t mix565(uint16_t b, uint16_t f, int a) {          // a = 0..15 : coverage of f over b
-  if (a >= 15) return f;
-  if (a <= 0) return b;
-  int br = (b >> 11) & 31, bg = (b >> 5) & 63, bb = b & 31, fr = (f >> 11) & 31, fg = (f >> 5) & 63, fb = f & 31;
-  return (uint16_t)(((br + (fr - br) * a / 15) << 11) | ((bg + (fg - bg) * a / 15) << 5) | (bb + (fb - bb) * a / 15));
+static inline uint16_t* rowPtr(int y) { return tPix + (y - bandY0) * SCR_W; }
+static inline int clampi(int v, int a, int b) { return v < a ? a : v > b ? b : v; }
+static inline float clampf(float v, float a, float b) { return v < a ? a : v > b ? b : v; }
+
+// ---------- colours ----------
+struct Rgb { uint8_t r, g, b; };
+static inline uint16_t c565(Rgb c) { return (uint16_t)(((c.r & 0xF8) << 8) | ((c.g & 0xFC) << 3) | (c.b >> 3)); }
+constexpr uint16_t C(uint8_t r, uint8_t g, uint8_t b) { return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)); }
+struct Theme { Rgb bg, panel, panel2, line, dark, acc, accL, acc2, accD, dim, text, hot, good, warn, track, disc, discLine, tabbg, tabline, sep, chartbg, grid, onacc; };
+struct Pal { uint16_t bg, panel, panel2, line, dark, acc, accL, acc2, accD, dim, text, hot, good, warn, track, disc, discLine, tabbg, tabline, sep, chartbg, grid, onacc; };
+static const int NTHEME = 2;
+static const Theme THEMES[NTHEME] = {
+  // 0 = black-blue
+  {{6, 13, 27}, {10, 20, 38}, {14, 28, 53}, {23, 49, 92}, {18, 36, 74}, {47, 140, 255}, {155, 216, 255}, {74, 163, 255}, {27, 95, 216}, {111, 136, 179}, {232, 241, 255},
+   {255, 77, 94}, {53, 224, 176}, {255, 176, 32}, {16, 33, 63}, {6, 15, 32}, {20, 41, 79}, {5, 13, 28}, {15, 33, 64}, {17, 36, 68}, {6, 16, 31}, {18, 38, 74}, {2, 16, 36}},
+  // 1 = black-red
+  {{13, 6, 9}, {24, 10, 14}, {38, 15, 21}, {88, 34, 46}, {60, 22, 30}, {255, 70, 85}, {255, 170, 178}, {255, 110, 120}, {170, 30, 50}, {178, 138, 146}, {255, 240, 241},
+   {255, 176, 32}, {53, 224, 176}, {255, 222, 110}, {46, 18, 24}, {16, 6, 9}, {70, 26, 35}, {11, 5, 8}, {50, 20, 27}, {52, 22, 30}, {15, 7, 10}, {56, 24, 32}, {30, 2, 6}},
+};
+static Theme TA = THEMES[0];                  // current theme as RGB888 ...
+static Pal T;                                 // ... and as RGB565
+static int theme = 0;
+static void applyTheme(int t) {
+  static_assert(sizeof(Theme) == 23 * 3 && sizeof(Pal) == 23 * 2, "theme layout");
+  if (t < 0 || t >= NTHEME) t = 0;
+  theme = t; TA = THEMES[t];
+  const Rgb* s = &TA.bg; uint16_t* d = &T.bg;
+  for (int i = 0; i < 23; i++) d[i] = c565(s[i]);
 }
-static const GlyphRec* glyphOf(const FontRec* f, unsigned char ch) {
-  if (f == &FONT_UL || f == &FONT_UM || f == &FONT_US) { if (ch >= 'a' && ch <= 'z') ch = (unsigned char)(ch - 32); }   // these fonts are capitals only
+static const Rgb RGB_ALRED = {255, 77, 94}, RGB_ALBG = {16, 5, 10}, RGB_ALCARD = {26, 8, 16}, RGB_VIOLET = {168, 130, 255};
+static const uint16_t RED_AL = C(255, 77, 94), ALBG = C(16, 5, 10), ALTXT = C(255, 179, 187), WHITE = C(255, 255, 255), VIOLET = C(168, 130, 255), ALCARD = C(26, 8, 16);
+
+// blend src over dst with alpha a (0..255)
+static inline uint16_t blendA(uint16_t d, uint16_t s, uint32_t a) {
+  if (a == 0) return d;
+  if (a >= 255) return s;
+  a += a >> 7; uint32_t ia = 256 - a;
+  uint32_t r = (((d >> 11) & 31) * ia + ((s >> 11) & 31) * a + 128) >> 8;
+  uint32_t g = (((d >> 5) & 63) * ia + ((s >> 5) & 63) * a + 128) >> 8;
+  uint32_t b = ((d & 31) * ia + (s & 31) * a + 128) >> 8;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+static uint16_t mixRgb(Rgb a, Rgb b, int t256) {          // t = 0..256 : a -> b, as RGB565
+  return C((uint8_t)(a.r + ((b.r - a.r) * t256 + 128) / 256), (uint8_t)(a.g + ((b.g - a.g) * t256 + 128) / 256), (uint8_t)(a.b + ((b.b - a.b) * t256 + 128) / 256));
+}
+
+// ---------- plain fills ----------
+static void fillBand(uint16_t c) {
+  uint32_t cc = (uint32_t)c | ((uint32_t)c << 16); uint32_t* p = (uint32_t*)tPix;
+  for (int i = 0; i < SCR_W * BAND_H / 2; i++) p[i] = cc;
+}
+static void fr(int x, int y, int w, int h, uint16_t c) {
+  int x0 = max(x, 0), x1 = min(x + w, SCR_W), y0 = max(y, bandY0), y1 = min(y + h, bandY1);
+  if (x1 <= x0 || y1 <= y0) return;
+  for (int yy = y0; yy < y1; yy++) { uint16_t* p = rowPtr(yy); for (int i = x0; i < x1; i++) p[i] = c; }
+}
+static void frA(int x, int y, int w, int h, uint16_t c, uint32_t a) {
+  int x0 = max(x, 0), x1 = min(x + w, SCR_W), y0 = max(y, bandY0), y1 = min(y + h, bandY1);
+  if (x1 <= x0 || y1 <= y0) return;
+  for (int yy = y0; yy < y1; yy++) { uint16_t* p = rowPtr(yy); for (int i = x0; i < x1; i++) p[i] = blendA(p[i], c, a); }
+}
+static inline void hl(int x, int y, int w, uint16_t c) { fr(x, y, w, 1, c); }
+static inline void plotA(int x, int y, uint16_t c, uint32_t a) {
+  if (x < 0 || x >= SCR_W || y < bandY0 || y >= bandY1 || a == 0) return;
+  uint16_t* p = rowPtr(y) + x; *p = blendA(*p, c, a);
+}
+
+// ---------- rounded rectangles ----------
+static uint8_t cvTab[15][14][14]; static bool cvInit[15];          // coverage of the corner pixels of a circle of radius r (index = pixel counted from the outermost one)
+static void cvBuild(int r) {
+  for (int k = 0; k < r; k++) for (int j = 0; j < r; j++) {
+    float dx = j + 0.5f - r, dy = k + 0.5f - r, d = sqrtf(dx * dx + dy * dy);
+    cvTab[r][k][j] = (uint8_t)(clampf(r - d + 0.5f, 0, 1) * 255 + 0.5f);
+  }
+  cvInit[r] = true;
+}
+static inline uint32_t cvOut(int r, int k, int j) { if (r <= 0 || k >= r || j >= r) return 255; return cvTab[r][k][j]; }
+static inline uint32_t cvIn(int r, int k, int j) {            // the shape inset by 1 px (radius r-1)
+  if (k < 1 || j < 1) return 0;
+  return cvOut(r - 1, k - 1, j - 1);
+}
+// Rounded rectangle.  Fill: solid (top == nullptr) or a vertical gradient top -> bot.  bc: 1 px border colour inside the box, or -1.
+static void rrImpl(int x, int y, int w, int h, int r, const Rgb* top, const Rgb* bot, uint16_t solid, int bc) {
+  if (w <= 0 || h <= 0) return;
+  int y0 = max(y, bandY0), y1 = min(y + h, bandY1);
+  if (y1 <= y0 || x >= SCR_W || x + w <= 0) return;
+  r = min(r, min(w / 2, h / 2)); if (r > 14) r = 14; if (r < 0) r = 0;
+  if (r > 0 && !cvInit[r]) cvBuild(r);
+  if (r > 1 && bc >= 0 && !cvInit[r - 1]) cvBuild(r - 1);
+  for (int yy = y0; yy < y1; yy++) {
+    int kt = yy - y, kb = y + h - 1 - yy, k = min(kt, kb);
+    uint16_t fc = top ? mixRgb(*top, *bot, ((2 * kt + 1) * 256) / (2 * h)) : solid;
+    uint16_t* p = rowPtr(yy);
+    if (k >= r && k >= 1) {                                   // straight rows
+      int xa = max(x, 0), xb = min(x + w, SCR_W);
+      if (bc < 0) { for (int i = xa; i < xb; i++) p[i] = fc; }
+      else {
+        for (int i = max(x + 1, 0); i < min(x + w - 1, SCR_W); i++) p[i] = fc;
+        if (x >= 0 && x < SCR_W) p[x] = (uint16_t)bc;
+        if (x + w - 1 >= 0 && x + w - 1 < SCR_W) p[x + w - 1] = (uint16_t)bc;
+      }
+      continue;
+    }
+    // rows in the rounded zone, or the first / last row (border line)
+    for (int zone = 0; zone < 2; zone++) {                     // 0 = left corner, 1 = right corner
+      for (int j = 0; j < r; j++) {
+        int px = zone == 0 ? x + j : x + w - 1 - j;
+        if (px < 0 || px >= SCR_W) continue;
+        uint32_t o = cvOut(r, k, j), in = cvIn(r, k, j);
+        if (o == 0) continue;
+        uint16_t d = p[px];
+        d = blendA(d, fc, o);
+        if (bc >= 0 && o > in) d = blendA(d, (uint16_t)bc, o - in);
+        p[px] = d;
+      }
+    }
+    int sa = max(x + r, 0), sb = min(x + w - r, SCR_W);        // straight part of this row
+    uint16_t sc = fc;
+    if (bc >= 0 && k < 1) sc = (uint16_t)bc;
+    for (int i = sa; i < sb; i++) p[i] = sc;
+  }
+}
+static void rr(int x, int y, int w, int h, int r, uint16_t fill, int bc = -1) { rrImpl(x, y, w, h, r, nullptr, nullptr, fill, bc); }
+static void rrG(int x, int y, int w, int h, int r, const Rgb& top, const Rgb& bot, int bc = -1) { rrImpl(x, y, w, h, r, &top, &bot, 0, bc); }
+static void tile(int x, int y, int w, int h, int r = 9) { rrG(x, y, w, h, r, TA.panel2, TA.panel, T.line); }
+
+// signed distance (px) of a pixel centre to a rounded rectangle; negative inside
+static inline float sdfRR(float px, float py, float x, float y, float w, float h, float r) {
+  float qx = fabsf(px - (x + w * 0.5f)) - (w * 0.5f - r), qy = fabsf(py - (y + h * 0.5f)) - (h * 0.5f - r);
+  float mx = qx > 0 ? qx : 0, my = qy > 0 ? qy : 0;
+  return sqrtf(mx * mx + my * my) + fminf(fmaxf(qx, qy), 0.0f) - r;
+}
+static inline float covD(float d) { float c = 0.5f - d; return c < 0 ? 0 : c > 1 ? 1 : c; }
+static const uint8_t HALO_A[4] = {87, 51, 26, 12};          // alpha of the 1 px rings around a shape: .34 .20 .10 .045
+// soft glow: n one-pixel rings around a rounded rectangle
+static void halo(int x, int y, int w, int h, int r, uint16_t col, int n) {
+  r = min(r, min(w / 2, h / 2));
+  int ya = max(y - n, bandY0), yb = min(y + h + n, bandY1);
+  for (int yy = ya; yy < yb; yy++) {
+    uint16_t* p = rowPtr(yy);
+    bool mid = yy >= y + r && yy < y + h - r;
+    for (int i = 1; i <= n && mid; i++) {                      // straight sides: ring i is exactly the i-th pixel
+      int xl = x - i, xr = x + w - 1 + i;
+      if (xl >= 0 && xl < SCR_W) p[xl] = blendA(p[xl], col, HALO_A[i - 1]);
+      if (xr >= 0 && xr < SCR_W) p[xr] = blendA(p[xr], col, HALO_A[i - 1]);
+    }
+    if (mid) continue;
+    int irow = yy < y ? y - yy : yy >= y + h ? yy - (y + h) + 1 : 0;
+    for (int px = x - n; px < x + w + n; px++) {
+      if (px < 0 || px >= SCR_W) continue;
+      bool straight = px >= x + r && px < x + w - r;
+      if (straight) { if (irow > 0) p[px] = blendA(p[px], col, HALO_A[irow - 1]); continue; }
+      float d0 = sdfRR(px + 0.5f, yy + 0.5f, (float)x, (float)y, (float)w, (float)h, (float)r);
+      if (d0 < -0.5f || d0 > n + 0.5f) continue;
+      for (int i = 1; i <= n; i++) {
+        float cv = covD(d0 - i) - covD(d0 - i + 1);
+        if (cv > 0.004f) p[px] = blendA(p[px], col, (uint32_t)(HALO_A[i - 1] * cv + 0.5f));
+      }
+    }
+  }
+}
+// border of a rounded rectangle with a stroke thickness t (px) drawn inside the box
+static void rrBorder(int x, int y, int w, int h, int r, float t, uint16_t col) {
+  int ti = (int)ceilf(t), ya = max(y, bandY0), yb = min(y + h, bandY1);
+  for (int yy = ya; yy < yb; yy++) {
+    uint16_t* p = rowPtr(yy);
+    int kd = min(yy - y, y + h - 1 - yy);                       // rows from the nearest horizontal edge
+    if (kd >= r + ti) {                                         // straight sides
+      for (int i = 0; i < ti; i++) {
+        uint32_t a = (uint32_t)(clampf(t - i, 0, 1) * 255 + 0.5f);
+        int xl = x + i, xr = x + w - 1 - i;
+        if (xl >= 0 && xl < SCR_W) p[xl] = blendA(p[xl], col, a);
+        if (xr >= 0 && xr < SCR_W) p[xr] = blendA(p[xr], col, a);
+      }
+      continue;
+    }
+    float din = kd + 0.5f; uint32_t as = kd < ti ? (uint32_t)((covD(-din) - covD(-din + t)) * 255 + 0.5f) : 0;
+    for (int px = max(x, 0); px < min(x + w, SCR_W); px++) {
+      bool corner = px < x + r + ti || px >= x + w - r - ti;
+      if (!corner) { if (as) p[px] = blendA(p[px], col, as); continue; }
+      float d0 = sdfRR(px + 0.5f, yy + 0.5f, (float)x, (float)y, (float)w, (float)h, (float)r);
+      float cv = covD(d0) - covD(d0 + t);
+      if (cv > 0.004f) p[px] = blendA(p[px], col, (uint32_t)(cv * 255 + 0.5f));
+    }
+  }
+}
+
+// ---------- discs and strokes ----------
+static void discA(float cx, float cy, float r, uint16_t col, uint32_t a) {
+  int x0 = (int)floorf(cx - r - 1), x1 = (int)ceilf(cx + r + 1), y0 = max((int)floorf(cy - r - 1), bandY0), y1 = min((int)ceilf(cy + r + 1), bandY1 - 1);
+  for (int py = y0; py <= y1; py++) for (int px = x0; px <= x1; px++) {
+    if (px < 0 || px >= SCR_W) continue;
+    float dx = px - cx, dy = py - cy, cv = clampf(r - sqrtf(dx * dx + dy * dy) + 0.5f, 0, 1);
+    if (cv > 0.004f) { uint16_t* p = rowPtr(py) + px; *p = blendA(*p, col, (uint32_t)(cv * a + 0.5f)); }
+  }
+}
+static inline void disc(float cx, float cy, float r, uint16_t col) { discA(cx, cy, r, col, 255); }
+static inline float segDist(float px, float py, float x0, float y0, float x1, float y1, float* tt = nullptr) {
+  float vx = x1 - x0, vy = y1 - y0, wx = px - x0, wy = py - y0, L = vx * vx + vy * vy, t = L > 0 ? (wx * vx + wy * vy) / L : 0;
+  if (tt) *tt = t;
+  t = clampf(t, 0, 1);
+  float dx = wx - vx * t, dy = wy - vy * t;
+  return sqrtf(dx * dx + dy * dy);
+}
+// straight line of width wd between pixel centres (x0,y0) and (x1,y1); butt ends unless round
+static void strokeSeg(float x0, float y0, float x1, float y1, float wd, uint16_t col, bool round) {
+  float hw = wd * 0.5f;
+  int ax = (int)floorf(fminf(x0, x1) - hw - 1), bx = (int)ceilf(fmaxf(x0, x1) + hw + 1), ay = max((int)floorf(fminf(y0, y1) - hw - 1), bandY0), by = min((int)ceilf(fmaxf(y0, y1) + hw + 1), bandY1 - 1);
+  for (int py = ay; py <= by; py++) for (int px = ax; px <= bx; px++) {
+    if (px < 0 || px >= SCR_W) continue;
+    float t, d = segDist((float)px, (float)py, x0, y0, x1, y1, &t);
+    if (!round && (t < 0 || t > 1)) { float e = t < 0 ? -t : t - 1; float L = sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)); if (e * L > 0.5f) continue; }
+    float cv = clampf(hw - d + 0.5f, 0, 1);
+    if (cv > 0.004f) { uint16_t* p = rowPtr(py) + px; *p = blendA(*p, col, (uint32_t)(cv * 255 + 0.5f)); }
+  }
+}
+static inline void ln(int x0, int y0, int x1, int y1, uint16_t col) { strokeSeg((float)x0, (float)y0, (float)x1, (float)y1, 1.0f, col, false); }
+// "<" or ">" arrow head used on the pager chips (two round-capped strokes, width 1.6)
+static void chevron(int cx, int cy, int dir, uint16_t col) {
+  float x0 = (float)(cx - dir * 2), y0 = (float)(cy - 4), x1 = (float)(cx + dir * 2), y1 = (float)cy, x2 = x0, y2 = (float)(cy + 4);
+  int ay = max(cy - 6, bandY0), by = min(cy + 6, bandY1 - 1);
+  for (int py = ay; py <= by; py++) for (int px = cx - 6; px <= cx + 6; px++) {
+    if (px < 0 || px >= SCR_W) continue;
+    float d = fminf(segDist((float)px, (float)py, x0, y0, x1, y1), segDist((float)px, (float)py, x1, y1, x2, y2));
+    float cv = clampf(0.8f - d + 0.5f, 0, 1);
+    if (cv > 0.004f) { uint16_t* p = rowPtr(py) + px; *p = blendA(*p, col, (uint32_t)(cv * 255 + 0.5f)); }
+  }
+}
+static void tri(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t col) {      // small filled triangle, 4x4 supersampled
+  int ax = min(x0, min(x1, x2)) - 1, bx = max(x0, max(x1, x2)) + 1, ay = max(min(y0, min(y1, y2)) - 1, bandY0), by = min(max(y0, max(y1, y2)) + 1, bandY1 - 1);
+  float den = (float)((y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2));
+  if (den == 0) return;
+  for (int py = ay; py <= by; py++) for (int px = ax; px <= bx; px++) {
+    if (px < 0 || px >= SCR_W) continue;
+    int hits = 0;
+    for (int sy = 0; sy < 4; sy++) for (int sx = 0; sx < 4; sx++) {
+      float fx = px + (sx + 0.5f) / 4 - 0.5f, fy = py + (sy + 0.5f) / 4 - 0.5f;
+      float a = ((y1 - y2) * (fx - x2) + (x2 - x1) * (fy - y2)) / den, b = ((y2 - y0) * (fx - x2) + (x0 - x2) * (fy - y2)) / den, c = 1 - a - b;
+      if (a >= 0 && b >= 0 && c >= 0) hits++;
+    }
+    if (hits) plotA(px, py, col, (uint32_t)(hits * 255 / 16));
+  }
+}
+
+// ---------- text: Poppins bitmaps with 1/8 px advances; the small text fonts have four sub-pixel phases ----------
+static inline const GlyphRec* glyphAt(const FontRec* f, unsigned char ch, int phase) {
   if (ch < 32 || ch > 127) return nullptr;
   uint8_t gi = pgm_read_byte(&f->map[ch - 32]);
-  return gi == 255 ? nullptr : &f->g[gi];
+  if (gi == 255) return nullptr;
+  return &f->g[((int)gi << f->ph) + phase];
 }
-static void blit4(const uint8_t* bm, int w, int h, int px, int py, int bw, int bh, uint16_t fg) {
-  for (int r = 0; r < h; r++) {
-    int yy = py + r; if (yy < 0 || yy >= bh) continue;
-    for (int c = 0; c < w; c++) {
-      int xx = px + c; if (xx < 0 || xx >= bw) continue;
+static int textW(FontId fid, const char* s) {
+  const FontRec* f = FNT[fid]; int w8 = 0;
+  for (const char* p = s; *p; p++) { const GlyphRec* g = glyphAt(f, (unsigned char)*p, 0); w8 += g ? g->adv : 32; }
+  return (w8 + 4) >> 3;
+}
+static void blit4(const uint8_t* bm, int w, int h, int px, int py, uint16_t fg) {
+  int r0 = max(0, bandY0 - py), r1 = min(h, bandY1 - py), c0 = max(0, -px), c1 = min(w, SCR_W - px);
+  for (int r = r0; r < r1; r++) {
+    uint16_t* d = rowPtr(py + r) + px;
+    for (int c = c0; c < c1; c++) {
       int idx = r * w + c; uint8_t v = pgm_read_byte(&bm[idx >> 1]); v = (idx & 1) ? (v & 15) : (v >> 4);
-      if (v) { uint16_t& d = tPix[yy * bw + xx]; d = mix565(d, fg, v); }
+      if (v) d[c] = v == 15 ? fg : blendA(d[c], fg, (uint32_t)v * 17);
     }
   }
 }
-
-struct Run { FontId f; const char* s; uint16_t fg; int gap; };           // gap = extra pixels before this run
-static int runAdv(const Run& r) { const FontRec* f = FNT[r.f]; int w = 0; for (const char* p = r.s; *p; p++) { const GlyphRec* g = glyphOf(f, (unsigned char)*p); w += g ? g->adv : 4; } return w; }
-static int textW(FontId f, const char* s) { Run r = {f, s, 0, 0}; return runAdv(r); }
-
-// draws runs side by side on one baseline.  al: anchor x is the left / centre / right edge.  minW: area that is always repainted with bg
-static void drawRuns(const Run* rs, int nr, int x, int by, uint16_t bg, int al, int minW) {
-  int adv = 0, inkL = 0, inkR = 0, asc = 0, desc = 0;
-  for (int i = 0; i < nr; i++) {
-    const FontRec* f = FNT[rs[i].f]; adv += rs[i].gap;
-    asc = max(asc, (int)f->asc); desc = max(desc, (int)f->line - (int)f->asc);
-    for (const char* p = rs[i].s; *p; p++) {
-      const GlyphRec* g = glyphOf(f, (unsigned char)*p);
-      if (!g) { adv += 4; continue; }
-      if (g->w) { inkL = min(inkL, adv + g->dx); inkR = max(inkR, adv + g->dx + g->w); }
-      adv += g->adv; inkR = max(inkR, adv);
+static void drawStr(FontId fid, const char* s, int x, int by, uint16_t fg) {
+  const FontRec* f = FNT[fid];
+  if (by - (int)f->asc >= bandY1 || by + ((int)f->line - (int)f->asc) <= bandY0) return;
+  int pen = 0;
+  for (const char* p = s; *p; p++) {
+    unsigned char ch = (unsigned char)*p;
+    const GlyphRec* g0 = glyphAt(f, ch, 0);
+    if (!g0) { pen += 32; continue; }
+    if (ch != ' ') {
+      int q = pen & 7, gx, ph;
+      if (f->ph) { ph = q >> 1; gx = x + (pen >> 3); } else { ph = 0; gx = x + ((pen + 4) >> 3); }
+      const GlyphRec* g = glyphAt(f, ch, ph);
+      if (g->w) blit4(&f->bm[g->off], g->w, g->h, gx + g->dx, by + g->dy, fg);
     }
+    pen += g0->adv;
   }
-  int ox = al == AL_C ? x - adv / 2 : al == AL_R ? x - adv : x;
-  int x0 = ox + inkL, x1 = ox + inkR;
-  if (minW > 0) {
-    int a0 = al == AL_C ? x - minW / 2 : al == AL_R ? x - minW : x;
-    x0 = min(x0, a0); x1 = max(x1, a0 + minW);
-  }
-  int w = x1 - x0, h = asc + desc, top = by - asc;
-  if (w <= 0 || h <= 0 || w * h > TB_CAP) return;
-  for (int i = 0; i < w * h; i++) tPix[i] = bg;
-  int pen = ox - x0;
-  for (int i = 0; i < nr; i++) {
-    const FontRec* f = FNT[rs[i].f]; pen += rs[i].gap;
-    for (const char* p = rs[i].s; *p; p++) {
-      const GlyphRec* g = glyphOf(f, (unsigned char)*p);
-      if (!g) { pen += 4; continue; }
-      if (g->w) blit4(&f->bm[g->off], g->w, g->h, pen + g->dx, (by + g->dy) - top, w, h, rs[i].fg);
-      pen += g->adv;
-    }
-  }
-  tft.pushImage(x0, top, w, h, tPix);
 }
-static void txt(FontId f, const char* s, int x, int by, uint16_t fg, uint16_t bg, int al = AL_L, int minW = 0) {
-  Run r = {f, s, fg, 0}; drawRuns(&r, 1, x, by, bg, al, minW);
-}
-// value + small unit on one line (the unit sits on the same baseline)
-static void txtVU(FontId f, const char* v, FontId uf, const char* u, int x, int by, uint16_t fg, uint16_t ufg, uint16_t bg, int al, int minW) {
-  Run r[2] = {{f, v, fg, 0}, {uf, u, ufg, 2}};
-  drawRuns(r, u && u[0] ? 2 : 1, x, by, bg, al, minW);
+static inline int anchorX(int x, int w, int al) { return al == AL_C ? x - w / 2 : al == AL_R ? x - w : x; }
+static void txt(FontId f, const char* s, int x, int by, uint16_t fg, int al = AL_L) { drawStr(f, s, anchorX(x, textW(f, s), al), by, fg); }
+static void txtVU(FontId f, const char* v, FontId uf, const char* u, int x, int by, uint16_t fg, uint16_t ufg, int al) {      // value and a small unit on one baseline
+  int w1 = textW(f, v); bool has = u && u[0]; int tot = w1 + (has ? 2 + textW(uf, u) : 0), ox = anchorX(x, tot, al);
+  drawStr(f, v, ox, by, fg); if (has) drawStr(uf, u, ox + w1 + 2, by, ufg);
 }
 
-// Thai (or English) fixed labels by id
-struct LabKind { FontId en; uint8_t th; };               // th: 0 = small Thai bitmaps, 1 = large
-static const LabKind LB_TILE = {F_LS, 0}, LB_ROW = {F_LM, 0}, LB_BTN = {F_UL, 1}, LB_BTNM = {F_UM, 0}, LB_SM = {F_US, 0};
-static inline int tby(int by) { return thai ? by + 3 : by; }       // small Thai labels are taller than the English ones: sit them 3 px lower
+// ---------- fixed labels by string id: English in the Poppins fonts, Thai from the Loma bitmaps ----------
+struct LabKind { FontId en; uint8_t th, off; };            // th: 0 small / 1 large Thai bitmaps; off: how far callers move a baseline down for Thai (taken off again for English-only strings)
+static const LabKind LB_TILE = {F_LS, 0, 3}, LB_ROW = {F_US, 0, 1}, LB_BTN = {F_UM, 0, 1}, LB_BTNM = {F_UM, 0, 1}, LB_SM = {F_LM, 0, 1}, LB_TAB = {F_LM, 0, 2}, LB_TTL = {F_UL, 1, 2};
+static bool thai = false;
+static inline int tby(int by) { return thai ? by + 3 : by; }
 static const ThBmp* thOf(StrId id, int sz) { const ThBmp* t = (sz ? THL : THS) + id; return pgm_read_ptr(&t->d) ? t : nullptr; }
-static int thWidth(StrId id, int sz) { const ThBmp* t = thOf(id, sz); return t ? pgm_read_byte(&t->w) : 0; }
 static bool thaiOn(StrId id, int sz) { return thai && thOf(id, sz); }
-static int labW(StrId id, LabKind k) { return thaiOn(id, k.th) ? thWidth(id, k.th) : textW(k.en, EN[id]); }
-static void lab(StrId id, LabKind k, int x, int by, uint16_t fg, uint16_t bg, int al = AL_L, int minW = 0) {
-  if (!thaiOn(id, k.th)) { txt(k.en, EN[id], x, by, fg, bg, al, minW); return; }
+static int labW(StrId id, LabKind k, int maxW = 0) {
+  if (!thaiOn(id, k.th)) return textW(k.en, EN[id]);
+  int w = pgm_read_byte(&thOf(id, k.th)->w); return maxW && w > maxW ? maxW : w;
+}
+static void blit4Scaled(const uint8_t* bm, int w, int h, int sw, int px, int py, uint16_t fg) {     // Thai bitmap squeezed horizontally to sw px (box filter)
+  int r0 = max(0, bandY0 - py), r1 = min(h, bandY1 - py);
+  for (int r = r0; r < r1; r++) {
+    uint16_t* d = rowPtr(py + r);
+    for (int dc = 0; dc < sw; dc++) {
+      int xx = px + dc; if (xx < 0 || xx >= SCR_W) continue;
+      int s0 = dc * w / sw, s1 = ((dc + 1) * w + sw - 1) / sw; if (s1 <= s0) s1 = s0 + 1; if (s1 > w) s1 = w;
+      int acc = 0;
+      for (int sc = s0; sc < s1; sc++) { int idx = r * w + sc; uint8_t v = pgm_read_byte(&bm[idx >> 1]); acc += (idx & 1) ? (v & 15) : (v >> 4); }
+      int a = acc * 17 / (s1 - s0);
+      if (a > 0) d[xx] = blendA(d[xx], fg, (uint32_t)(a > 255 ? 255 : a));
+    }
+  }
+}
+static void lab(StrId id, LabKind k, int x, int by, uint16_t fg, int al = AL_L, int maxW = 0) {
+  if (!thaiOn(id, k.th)) { txt(k.en, EN[id], x, thai ? by - k.off : by, fg, al); return; }
   const ThBmp* t = thOf(id, k.th); int w = pgm_read_byte(&t->w), H = k.th ? THL_H : THS_H, BASE = k.th ? THL_BASE : THS_BASE;
   const uint8_t* bm = (const uint8_t*)pgm_read_ptr(&t->d);
-  int ox = al == AL_C ? x - w / 2 : al == AL_R ? x - w : x, x0 = ox, x1 = ox + w;
-  if (minW > 0) { int a0 = al == AL_C ? x - minW / 2 : al == AL_R ? x - minW : x; x0 = min(x0, a0); x1 = max(x1, a0 + minW); }
-  int bw = x1 - x0;
-  if (bw <= 0 || bw * H > TB_CAP) return;
-  for (int i = 0; i < bw * H; i++) tPix[i] = bg;
-  blit4(bm, w, H, ox - x0, 0, bw, H, fg);
-  tft.pushImage(x0, by - BASE, bw, H, tPix);
+  int sw = (maxW && w > maxW) ? maxW : w, ox = anchorX(x, sw, al);
+  if (by - BASE >= bandY1 || by - BASE + H <= bandY0) return;
+  if (sw == w) blit4(bm, w, H, ox, by - BASE, fg); else blit4Scaled(bm, w, H, sw, ox, by - BASE, fg);
 }
-
-// =====================================================================================
-//  Shapes: chamfered panels, brackets, hexagons, segmented bars
-// =====================================================================================
-enum { CUT_TL = 1, CUT_TR = 2, CUT_BR = 4, CUT_BL = 8 };
-static void panel(int x, int y, int w, int h, int ch, int cuts, uint16_t fill, uint16_t border) {
-  tft.fillRect(x, y + ch, w, h - 2 * ch, fill);
-  tft.fillRect(x + ch, y, w - 2 * ch, ch, fill);
-  tft.fillRect(x + ch, y + h - ch, w - 2 * ch, ch, fill);
-  if (cuts & CUT_TL) tft.fillTriangle(x + ch, y, x + ch, y + ch, x, y + ch, fill); else tft.fillRect(x, y, ch, ch, fill);
-  if (cuts & CUT_TR) tft.fillTriangle(x + w - 1 - ch, y, x + w - 1 - ch, y + ch, x + w - 1, y + ch, fill); else tft.fillRect(x + w - ch, y, ch, ch, fill);
-  if (cuts & CUT_BR) tft.fillTriangle(x + w - 1 - ch, y + h - 1, x + w - 1 - ch, y + h - 1 - ch, x + w - 1, y + h - 1 - ch, fill); else tft.fillRect(x + w - ch, y + h - ch, ch, ch, fill);
-  if (cuts & CUT_BL) tft.fillTriangle(x + ch, y + h - 1, x + ch, y + h - 1 - ch, x, y + h - 1 - ch, fill); else tft.fillRect(x, y + h - ch, ch, ch, fill);
-  if (border == fill) return;
-  int xl = x, xr = x + w - 1, yt = y, yb = y + h - 1;
-  tft.drawFastHLine(x + ((cuts & CUT_TL) ? ch : 0), yt, w - ((cuts & CUT_TL) ? ch : 0) - ((cuts & CUT_TR) ? ch : 0), border);
-  tft.drawFastHLine(x + ((cuts & CUT_BL) ? ch : 0), yb, w - ((cuts & CUT_BL) ? ch : 0) - ((cuts & CUT_BR) ? ch : 0), border);
-  tft.drawFastVLine(xl, y + ((cuts & CUT_TL) ? ch : 0), h - ((cuts & CUT_TL) ? ch : 0) - ((cuts & CUT_BL) ? ch : 0), border);
-  tft.drawFastVLine(xr, y + ((cuts & CUT_TR) ? ch : 0), h - ((cuts & CUT_TR) ? ch : 0) - ((cuts & CUT_BR) ? ch : 0), border);
-  if (cuts & CUT_TL) tft.drawLine(xl, yt + ch, xl + ch, yt, border);
-  if (cuts & CUT_TR) tft.drawLine(xr - ch, yt, xr, yt + ch, border);
-  if (cuts & CUT_BR) tft.drawLine(xr, yb - ch, xr - ch, yb, border);
-  if (cuts & CUT_BL) tft.drawLine(xl + ch, yb, xl, yb - ch, border);
-}
-static void bracket(int x, int y, int w, uint16_t c, bool left, bool right) {      // accent strokes on the top corners of a tile
-  if (left) { tft.fillRect(x + 3, y, 12, 2, c); tft.fillRect(x, y + 3, 2, 7, c); tft.drawLine(x, y + 3, x + 3, y, c); tft.drawLine(x + 1, y + 3, x + 4, y, c); }
-  if (right) { tft.fillRect(x + w - 15, y, 12, 2, c); tft.fillRect(x + w - 2, y + 3, 2, 7, c); tft.drawLine(x + w - 1, y + 3, x + w - 4, y, c); tft.drawLine(x + w - 2, y + 3, x + w - 5, y, c); }
-}
-static void hexagon(int cx, int cy, int r, uint16_t fill, uint16_t line, bool thick) {
-  int dx = (r * 7) / 8, hy = r / 2;
-  tft.fillTriangle(cx, cy - r, cx + dx, cy - hy, cx - dx, cy - hy, fill);
-  tft.fillRect(cx - dx, cy - hy, 2 * dx + 1, 2 * hy + 1, fill);
-  tft.fillTriangle(cx, cy + r, cx + dx, cy + hy, cx - dx, cy + hy, fill);
-  int px[7] = {cx, cx + dx, cx + dx, cx, cx - dx, cx - dx, cx}, py[7] = {cy - r, cy - hy, cy + hy, cy + r, cy + hy, cy - hy, cy - r};
-  for (int i = 0; i < 6; i++) {
-    tft.drawLine(px[i], py[i], px[i + 1], py[i + 1], line);
-    if (thick) { tft.drawLine(px[i] + (px[i] < cx ? 1 : px[i] > cx ? -1 : 0), py[i] + (py[i] < cy ? 1 : -1), px[i + 1] + (px[i + 1] < cx ? 1 : px[i + 1] > cx ? -1 : 0), py[i + 1] + (py[i + 1] < cy ? 1 : -1), line); }
-  }
-}
-static void segBar(int x, int y, int n, int lit, uint16_t on, uint16_t off) {       // n small dashes, 5x2 px, 1 px gap
-  for (int i = 0; i < n; i++) tft.fillRect(x + i * 6, y, 5, 2, i < lit ? on : off);
-}
-static bool hit(int x, int y, int rx, int ry, int rw, int rh) { return x >= rx && x < rx + rw && y >= ry && y < ry + rh; }
 static void fmtv(char* b, size_t n, float v, int dec) { if (v > -0.5f * powf(10, -dec) && v < 0) v = 0; snprintf(b, n, "%.*f", dec, v); }
 static void fmtThou(char* b, size_t n, int v) { if (v >= 1000) snprintf(b, n, "%d,%03d", v / 1000, v % 1000); else snprintf(b, n, "%d", v); }
 static void fitText(char* d, size_t n, const char* s, FontId f, int maxw) {   // shortens with ".." to fit
   strncpy(d, s, n - 1); d[n - 1] = 0;
   if (textW(f, d) <= maxw) return;
   int L = (int)strlen(d);
-  while (L > 1) { L--; char t[40]; snprintf(t, sizeof t, "%.*s..", L, d); if (textW(f, t) <= maxw) { strncpy(d, t, n - 1); d[n - 1] = 0; return; } }
+  while (L > 1) { L--; char t[48]; snprintf(t, sizeof t, "%.*s..", L, d); if (textW(f, t) <= maxw) { strncpy(d, t, n - 1); d[n - 1] = 0; return; } }
 }
+static bool hit(int x, int y, int rx, int ry, int rw, int rh) { return x >= rx && x < rx + rw && y >= ry && y < ry + rh; }
 
-// ---------- buttons ----------
-static void btnBox(int x, int y, int w, int h, bool on) {
-  panel(x, y, w, h, 4, CUT_TL | CUT_BR, on ? T.acc : T.panel2, on ? T.acc : T.line);
+// ---------- chips, tab bar, headers ----------
+static void chipBox(int x, int y, int w, int h, bool on) { rr(x, y, w, h, min(8, h >> 1), on ? T.acc : T.panel, on ? T.acc : T.line); }
+static inline int chipBy(int y, int h) { return y + (h >> 1) + (thai ? 5 : 4); }
+static void chipId(StrId id, int x, int y, int w, int h, bool on, LabKind k = LB_BTNM) { chipBox(x, y, w, h, on); lab(id, k, x + (w >> 1), chipBy(y, h), on ? T.onacc : T.text, AL_C, w - 6); }
+static void chipS(const char* s, int x, int y, int w, int h, bool on, FontId f = F_UM) { chipBox(x, y, w, h, on); txt(f, s, x + (w >> 1), y + (h >> 1) + 4, on ? T.onacc : T.text, AL_C); }
+static void chipArrow(int x, int y, int w, int h, int dir, bool on) { chipBox(x, y, w, h, on); chevron(x + (w >> 1), y + (h >> 1), dir, on ? T.onacc : T.text); }
+static const int TABX[6] = {6, 58, 109, 161, 213, 264};
+static const StrId TABS[6] = {S_DASH, S_DATA, S_GRAPH, S_TRIP, S_CODES, S_SETUP};
+static void tabBar(int active) {
+  fr(0, 200, 320, 40, T.tabbg); hl(0, 200, 320, T.tabline);
+  for (int i = 0; i < 6; i++) {
+    int x = TABX[i]; bool on = i == active;
+    if (on) { halo(x, 206, 50, 26, 8, T.acc, 3); rr(x, 206, 50, 26, 8, T.panel2, T.acc); }
+    lab(TABS[i], LB_TAB, x + 25, thai ? 224 : 222, on ? T.text : T.dim, AL_C, 46);
+  }
 }
-static void btnId(StrId id, int x, int y, int w, int h, bool on, LabKind k = LB_BTN) {
-  btnBox(x, y, w, h, on); uint16_t bg = on ? T.acc : T.panel2;
-  lab(id, k, x + w / 2, y + h / 2 + (k.en == F_UL ? 6 : (k.en == F_UM ? 5 : 4)), T.text, bg, AL_C);
+static int tabOf(int x) { for (int i = 0; i < 6; i++) if (x >= TABX[i] - 3 && x < TABX[i] + 53) return i; return -1; }
+static void subHeader(StrId title, StrId rightId, bool hasRight) {
+  chipBox(9, 4, 64, 20, false); chevron(22, 14, -1, T.text); lab(S_BACK, LB_BTNM, 46, chipBy(4, 20), T.text, AL_C, 44);
+  lab(title, LB_TTL, 160, thai ? 22 : 20, T.text, AL_C, 150);
+  if (hasRight) chipId(rightId, 247, 4, 64, 20, false);
 }
-static void btnS(const char* s, int x, int y, int w, int h, bool on, FontId f = F_UL) {
-  btnBox(x, y, w, h, on); uint16_t bg = on ? T.acc : T.panel2;
-  txt(f, s, x + w / 2, y + h / 2 + (f == F_UL ? 6 : (f == F_UM ? 5 : 4)), T.text, bg, AL_C);
-}
+static bool hitBack(int x, int y) { return hit(x, y, 9, 4, 64, 20); }
 
-// =====================================================================================
-//  Vehicle-dependent values, tile metrics, trip / peaks / graph history
-// =====================================================================================
+// ---------- band loop ----------
+static uint32_t bandHash[NBAND]; static bool bandHashOk[NBAND];
+static void presentBand(int b) {                              // push the band unless it is identical to what is already on the panel
+  uint32_t h = 2166136261u; const uint32_t* p = (const uint32_t*)tPix;
+  for (int i = 0; i < SCR_W * BAND_H / 2; i++) h = (h ^ p[i]) * 16777619u;
+  if (bandHashOk[b] && bandHash[b] == h) return;
+  bandHash[b] = h; bandHashOk[b] = true;
+  tft.pushImage(0, b * BAND_H, SCR_W, BAND_H, tPix);
+}
+static void invalidatePanel() { for (int i = 0; i < NBAND; i++) bandHashOk[i] = false; }
+
 static bool vehDiesel() { if (ecuDieselKnown && !demoMode) return ecuDiesel; return vehModel >= 0 && (MODELS[vehModel].flags & VF_D); }
 static bool vehHybrid() { return (ecuHybrid && !demoMode) || (vehModel >= 0 && (MODELS[vehModel].flags & VF_H)); }
 static int ringMaxK() { return vehDiesel() ? 6 : 8; }          // tacho scale in 1000 rpm
@@ -1246,285 +1447,218 @@ static void carName(char* d, size_t n) {
   else snprintf(d, n, "%s", carBuf);
 }
 static void goPage(Page p) { scr = p; redraw = true; updateWants(); }
+// =====================================================================================
+//  Pages, part 1: top bar, dashboard, data, all PIDs, graph, trip, peaks   (layouts, fonts and touch areas are those of the web preview)
+// =====================================================================================
+static void nav(Page p);
+static void saveSoon();
+static float gv0(int pid) { bool ok; float v = getVal((uint8_t)pid, ok); return ok ? v : 0; }
+static const int DT_X[6] = {9, 9, 9, 228, 228, 228}, DT_Y[6] = {36, 80, 124, 36, 80, 124};      // dashboard tiles 83 x 38
+static const int GX[4] = {9, 86, 163, 240}, GY[4] = {56, 92, 128, 164};                         // 4-column tile grid, tiles 71 wide
 
-// ---------- common header / footer ----------
-static void titleBar(StrId title, int right /* 0 none, 1 DONE, 2 BACK */) {
-  lab(title, LB_BTN, 160, 21, T.text, T.bg, AL_C, 120);
-  tft.fillRect(124, 25, 72, 2, T.acc);
-  if (right) btnId(right == 1 ? S_DONE : S_BACK, 246, 4, 68, 22, true);
-  tft.drawFastHLine(0, 30, 320, T.line);
+// ---------- colours of values ----------
+static bool tileGood(const Met& m, float v) { (void)m; (void)v; return false; }
+static uint16_t valCol(const Met& m, float v) { return v >= m.b ? T.hot : v >= m.w ? T.warn : v < m.lo ? T.warn : T.text; }     // white unless it is high or low
+static void clockStr(char* d, size_t n, uint32_t s) { if (s >= 3600) snprintf(d, n, "%u:%02u", (unsigned)(s / 3600), (unsigned)(s / 60 % 60)); else snprintf(d, n, "%u:%02u", (unsigned)(s / 60), (unsigned)(s % 60)); }
+
+static void valueFit(const char* b, const char* unit, int x, int by, uint16_t col, int al, int maxw) {
+  bool has = unit && unit[0]; FontId f = F_NS; bool u = false;
+  static const FontId order[3] = {F_NL, F_NM, F_NS};
+  for (int i = 0; i < 3; i++) {
+    int w = textW(order[i], b);
+    if (has && w + 2 + textW(F_LS, unit) <= maxw) { f = order[i]; u = true; break; }
+    if (w <= maxw) { f = order[i]; u = false; break; }
+  }
+  txtVU(f, b, F_LS, u ? unit : "", x, by, col, T.dim, al);
 }
-static void leftBtn(StrId id) { btnId(id, 6, 4, 76, 22, false, LB_BTNM); }
-static void leftTxt(const char* s) { txt(F_LS, s, 10, 20, T.dim, T.bg, AL_L, 90); }
-static void statusDot(int x, int y) { uint16_t c = linkState == 2 || demoMode ? T.good : T.warn; tft.fillCircle(x, y, 3, c); }
+
+// ---------- header row + 14-pill shift strip, shown on every main page ----------
+static const int SPX[14] = {11, 32, 54, 75, 97, 118, 140, 161, 183, 204, 225, 247, 268, 290};
+static void shiftStrip(float rpm) {
+  float r0 = (float)max(1800, shiftRpm - 3000); bool over = rpm >= shiftRpm, blink = over && ((uiNow / 140) & 1);
+  for (int i = 0; i < 14; i++) {
+    float th = r0 + i * (shiftRpm - r0) / 14; bool lit = rpm >= th && !blink, hot = over || i >= 11;
+    uint16_t col = hot ? T.hot : T.acc;
+    if (over && blink) { rr(SPX[i], 24, 19, 4, 2, mixRgb(TA.bg, TA.hot, 85)); continue; }
+    if (lit) halo(SPX[i], 24, 19, 4, 2, col, 2);
+    rr(SPX[i], 24, 19, 4, 2, lit ? col : T.dark);
+  }
+}
+static void topBar(float rpm) {
+  bool linkOk = linkState == 2 || demoMode;
+  uint16_t dc = linkOk ? T.good : T.warn;
+  discA(14, 13, 4.6f, dc, 41); discA(14, 13, 3.6f, dc, 71); disc(14, 13, 2.5f, dc);
+  StrId sid = demoMode ? S_DEMO : linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_SELDEV;
+  if (!demoMode && linkState == 2) txt(F_LM, selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
+  else lab(sid, LB_SM, 22, thai ? 17 : 16, T.dim);
+  const char* pn = demoMode ? "" : protoName(protoNum);
+  if (pn[0]) txt(F_LM, pn, 311, 16, T.dim, AL_R);
+  char nm[32]; carName(nm, sizeof nm);
+  if (nm[0]) { char t[32]; if (textW(F_UM, nm) > 150) fitText(t, sizeof t, nm, F_UM, 150); else strcpy(t, nm); txt(F_UM, t, 160, 16, T.accL, AL_C); }
+  else if (!demoMode && linkState == 2) lab(S_UNKNOWN, LB_BTNM, 160, thai ? 17 : 16, T.dim, AL_C);
+  else if (!demoMode && linkState == 1 && selName[0]) { char t[32]; fitText(t, sizeof t, selName, F_UM, 150); txt(F_UM, t, 160, 16, T.dim, AL_C); }
+  shiftStrip(rpm);
+}
+// mode chips on the first row of the Data / Trip / Codes pages
+struct ModeChip { StrId id; int x, w; };
+static void modeChips(const ModeChip* l, int n, int active) { for (int i = 0; i < n; i++) chipId(l[i].id, l[i].x, 32, l[i].w, 20, i == active); }
+static int modeTap(const ModeChip* l, int n, int x, int y) { if (y < 32 || y >= 52) return -1; for (int i = 0; i < n; i++) if (x >= l[i].x && x < l[i].x + l[i].w) return i; return -1; }
+static const Page TABPG[6] = {PG_DASH, PG_DATA, PG_GRAPH, PG_TRIP, PG_CODES, PG_SETUP};
+static bool tabTap(int x, int y, Page cur) {                    // true when the touch was on the tab bar
+  if (y < 200) return false;
+  int i = tabOf(x); if (i >= 0 && TABPG[i] != cur) nav(TABPG[i]);
+  return true;
+}
 
 // ---------- dashboard ----------
-static const int DT_X[6] = {6, 6, 6, 250, 250, 250}, DT_Y[6] = {36, 96, 156, 36, 96, 156};
-static const int RV[6][2] = {{124, 192}, {84, 121}, {120, 52}, {200, 52}, {236, 121}, {196, 192}};   // centre line of the tacho, bottom-left -> bottom-right
-static int16_t RQ[40][8];
-static bool ringBuilt = false;
-static void ringBuild() {
-  ringBuilt = true;
-  for (int e = 0; e < 5; e++) {
-    float x0 = RV[e][0], y0 = RV[e][1], x1 = RV[e + 1][0], y1 = RV[e + 1][1], dx = x1 - x0, dy = y1 - y0, L = sqrtf(dx * dx + dy * dy), ux = dx / L, uy = dy / L;
-    float nx = uy, ny = -ux, mx = (x0 + x1) / 2 - 160, my = (y0 + y1) / 2 - 122;
-    if (nx * mx + ny * my < 0) { nx = -nx; ny = -ny; }
-    for (int j = 0; j < 8; j++) {
-      float t0 = (j + 0.10f) / 8, t1 = (j + 0.90f) / 8, ax = x0 + dx * t0, ay = y0 + dy * t0, bx = x0 + dx * t1, by = y0 + dy * t1;
-      const float h = 5.0f, sk = 2.5f; int16_t* q = RQ[e * 8 + j];
-      q[0] = (int16_t)lroundf(ax + nx * h); q[1] = (int16_t)lroundf(ay + ny * h); q[2] = (int16_t)lroundf(bx + nx * h); q[3] = (int16_t)lroundf(by + ny * h);
-      q[4] = (int16_t)lroundf(bx - nx * h + ux * sk); q[5] = (int16_t)lroundf(by - ny * h + uy * sk); q[6] = (int16_t)lroundf(ax - nx * h + ux * sk); q[7] = (int16_t)lroundf(ay - ny * h + uy * sk);
+static void dtile(int i) {
+  const Met& m = MET[slots[i]]; int x = DT_X[i], y = DT_Y[i];
+  tile(x, y, 83, 38);
+  lab(m.lab, LB_TILE, x + 8, thai ? y + 15 : y + 12, T.dim, AL_L, 68);
+  bool ok; float f = metricVal(m.src, ok); char b[16] = "--"; uint16_t col = T.dim;
+  if (ok) { float v = f * m.mul; fmtv(b, sizeof b, v, m.dec); col = valCol(m, v); }
+  valueFit(b, m.unit, x + 8, y + 30, col, AL_L, 67);
+}
+static const int RCX = 160, RCY = 97, RR = 53;
+static void ringDraw(float rpm) {                                 // tacho: track, glow, gradient arc with round caps, inner disc (per pixel, no angle maths)
+  float frac = clampf(rpm / (ringMaxK() * 1000.0f), 0, 1); bool over = rpm >= shiftRpm;
+  uint16_t glow = over ? T.hot : T.acc;
+  const float PI_ = 3.14159265f, s2 = 0.70710678f;
+  float S = 1.5f * PI_ * frac + 0.0001f, ae = 0.75f * PI_ + S;
+  float u0x = -s2, u0y = s2, uex = cosf(ae), uey = sinf(ae);
+  float e0x = RR * u0x, e0y = RR * u0y, e1x = RR * uex, e1y = RR * uey;           // ends of the lit arc (relative to the centre)
+  float t0x = -RR * s2, t0y = RR * s2, t1x = RR * s2, t1y = RR * s2;               // ends of the track
+  static const float GW[4] = {7.5f, 6.0f, 4.5f, 3.5f};                               // half widths of the glow strokes
+  static const uint8_t GA[4] = {13, 18, 26, 36};                                     // alphas .05 .07 .10 .14
+  int ya = max(RCY - 62, bandY0), yb = min(RCY + 62, bandY1 - 1);
+  for (int py = ya; py <= yb; py++) {
+    uint16_t* row = rowPtr(py); int dy = py - RCY;
+    for (int px = RCX - 62; px <= RCX + 62; px++) {
+      int dx = px - RCX, d2 = dx * dx + dy * dy;
+      if (d2 > 62 * 62 || px < 0 || px >= SCR_W) continue;
+      uint16_t* p = row + px;
+      if (d2 <= 41 * 41) { *p = T.disc; continue; }
+      float d = sqrtf((float)d2);
+      if (d2 < 45 * 45) {
+        float cv = clampf(43.0f - d + 0.5f, 0, 1); *p = blendA(*p, T.disc, (uint32_t)(cv * 255 + 0.5f));
+        float c2 = clampf(1.0f - fabsf(d - 42.5f), 0, 1); if (c2 > 0.004f) *p = blendA(*p, T.discLine, (uint32_t)(c2 * 255 + 0.5f));
+        continue;
+      }
+      float ro = fabsf(d - RR), fx = (float)dx, fy = (float)dy;
+      // track (full sweep, round caps)
+      bool inT = !(dy > abs(dx)); float dT = ro;
+      if (!inT) { float a = (fx - t0x) * (fx - t0x) + (fy - t0y) * (fy - t0y), b = (fx - t1x) * (fx - t1x) + (fy - t1y) * (fy - t1y); dT = sqrtf(a < b ? a : b); }
+      float cT = clampf(2.5f - dT + 0.5f, 0, 1);
+      if (cT > 0.004f) *p = blendA(*p, T.track, (uint32_t)(cT * 255 + 0.5f));
+      // lit arc
+      float c0 = u0x * fy - u0y * fx, ce = fx * uey - fy * uex;
+      bool inL = S <= PI_ ? (c0 >= 0 && ce >= 0) : (c0 >= 0 || ce >= 0); float dL = ro;
+      if (!inL) { float a = (fx - e0x) * (fx - e0x) + (fy - e0y) * (fy - e0y), b = (fx - e1x) * (fx - e1x) + (fy - e1y) * (fy - e1y); float m = a < b ? a : b; dL = m > 72.25f ? 99.0f : sqrtf(m); }
+      if (dL > 8.0f) continue;
+      for (int k = 0; k < 4; k++) { float cv = clampf(GW[k] - dL + 0.5f, 0, 1); if (cv > 0.004f) *p = blendA(*p, glow, (uint32_t)(GA[k] * cv + 0.5f)); }
+      float c5 = clampf(2.5f - dL + 0.5f, 0, 1);
+      if (c5 > 0.004f) {
+        uint16_t lc = over ? T.hot : mixRgb(TA.accD, TA.accL, clampi((px - py + 43) * 256 / 212, 0, 256));
+        *p = blendA(*p, lc, (uint32_t)(c5 * 255 + 0.5f));
+      }
     }
   }
 }
-static int ringRed() { int k = ringMaxK() * 1000; return constrain((int)lroundf(shiftRpm * 40.0f / k), 1, 40); }
-static uint16_t hotDim() { return mix565(T.bg, T.hot, 5); }
-static uint16_t segCol(int i, bool lit, bool lead) {
-  if (i >= ringRed()) return lit ? T.hot : hotDim();
-  return lit ? (lead ? T.accL : T.acc) : T.dark;
+static void drawDash() {
+  float rpm = gv0(0x0C), spd = gv0(0x0D);
+  topBar(rpm);
+  for (int i = 0; i < 6; i++) dtile(i);
+  ringDraw(rpm);
+  char b[16]; fmtThou(b, sizeof b, (int)rpm);
+  txtVU(F_NS, b, F_LS, "rpm", RCX, 76, T.accL, T.accL, AL_C);
+  int cv = (int)lroundf(clampf(crpV, 0, 9.99f) * 100); char crpS[12]; snprintf(crpS, sizeof crpS, "%d.%02d", cv / 100, cv % 100);
+  char sp[12]; snprintf(sp, sizeof sp, "%d", (int)spd);
+  if (!crpMain) { txt(F_NXL, sp, RCX, 115, T.text, AL_C); txt(F_LS, "km/h", RCX, 131, T.dim, AL_C); }
+  else { txt(F_NXM, crpS, RCX, 111, T.accL, AL_C); txt(F_LS, "CRP volts", RCX, 131, T.dim, AL_C); }
+  tile(9, 168, 302, 29);
+  StrId lid = crpMain ? S_SPEED : S_CRPV; int lw = labW(lid, LB_TILE), vx = max(67, 18 + lw + 8);
+  lab(lid, LB_TILE, 18, thai ? 188 : 185, T.dim);
+  const char* vtxt; const char* vun; float frac;
+  if (!crpMain) { vtxt = crpS; vun = "V"; frac = crpV / 5; } else { vtxt = sp; vun = "km/h"; frac = spd / 200; }
+  txtVU(F_NL, vtxt, F_LS, vun, vx, 188, T.text, T.dim, AL_L);
+  int bx = max(122, vx + textW(F_NL, vtxt) + 2 + textW(F_LS, vun) + 10), bl = 302 - bx;
+  rr(bx, 181, bl, 3, 1, T.dark);
+  int bw = (int)lroundf(bl * clampf(frac, 0, 1)); if (bw >= 2) rr(bx, 181, bw, 3, 1, T.acc);
+  tabBar(0);
 }
-static void ringSeg(int i, uint16_t c) { const int16_t* q = RQ[i]; tft.fillTriangle(q[0], q[1], q[2], q[3], q[4], q[5], c); tft.fillTriangle(q[0], q[1], q[4], q[5], q[6], q[7], c); }
-static int ringLit = -1;
-static void ringNumerals() {
-  float total = 0, el[5];
-  for (int e = 0; e < 5; e++) { float dx = RV[e + 1][0] - RV[e][0], dy = RV[e + 1][1] - RV[e][1]; el[e] = sqrtf(dx * dx + dy * dy); total += el[e]; }
-  int K = ringMaxK();
-  for (int k = 0; k <= K; k++) {
-    float s = total * k / K; int e = 0;
-    while (e < 4 && s > el[e]) { s -= el[e]; e++; }
-    float t = s / el[e], x = RV[e][0] + (RV[e + 1][0] - RV[e][0]) * t, y = RV[e][1] + (RV[e + 1][1] - RV[e][1]) * t;
-    float dx = RV[e + 1][0] - RV[e][0], dy = RV[e + 1][1] - RV[e][1], L = el[e], nx = dy / L, ny = -dx / L;
-    float mx = x - 160, my = y - 122; if (nx * mx + ny * my > 0) { nx = -nx; ny = -ny; }       // inward
-    char b[4]; snprintf(b, sizeof b, "%d", k);
-    bool red = k * 1000 >= shiftRpm;
-    txt(F_LS, b, (int)lroundf(x + nx * 15), (int)lroundf(y + ny * 15) + 4, red ? T.hot : T.dim, T.bg, AL_C);
+static void tapDash(int x, int y, bool first) {
+  if (!first) return;
+  if (tabTap(x, y, PG_DASH)) return;
+  for (int i = 0; i < 6; i++) if (hit(x, y, DT_X[i], DT_Y[i], 83, 38)) { slots[i] = (uint8_t)nextMetric(slots[i], i); slotsCustom = true; updateWants(); saveSoon(); return; }
+  if (hit(x, y, 94, 34, 132, 132) || hit(x, y, 9, 168, 302, 29)) { crpMain = !crpMain; saveSoon(); }
+}
+
+// ---------- data grid ----------
+static const ModeChip DATA_MODES[2] = {{S_MAIN, 9, 46}, {S_ALLPID, 59, 60}};
+static void drawData() {
+  topBar(gv0(0x0C)); modeChips(DATA_MODES, 2, 0);
+  for (int i = 0; i < 16; i++) {
+    DTile t; dtileOf(i, t); int x = GX[i & 3], y = GY[i >> 2];
+    tile(x, y, 71, 33);
+    lab(t.lab, LB_TILE, x + 6, thai ? y + 14 : y + 11, T.dim, AL_L, 62);
+    bool ok; float f = metricVal(t.src, ok); char b[16] = "--"; uint16_t col = T.dim;
+    if (ok) { float v = f * t.mul; fmtv(b, sizeof b, v, t.dec); col = t.mi >= 0 ? valCol(MET[t.mi], v) : T.text; }
+    valueFit(b, t.unit, x + 7, y + 28, col, AL_L, 58);
   }
+  tabBar(1);
 }
-static void ringPaint(int lit) {                                   // repaint segments between old and new lit count
-  if (!ringBuilt) ringBuild();
-  int a = ringLit < 0 ? 0 : min(ringLit, lit), b = ringLit < 0 ? 40 : max(ringLit, lit);
-  for (int i = max(0, a - 1); i < min(40, b + 1); i++) ringSeg(i, segCol(i, i < lit, i == lit - 1));
-  ringLit = lit;
+static void tapData(int x, int y, bool first) {
+  if (!first) return;
+  if (tabTap(x, y, PG_DATA)) return;
+  if (modeTap(DATA_MODES, 2, x, y) == 1) nav(PG_ALL);
 }
-
-static char dtCache[6][24];
-static bool tileGood(const Met& m, float v) {
-  switch (m.src) {
-    case 0x42: return v >= 13.0f && v <= 15.0f;
-    case M_AFR: return v >= 14.2f && v <= 15.2f;
-    case M_LAMBDA: return v >= 0.97f && v <= 1.03f;
-    case 0x06: case 0x07: return fabsf(v) <= 5.0f;
-  }
-  return false;
-}
-static uint16_t valCol(const Met& m, float v) { return v >= m.b ? T.hot : v >= m.w ? T.warn : v < m.lo ? T.warn : tileGood(m, v) ? T.good : T.text; }
-static void dtileStatic(int i) {
-  const Met& m = MET[slots[i]]; bool right = i >= 3; int x = DT_X[i], y = DT_Y[i];
-  panel(x, y, 64, 40, 4, right ? (CUT_TR | CUT_BL) : (CUT_TL | CUT_BR), T.panel, T.line);
-  bracket(x, y, 64, T.acc, !right, right);
-  lab(m.lab, LB_TILE, right ? x + 58 : x + 6, thai ? y + 14 : y + 11, T.dim, T.panel, right ? AL_R : AL_L);
-  dtCache[i][0] = 0;
-}
-static void valueFit(const char* b, const char* unit, int x, int by, uint16_t col, uint16_t bg, int al, int maxw, int clearW, bool big = false) {
-  FontId f = F_NS; bool u = false;
-  const int uw = unit[0] ? textW(F_LS, unit) + 3 : 0;
-  if (big && textW(F_NL, b) + uw <= maxw) { f = F_NL; u = uw > 0; }
-  else if (textW(F_NM, b) + uw <= maxw) { f = F_NM; u = uw > 0; }
-  else if (textW(F_NM, b) <= maxw) f = F_NM;
-  else u = uw > 0 && textW(F_NS, b) + uw <= maxw;
-  txtVU(f, b, F_LS, u ? unit : "", x, by, col, T.dim, bg, al, clearW);
-}
-static void dtileDyn(int i) {
-  const Met& m = MET[slots[i]]; bool right = i >= 3, ok; int x = DT_X[i], y = DT_Y[i];
-  float v = metricVal(m.src, ok) * m.mul; char b[14], key[24]; uint16_t col = T.dim; int lit = 0;
-  if (ok) { fmtv(b, sizeof b, v, m.dec); col = valCol(m, v); lit = constrain((int)lroundf((v - m.bmin) / (m.bmax - m.bmin) * 8), 0, 8); } else strcpy(b, "--");
-  snprintf(key, sizeof key, "%s|%04X|%d", b, col, lit);
-  if (!strcmp(key, dtCache[i])) return;
-  bool first = dtCache[i][0] == 0; strcpy(dtCache[i], key);
-  valueFit(b, m.unit, right ? x + 57 : x + 7, y + (thai ? 34 : 31), col, T.panel, right ? AL_R : AL_L, 52, 52, !thai);
-  segBar(right ? x + 64 - 6 - 47 : x + 6, y + (thai ? 37 : 35), 8, lit, col == T.dim ? T.dark : (col == T.text ? T.text : col), T.dark);
-  (void)first;
-}
-
-static int sbLast = -1; static bool sbBlink = false;
-static const int SBX[10] = {6, 21, 36, 51, 66, 81, 96, 111, 126, 141};
-static void sbSeg(int i, uint16_t c) {                             // i = 0..19, 0 = far left, 19 = far right (mirror image)
-  int p = i < 10 ? i : 19 - i;
-  int x = i < 10 ? SBX[p] : 320 - SBX[p] - 16, ax, bx, cx, dx;
-  if (i < 10) { ax = x + 3; bx = x + 16; cx = x + 13; dx = x; } else { ax = x; bx = x + 13; cx = x + 16; dx = x + 3; }
-  tft.fillTriangle(ax, 3, bx, 3, cx, 8, c); tft.fillTriangle(ax, 3, cx, 8, dx, 8, c);
-}
-static uint16_t sbCol(int pos, bool lit) {          // pos 0 = outermost segment
-  if (pos < 4) return lit ? T.acc : T.accDim;
-  if (pos < 7) return lit ? T.warn : mix565(T.bg, T.warn, 4);
-  return lit ? T.hot : hotDim();
-}
-static void shiftBar(float rpm) {
-  int r0 = max(1800, shiftRpm - 3000);
-  int lvl = rpm <= r0 ? 0 : min(10, 1 + (int)((rpm - r0) * 10.0f / (shiftRpm - r0)));
-  bool over = rpm >= shiftRpm; bool blink = over && ((millis() / 140) & 1);
-  int state = lvl * 2 + (over ? 100 : 0) + (blink ? 1 : 0);
-  if (state == sbLast) return;
-  sbLast = state;
-  for (int p = 0; p < 10; p++) {
-    bool lit = !blink && p < lvl;
-    uint16_t c = over ? (blink ? hotDim() : T.hot) : sbCol(p, lit);
-    sbSeg(p, c); sbSeg(19 - p, c);
-  }
-}
-
-static char lastRpm[14], lastSpd[10], lastHex[10], lastHdr[40];
-static int lastLink = -1;
-static void dashHeader() {
-  char nm[40]; carName(nm, sizeof nm);
-  char key[40]; snprintf(key, sizeof key, "%d|%d|%s|%d|%d|%d", linkState, (int)demoMode, nm, protoNum, (int)thai, (int)selBle);
-  if (!strcmp(key, lastHdr)) return;
-  strcpy(lastHdr, key);
-  tft.fillRect(0, 11, 320, 19, T.bg);
-  statusDot(11, 20);
-  StrId sid = demoMode ? S_DEMO : linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_SELDEV;
-  if (!demoMode && linkState == 2) txt(F_LS, selBle ? "OBD BLE" : "OBD BT", 19, 23, T.dim, T.bg);
-  else lab(sid, LB_TILE, 19, thai ? 24 : 23, T.dim, T.bg);
-  const char* pn = demoMode ? "" : protoName(protoNum);
-  if (pn[0]) txt(F_LS, pn, 313, 23, T.dim, T.bg, AL_R);
-  if (nm[0]) {
-    FontId f = F_UL; char t[40]; snprintf(t, sizeof t, "%s", nm);
-    if (textW(f, t) > 168) f = F_UM;
-    if (textW(f, t) > 168) fitText(t, sizeof t, nm, f, 168);
-    txt(f, t, 160, f == F_UL ? 25 : 24, T.text, T.bg, AL_C);
-  } else if (!demoMode && linkState == 2) lab(S_UNKNOWN, LB_BTNM, 160, 25, T.dim, T.bg, AL_C);
-  else if (!demoMode && linkState == 1 && selName[0]) { char t[32]; fitText(t, sizeof t, selName, F_UM, 160); txt(F_UM, t, 160, 24, T.dim, T.bg, AL_C); }
-}
-
-static const int NAVX[5] = {6, 68, 131, 193, 256};
-static const StrId NAVS[5] = {S_DATA, S_GRAPH, S_TRIP, S_CODES, S_SETUP};
-static void navBar() { for (int i = 0; i < 5; i++) btnId(NAVS[i], NAVX[i], 214, 58, 24, false); }
-
-static void centreCaption() {
-  txt(F_LS, crpMain ? "CRP  VOLT" : "KM/H", 160, 159, T.dim, T.bg, AL_C, 60);
-  hexagon(160, 190, 17, T.panel, T.acc, true); lastHex[0] = 0;
-}
-static void dashStatic() {
-  if (!ringBuilt) ringBuild();
-  dashHeader(); lastHdr[0] = 0; dashHeader();
-  tft.drawFastHLine(0, 30, 320, T.line);
-  for (int i = 0; i < 6; i++) dtileStatic(i);
-  ringLit = -1; ringPaint(0); ringNumerals();
-  centreCaption(); navBar();
-  lastRpm[0] = lastSpd[0] = 0; sbLast = -1;
-  for (int p = 0; p < 10; p++) { sbSeg(p, sbCol(p, false)); sbSeg(19 - p, sbCol(p, false)); }
-}
-static void dashSwap() {
-  tft.fillRect(96, 66, 128, 104, T.bg);
-  ringNumerals();
-  lastSpd[0] = lastRpm[0] = 0; centreCaption();
-}
-static void dashDyn() {
-  bool ok; float rpm = getVal(0x0C, ok); if (!ok) rpm = 0;
-  float spd = getVal(0x0D, ok); if (!ok) spd = 0;
-  dashHeader();
-  int lit = constrain((int)lroundf(rpm / (ringMaxK() * 1000.0f) * 40), 0, 40);
-  if (lit != ringLit) ringPaint(lit);
-  shiftBar(rpm);
-  char b[14], r[14]; fmtThou(r, sizeof r, (int)rpm);
-  if (strcmp(r, lastRpm)) { txtVU(F_NM, r, F_LS, "RPM", 160, 92, T.text, T.dim, T.bg, AL_C, 100); strcpy(lastRpm, r); }
-  int cv = (int)lroundf(constrain(crpV, 0.0f, 9.99f) * 100.0f);
-  if (crpMain) snprintf(b, sizeof b, "%d.%02d", cv / 100, cv % 100); else snprintf(b, sizeof b, "%d", (int)spd);
-  if (strcmp(b, lastSpd)) { txt(F_NXL, b, 160, 138, crpMain ? T.accL : T.text, T.bg, AL_C, 84); strcpy(lastSpd, b); }
-  char h[10]; if (crpMain) snprintf(h, sizeof h, "%d", (int)spd); else snprintf(h, sizeof h, "%d.%d", cv / 100, (cv / 10) % 10);
-  if (strcmp(h, lastHex)) { txt(F_NS, h, 160, 195, crpMain ? T.text : T.accL, T.panel, AL_C, 24); strcpy(lastHex, h); }
-  for (int i = 0; i < 6; i++) dtileDyn(i);
-}
-
-// =====================================================================================
-//  DATA grid, ALL PIDS list, GRAPH, TRIP, PEAKS
-// =====================================================================================
-static const int GX[4] = {6, 84, 162, 240}, GY[4] = {34, 85, 136, 187};         // data grid: tiles are 73 x 48
-static char gCache[16][24];
-
-static void dataTileStatic(int i) {
-  DTile t; dtileOf(i, t); int x = GX[i & 3], y = GY[i >> 2];
-  panel(x, y, 73, 48, 4, CUT_BL | CUT_BR, T.panel, T.line);
-  bracket(x, y, 73, T.acc, true, true);
-  lab(t.lab, LB_TILE, x + 36, thai ? y + 15 : y + 13, T.dim, T.panel, AL_C);
-  gCache[i][0] = 0;
-}
-static void dataTileDyn(int i) {
-  DTile t; dtileOf(i, t); int x = GX[i & 3], y = GY[i >> 2]; bool ok;
-  float v = metricVal(t.src, ok) * t.mul; char b[14], key[24]; uint16_t col = T.dim; int lit = 0;
-  if (ok) { fmtv(b, sizeof b, v, t.dec); col = t.mi >= 0 ? valCol(MET[t.mi], v) : T.text; lit = constrain((int)lroundf((v - t.bmin) / (t.bmax - t.bmin) * 8), 0, 8); } else strcpy(b, "--");
-  snprintf(key, sizeof key, "%s|%04X|%d", b, col, lit);
-  if (!strcmp(key, gCache[i])) return;
-  strcpy(gCache[i], key);
-  valueFit(b, t.unit, x + 36, y + 36, col, T.panel, AL_C, 64, 64, true);
-  segBar(x + 13, y + 41, 8, lit, col == T.dim ? T.dark : col, T.dark);
-}
-static void dataStatic() {
-  titleBar(S_ENGINE, 1); leftBtn(S_ALLPID);
-  for (int i = 0; i < 16; i++) dataTileStatic(i);
-}
-static void dataDyn() { for (int i = 0; i < 16; i++) dataTileDyn(i); }
 
 // ---------- all PIDs ----------
-static const int ALL_ROWS = 7;
+static const int ALL_ROWS = 5;
 static uint8_t allIdx[NPID]; static int allN = 0, allPg = 0;
-static char aCache[ALL_ROWS][16];
-static void allBuild() {
-  allN = 0;
-  for (int i = 0; i < NPID; i++) if (allMode || demoMode || psup[PIDS[i].id]) allIdx[allN++] = (uint8_t)i;
-  int pages = max(1, (allN + ALL_ROWS - 1) / ALL_ROWS);
-  allPg = constrain(allPg, 0, pages - 1);
-}
+static void allBuild() { allN = 0; for (int i = 0; i < NPID; i++) if (allMode || demoMode || psup[PIDS[i].id]) allIdx[allN++] = (uint8_t)i; }
 static int allPages() { return max(1, (allN + ALL_ROWS - 1) / ALL_ROWS); }
-static void allStatic() {
-  allBuild();
-  titleBar(S_ALLPID, 2);
+static void drawAll() {
+  int pages = allPages(); allPg = clampi(allPg, 0, pages - 1);
+  topBar(gv0(0x0C)); modeChips(DATA_MODES, 2, 1);
+  chipArrow(121, 32, 24, 20, -1, false);
+  char pg[12]; snprintf(pg, sizeof pg, "%d/%d", allPg + 1, pages); txt(F_LM, pg, 170, 45, T.dim, AL_C);
+  chipArrow(195, 32, 24, 20, 1, false);
+  chipId(allMode ? S_ALLPID : S_LIVE, 227, 32, 84, 20, allMode);
+  tile(9, 56, 302, 141);
   for (int r = 0; r < ALL_ROWS; r++) {
-    int k = allPg * ALL_ROWS + r, y = 34 + r * 25; aCache[r][0] = 0;
-    if (k >= allN) continue;
+    int k = allPg * ALL_ROWS + r, y = 57 + r * 28; if (k >= allN) continue;
     const Pid& p = PIDS[allIdx[k]];
-    char id[6]; snprintf(id, sizeof id, "%02X", p.id);
-    txt(F_LS, id, 8, y + 17, T.acc, T.bg);
-    char nm[40]; fitText(nm, sizeof nm, p.name, F_LM, 190); txt(F_LM, nm, 30, y + 17, T.text, T.bg);
-    txt(F_LS, p.unit, 276, y + 17, T.dim, T.bg);
-    tft.drawFastHLine(6, y + 24, 308, T.dark);
-  }
-  btnS("<", 6, 214, 50, 24, false); btnS(">", 62, 214, 50, 24, false);
-  char b[16]; snprintf(b, sizeof b, "%d/%d", allPg + 1, allPages()); txt(F_LM, b, 160, 231, T.dim, T.bg, AL_C, 70);
-  btnId(allMode ? S_ALLPID : S_LIVE, 232, 214, 82, 24, allMode, LB_BTNM);
-}
-static void allDyn() {
-  int n0 = allN; allBuild(); if (allN != n0) { redraw = true; return; }
-  for (int r = 0; r < ALL_ROWS; r++) {
-    int k = allPg * ALL_ROWS + r; if (k >= allN) break;
-    const Pid& p = PIDS[allIdx[k]]; bool ok; float v = getVal(p.id, ok); char b[16];
+    char id[6]; snprintf(id, sizeof id, "%02X", p.id); txt(F_UM, id, 17, y + 17, T.accL);
+    char nm[40]; fitText(nm, sizeof nm, p.name, F_US, 168); txt(F_US, nm, 42, y + 17, T.text);
+    bool ok; float v = getVal(p.id, ok); char b[16];
     if (ok) fmtv(b, sizeof b, v, p.dec); else strcpy(b, "--");
-    if (!strcmp(b, aCache[r])) continue;
-    strcpy(aCache[r], b);
-    txt(F_NM, b, 270, 34 + r * 25 + 19, ok ? T.text : T.dim, T.bg, AL_R, 76);
+    const char* un = !ok ? "" : (!strcmp(p.unit, "C") ? DEGC : p.unit);
+    txtVU(F_NM, b, F_LS, un, 304, y + 17, ok ? T.text : T.dim, T.dim, AL_R);
+    if (r < ALL_ROWS - 1) hl(15, y + 27, 290, T.sep);
   }
+  tabBar(1);
+}
+static void tapAll(int x, int y, bool first) {
+  if (!first) return;
+  if (tabTap(x, y, PG_DATA)) return;
+  int m = modeTap(DATA_MODES, 2, x, y);
+  if (m == 0) { nav(PG_DATA); return; }
+  if (hit(x, y, 121, 32, 24, 20)) { if (allPg > 0) allPg--; }
+  else if (hit(x, y, 195, 32, 24, 20)) { if (allPg + 1 < allPages()) allPg++; }
+  else if (hit(x, y, 227, 32, 84, 20)) { allMode = !allMode; allPg = 0; allBuild(); }
 }
 
 // ---------- graph ----------
 struct GSer { int8_t ch; uint16_t col; float lo, hi; StrId lab; const char* unit; uint8_t dec; };
-static const int CP_X = 30, CP_Y = 68, CP_W = 252, CP_H = 120;                       // plot area
-static uint32_t gDrawn = 0xFFFFFFFFu; static char grCache[3][28]; static uint32_t grAt = 0;
+static const int CP_X = 36, CP_Y = 70, CP_W = 244, CP_H = 76;                         // plot area
 static void gDefs(GSer* s, int& n) {
-  uint16_t cy = T.accL, vio = C(168, 130, 255);
+  uint16_t c1 = c565(TA.acc2), cy = T.accL;
   switch (gsel) {
-    case 0: n = 2; s[0] = GSer{GC_RPM, T.text, 0, (float)(ringMaxK() * 1000), S_GRPM, "", 0}; s[1] = GSer{GC_SPD, cy, 0, 200, S_SPEED, "km/h", 0}; break;
-    case 1: n = 3; s[0] = GSer{GC_COOL, T.text, 20, 140, S_COOLANT, DEGC, 0}; s[1] = GSer{GC_OIL, T.warn, 20, 140, S_OIL, DEGC, 0}; s[2] = GSer{GC_INT, vio, 20, 140, S_INTAKE, DEGC, 0}; break;
-    case 2: n = 2; s[0] = GSer{GC_AFR, T.text, 10, 20, S_AFR, "", 1}; s[1] = GSer{GC_STFT, cy, -25, 25, S_STFT, "%", 1}; break;
-    default: n = 1; s[0] = GSer{GC_BATT, T.text, 10, 16, S_BATT, "V", 1}; break;
-  }
-}
-static void bufTxt(FontId f, const char* s, int x, int by, uint16_t col, int bx0, int bw, int bh) {     // text drawn into the stripe buffer (no flicker)
-  const FontRec* F = FNT[f];
-  for (const char* p = s; *p; p++) {
-    const GlyphRec* g = glyphOf(F, (unsigned char)*p);
-    if (!g) { x += 4; continue; }
-    if (g->w) blit4(&F->bm[g->off], g->w, g->h, x + g->dx - bx0, by + g->dy, bw, bh, col);
-    x += g->adv;
+    case 0: n = 2; s[0] = GSer{GC_RPM, c1, 0, (float)(ringMaxK() * 1000), S_GRPM, "", 0}; s[1] = GSer{GC_SPD, cy, 0, 200, S_SPEED, "km/h", 0}; break;
+    case 1: n = 3; s[0] = GSer{GC_COOL, c1, 20, 140, S_COOLANT, DEGC, 0}; s[1] = GSer{GC_OIL, T.warn, 20, 140, S_OIL, DEGC, 0}; s[2] = GSer{GC_INT, VIOLET, 20, 140, S_INTAKE, DEGC, 0}; break;
+    case 2: n = 2; s[0] = GSer{GC_AFR, c1, 10, 20, S_AFR, "", 1}; s[1] = GSer{GC_STFT, cy, -25, 25, S_STFT, "%", 1}; break;
+    default: n = 1; s[0] = GSer{GC_BATT, c1, 10, 16, S_BATT, "V", 1}; break;
   }
 }
 static int16_t gY[3][GN];
@@ -1540,257 +1674,310 @@ static bool gYAt(int k, int X, float x0f, float dxp, int cnt, int& y) {
   if (b < 0) { y = a; return true; }
   y = (int)lroundf(a + (b - a) * f); return true;
 }
-static int gTh(const GSer* s, int n, int idx, float v) {      // y of a threshold on the scale of series idx
-  (void)n; float f = (v - s[idx].lo) / (s[idx].hi - s[idx].lo);
-  return (CP_H - 1) - (int)lroundf(constrain(f, 0.0f, 1.0f) * (CP_H - 1));
-}
+static int gTh(const GSer* s, float v) { float f = (v - s[0].lo) / (s[0].hi - s[0].lo); return (CP_H - 1) - (int)lroundf(clampf(f, 0, 1) * (CP_H - 1)); }
 static void chartRender(const GSer* s, int n) {
   int cnt = gCnt[gmode]; const float dxp = (CP_W - 1) / (float)(GN - 1), x0f = (CP_W - 1) - (cnt - 1) * dxp;
   for (int k = 0; k < n; k++) for (int j = 0; j < GN; j++) {
     int16_t raw = j < cnt ? gH[s[k].ch][gmode][j] : (int16_t)-32768;
     if (raw == -32768) { gY[k][j] = -1; continue; }
     float v = raw / gScale(s[k].ch), f = (v - s[k].lo) / (s[k].hi - s[k].lo);
-    gY[k][j] = (int16_t)((CP_H - 1) - (int)lroundf(constrain(f, 0.0f, 1.0f) * (CP_H - 1)));
+    gY[k][j] = (int16_t)((CP_H - 1) - (int)lroundf(clampf(f, 0, 1) * (CP_H - 1)));
   }
-  int thN = 0, thY[2]; uint16_t thC[2]; char thT[2][20]; thT[0][0] = thT[1][0] = 0;     // dashed limit lines
-  if (gsel == 0) { thY[thN] = gTh(s, n, 0, (float)shiftRpm); thC[thN++] = T.hot; }
+  int thN = 0, thY[2]; uint16_t thC[2]; char thT[2][24]; thT[0][0] = thT[1][0] = 0;     // dashed limit lines
+  if (gsel == 0) { thY[thN] = gTh(s, (float)shiftRpm); thC[thN++] = T.hot; }
   else if (gsel == 1) {
-    thY[thN] = gTh(s, n, 0, 100); thC[thN] = T.warn; snprintf(thT[thN], 20, "%s 100", EN[S_COOLANT]); thN++;
-    thY[thN] = gTh(s, n, 0, 120); thC[thN] = T.hot; snprintf(thT[thN], 20, "%s 120", EN[S_OIL]); thN++;
+    thY[thN] = gTh(s, 100); thC[thN] = T.warn; snprintf(thT[thN], 24, "%s 100", EN[S_COOLANT]); thN++;
+    thY[thN] = gTh(s, 120); thC[thN] = T.hot; snprintf(thT[thN], 24, "%s 120", EN[S_OIL]); thN++;
   }
-  else if (gsel == 2) { thY[thN] = gTh(s, n, 0, 14.7f); thC[thN++] = T.good; }
-  else { thY[thN] = gTh(s, n, 0, 12.0f); thC[thN++] = T.warn; }
-  const int SW = TB_CAP / CP_H;
-  for (int x0 = 0; x0 < CP_W; x0 += SW) {
-    int w = min(SW, CP_W - x0);
-    for (int i = 0; i < w * CP_H; i++) tPix[i] = T.panel;
-    for (int r = 0; r <= 4; r++) { int y = r * (CP_H - 1) / 4; for (int c = 0; c < w; c++) tPix[y * w + c] = T.dark; }
-    for (int q = 0; q <= 4; q++) { int X = q * (CP_W - 1) / 4 - x0; if (X >= 0 && X < w) for (int y = 0; y < CP_H; y++) tPix[y * w + X] = T.dark; }
-    for (int t = 0; t < thN; t++) for (int c = 0; c < w; c++) if (((x0 + c) & 7) < 5) tPix[thY[t] * w + c] = thC[t];
-    if (CP_W - 1 >= x0 && CP_W - 1 < x0 + w) for (int y = 0; y < CP_H; y++) tPix[y * w + (CP_W - 1 - x0)] = T.accDim;     // "now" edge
-    for (int k = 0; k < n; k++) {
-      for (int c = 0; c < w; c++) {
-        int X = x0 + c, ya, yb;
-        if (!gYAt(k, X, x0f, dxp, cnt, ya)) continue;
-        if (!gYAt(k, X + 1, x0f, dxp, cnt, yb)) yb = ya;
-        int lo = min(ya, yb), hi = max(ya, yb) + 1;
-        for (int y = max(0, lo); y <= min(CP_H - 1, hi); y++) tPix[y * w + c] = s[k].col;
-      }
+  else if (gsel == 2) { thY[thN] = gTh(s, 14.7f); thC[thN++] = T.good; }
+  else { thY[thN] = gTh(s, 12.0f); thC[thN++] = T.warn; }
+  for (int r = 0; r <= 4; r++) hl(CP_X, CP_Y + r * (CP_H - 1) / 4, CP_W, T.grid);
+  for (int t = 0; t < thN; t++) for (int x = 0; x < CP_W; x += 8) fr(CP_X + x, CP_Y + thY[t], min(5, CP_W - x), 1, thC[t]);
+  if (CP_Y + CP_H <= bandY0 || CP_Y >= bandY1) return;
+  for (int k = 0; k < n; k++) {
+    for (int X = 0; X < CP_W; X++) {
+      int ya, yb;
+      if (!gYAt(k, X, x0f, dxp, cnt, ya)) continue;
+      if (!gYAt(k, X + 1, x0f, dxp, cnt, yb)) yb = ya;
+      int lo = max(0, min(ya, yb)), hi = min(CP_H - 2, max(ya, yb));
+      if (k == 0 && hi + 2 < CP_H) frA(CP_X + X, CP_Y + hi + 2, 1, CP_H - hi - 2, T.acc, 34);
+      fr(CP_X + X, CP_Y + lo, 1, hi - lo + 2, s[k].col);
     }
-    for (int t = 0; t < thN; t++) if (thT[t][0]) bufTxt(F_LS, thT[t], CP_W - 6 - textW(F_LS, thT[t]), thY[t] - 3, thC[t], x0, w, CP_H);
-    tft.pushImage(CP_X + x0, CP_Y, w, CP_H, tPix);
   }
+  for (int t = 0; t < thN; t++) if (thT[t][0]) txt(F_LS, thT[t], CP_X + CP_W - 6 - textW(F_LS, thT[t]), CP_Y + thY[t] - 3, thC[t]);
 }
-static void graphAxes() {
-  GSer s[3]; int n; gDefs(s, n);
-  panel(6, 64, 308, 148, 4, CUT_BL | CUT_BR, T.panel, T.line);
+static void graphAxes(const GSer* s, int n) {
+  rr(9, 64, 302, 99, 9, T.chartbg, T.line);
+  chartRender(s, n);
   for (int r = 0; r <= 4; r++) {
-    int y = CP_Y + r * (CP_H - 1) / 4; char b[10];
+    int y = CP_Y + r * (CP_H - 1) / 4; char b[12];
     float v = s[0].lo + (s[0].hi - s[0].lo) * (4 - r) / 4;
     if (gsel == 0) { if (v >= 1000 && ((int)v % 1000) == 0) snprintf(b, sizeof b, "%dK", (int)v / 1000); else if (v >= 1000) snprintf(b, sizeof b, "%.1fK", v / 1000); else snprintf(b, sizeof b, "%d", (int)v); }
     else snprintf(b, sizeof b, "%.*f", s[0].dec, v);
-    txt(F_LS, b, CP_X - 4, y + 3, T.dim, T.panel, AL_R, 18);
-    if (n >= 2 && gsel != 1) {
-      float v2 = s[1].lo + (s[1].hi - s[1].lo) * (4 - r) / 4; snprintf(b, sizeof b, "%.*f", s[1].dec, v2);
-      txt(F_LS, b, CP_X + CP_W + 4, y + 3, s[1].col, T.panel, AL_L, 22);
-    }
+    txt(F_LS, b, CP_X - 5, y + 3, T.dim, AL_R);
+    if (n >= 2 && gsel != 1) { float v2 = s[1].lo + (s[1].hi - s[1].lo) * (4 - r) / 4; snprintf(b, sizeof b, "%.*f", s[1].dec, v2); txt(F_LS, b, CP_X + CP_W + 5, y + 3, s[1].col, AL_L); }
   }
-  static const char* const T60[5] = {"-60S", "-45", "-30", "-15", "NOW"}, *const T15[5] = {"-15M", "-11", "-8", "-4", "NOW"};
-  for (int q = 0; q < 5; q++) txt(F_LS, gmode ? T15[q] : T60[q], CP_X + q * (CP_W - 1) / 4, 204, T.dim, T.panel, q == 4 ? AL_R : (q == 0 ? AL_L : AL_C), 0);
+  static const char* const T60[5] = {"-60s", "-45", "-30", "-15", "now"}, *const T15[5] = {"-15m", "-11", "-8", "-4", "now"};
+  for (int q = 0; q < 5; q++) txt(F_LS, gmode ? T15[q] : T60[q], CP_X + q * (CP_W - 1) / 4, 158, T.dim, q == 4 ? AL_R : (q == 0 ? AL_L : AL_C));
 }
-static void graphReadouts(bool statics) {
-  GSer s[3]; int n; gDefs(s, n);
-  int pw = (308 - (n - 1) * 4) / n;
+static void graphReadouts(const GSer* s, int n) {
+  int pw = (302 - (n - 1) * 5) / n;
   for (int k = 0; k < n; k++) {
-    int x = 6 + k * (pw + 4), y = 33, lb = thai ? y + 12 : y + 11;
-    if (statics) {
-      panel(x, y, pw, 29, 4, CUT_BL | CUT_BR, T.panel, T.line); bracket(x, y, pw, T.acc, true, true);
-      tft.fillCircle(x + 9, y + 8, 2, s[k].col);
-      lab(s[k].lab, LB_TILE, x + 15, lb, T.dim, T.panel);
-      if (pw >= 140) lab(S_GMAX, LB_TILE, x + pw - 48, tby(y + 26), T.dim, T.panel, AL_R);
-      tft.fillTriangle(x + pw - 43, y + 25, x + pw - 39, y + 25, x + pw - 41, y + 19, T.hot);
-      grCache[k][0] = 0;
-    }
-    int ch = s[k].ch; float mx = -1e9f; bool any = false;
+    int x = 9 + k * (pw + 5), y = 32, ch = s[k].ch;
+    tile(x, y, pw, 30);
+    disc(x + 9, y + 8, 2.4f, s[k].col);
+    lab(s[k].lab, LB_TILE, x + 16, thai ? y + 13 : y + 11, T.dim);
+    float mx = -1e9f; bool any = false;
     for (int j = 0; j < gCnt[gmode]; j++) { int16_t r = gH[ch][gmode][j]; if (r != -32768) { mx = fmaxf(mx, r / gScale(ch)); any = true; } }
-    char v[14], m[14], key[28];
-    if (gOk[ch]) { if (ch == GC_RPM) fmtThou(v, sizeof v, (int)gLast[ch]); else fmtv(v, sizeof v, gLast[ch], s[k].dec); } else strcpy(v, "--");
-    if (any) { if (ch == GC_RPM) fmtThou(m, sizeof m, (int)mx); else fmtv(m, sizeof m, mx, s[k].dec); } else strcpy(m, "--");
-    snprintf(key, sizeof key, "%s|%s", v, m);
-    if (!statics && !strcmp(key, grCache[k])) continue;
-    strcpy(grCache[k], key);
-    int vw = pw >= 140 ? pw - 100 : pw - 52; bool u = textW(F_NM, v) + textW(F_LS, s[k].unit) + 3 <= vw;
-    txtVU(F_NM, v, F_LS, u ? s[k].unit : "", x + 8, y + 26, gOk[ch] ? T.text : T.dim, T.dim, T.panel, AL_L, vw);
-    txt(F_LS, m, x + pw - 6, y + 25, T.hot, T.panel, AL_R, 34);
+    char v[16] = "--", m[16] = "--";
+    if (gOk[ch]) { if (ch == GC_RPM) fmtThou(v, sizeof v, (int)gLast[ch]); else fmtv(v, sizeof v, gLast[ch], s[k].dec); }
+    if (any) { if (ch == GC_RPM) fmtThou(m, sizeof m, (int)mx); else fmtv(m, sizeof m, mx, s[k].dec); }
+    int mby = thai ? y + 13 : y + 11;
+    if (pw >= 140) {
+      int mw = textW(F_LS, m), xr = x + pw - 7;
+      txt(F_LS, m, xr, mby, T.hot, AL_R);
+      tri(xr - mw - 9, y + 10, xr - mw - 5, y + 10, xr - mw - 7, y + 5, T.hot);
+      lab(S_GMAX, LB_TILE, xr - mw - 12, mby, T.dim, AL_R);
+    } else txt(F_LS, m, x + pw - 7, mby, T.hot, AL_R);
+    int vw = pw - 16; bool u = textW(F_NL, v) + textW(F_LS, s[k].unit) + 3 <= vw;
+    txtVU(F_NL, v, F_LS, u ? s[k].unit : "", x + 8, y + 27, gOk[ch] ? T.text : T.dim, T.dim, AL_L);
   }
 }
-static void graphStatic() {
-  titleBar(S_GRAPH, 1);
-  lab(gmode ? S_G15M : S_G60S, LB_TILE, 8, thai ? 20 : 19, T.dim, T.bg);
-  graphReadouts(true); graphAxes();
-  static const StrId GN_[4] = {S_GRPM, S_GTEMPS, S_GAFR, S_GBATT};
-  for (int i = 0; i < 4; i++) btnId(GN_[i], NAVX[i], 214, 58, 24, gsel == i);
-  btnId(gmode ? S_G15M : S_G60S, NAVX[4], 214, 58, 24, false);
-  gDrawn = 0xFFFFFFFFu;
-}
-static void graphDyn() {
+static const StrId GBTN[4] = {S_GRPM, S_GTEMPS, S_GAFR, S_GBATT};
+static const int GBX[5] = {9, 70, 131, 192, 253};
+static void drawGraph() {
   GSer s[3]; int n; gDefs(s, n);
-  uint32_t sig = gPush[gmode] * 8 + gsel + (uint32_t)gmode * 3;
-  if (sig != gDrawn) { gDrawn = sig; chartRender(s, n); graphReadouts(false); }
+  topBar(gv0(0x0C));
+  graphReadouts(s, n); graphAxes(s, n);
+  for (int i = 0; i < 4; i++) chipId(GBTN[i], GBX[i], 168, 56, 22, gsel == i);
+  chipId(gmode ? S_G15M : S_G60S, GBX[4], 168, 58, 22, false);
+  tabBar(2);
+}
+static void tapGraph(int x, int y, bool first) {
+  if (!first) return;
+  if (tabTap(x, y, PG_GRAPH)) return;
+  if (y < 168 || y >= 190) return;
+  for (int i = 0; i < 4; i++) if (hit(x, y, GBX[i], 168, 56, 22)) { gsel = i; updateWants(); return; }
+  if (hit(x, y, GBX[4], 168, 58, 22)) gmode ^= 1;
 }
 
 // ---------- trip ----------
-static char tcache[8][26];
-static void tripTile(int i, int x, int y, int w, int h, StrId lb, const char* v, const char* unit, uint16_t col, bool statics) {
-  if (statics) { panel(x, y, w, h, 4, CUT_BL | CUT_BR, T.panel, T.line); bracket(x, y, w, T.acc, true, true); lab(lb, LB_TILE, x + w / 2, thai ? y + 15 : y + 13, T.dim, T.panel, AL_C); tcache[i][0] = 0; }
-  char key[26]; snprintf(key, sizeof key, "%s|%04X", v, col);
-  if (!statics && !strcmp(key, tcache[i])) return;
-  strcpy(tcache[i], key);
-  valueFit(v, unit, x + w / 2, y + h - 7, col, T.panel, AL_C, w - 8, w - 8, true);
+static const ModeChip TRIP_MODES[2] = {{S_TRIP, 9, 44}, {S_PEAKS, 57, 52}};
+static void smallTile(int x, int y, int w, int h, StrId lb, const char* v, const char* unit, uint16_t col) {
+  tile(x, y, w, h);
+  lab(lb, LB_TILE, x + 6, thai ? y + 13 : y + 10, T.dim, AL_L, w - 10);
+  valueFit(v, unit, x + 7, y + h - 5, col, AL_L, w - 14);
 }
-static void tripBars();
-static void tripDraw(bool st) {
-  char b[24], u[12]; bool have = tFuel > 0.002f || tNow > 0 || tNowKmL > 0;
-  // left header text: range
-  float rg = rangeKm();
-  if (st) { lab(S_RANGE, LB_TILE, 8, thai ? 20 : 19, T.dim, T.bg); }
-  { char r[12]; if (rg >= 0) snprintf(r, sizeof r, "%d km", (int)rg); else strcpy(r, "-- km"); char key[14]; snprintf(key, sizeof key, "%s", r);
-    if (st || strcmp(key, tcache[7])) { strcpy(tcache[7], key); txt(F_LS, r, 8 + labW(S_RANGE, LB_TILE) + 5, 19, T.text, T.bg, AL_L, 44); } }
-  // NOW + AVERAGE
-  float nowv = unitL100 ? tNow : tNowKmL; if (!have || nowv <= 0) strcpy(b, "--"); else fmtv(b, sizeof b, nowv, 1);
-  if (st) { panel(6, 34, 150, 58, 4, CUT_BL | CUT_BR, T.panel, T.line); bracket(6, 34, 150, T.acc, true, false); lab(S_NOW, LB_TILE, 14, thai ? 49 : 47, T.dim, T.panel);
-    txt(F_LS, unitL100 ? "L/100km" : "km/L", 148, 47, T.dim, T.panel, AL_R); tcache[0][0] = 0; }
-  if (st || strcmp(b, tcache[0])) { strcpy(tcache[0], b); txt(F_NHL, b, 81, 78, T.text, T.panel, AL_C, 120); }
-  float al = tripAvgL100(), avgv = al > 0 ? (unitL100 ? al : 100.0f / al) : 0; if (avgv > 0) fmtv(b, sizeof b, avgv, 1); else strcpy(b, "--");
-  if (st) { panel(160, 34, 154, 58, 4, CUT_TL | CUT_BR, T.panel, T.line); bracket(160, 34, 154, T.good, false, true); lab(S_TAVG, LB_TILE, 168, thai ? 49 : 47, T.dim, T.panel);
-    txt(F_LS, unitL100 ? "L/100km" : "km/L", 306, 47, T.dim, T.panel, AL_R); tcache[1][0] = 0; }
-  snprintf(u, sizeof u, "%s", al > 0 ? (unitL100 ? "km/L" : "L/100km") : ""); char b2[24]; snprintf(b2, sizeof b2, "%s|%s", b, u);
-  if (st || strcmp(b2, tcache[1])) {
-    strcpy(tcache[1], b2); txt(F_NHL, b, 237, 76, avgv > 0 ? T.good : T.dim, T.panel, AL_C, 130);
-    char s2[24]; if (al > 0) snprintf(s2, sizeof s2, "%.1f %s", unitL100 ? 100.0f / al : al, u); else s2[0] = 0;
-    txt(F_LS, s2, 237, 88, T.dim, T.panel, AL_C, 120);
-  }
-  // small tiles
-  char v[16];
-  fmtv(v, sizeof v, tDist, 1); tripTile(2, GX[0], 96, 73, 44, S_DIST, v, "km", T.text, st);
-  int mins = (int)(tSec / 60); snprintf(v, sizeof v, "%d:%02d", mins / 60, mins % 60); tripTile(3, GX[1], 96, 73, 44, S_DTIME, v, "h", T.text, st);
-  float avs = tSec > 5 ? tDist / (tSec / 3600.0f) : 0; fmtv(v, sizeof v, avs, 0); tripTile(4, GX[2], 96, 73, 44, S_ASPD, v, "km/h", T.text, st);
-  if (tFuel > 0.002f) fmtv(v, sizeof v, tFuel, 2); else strcpy(v, "--"); tripTile(5, GX[3], 96, 73, 44, S_FUELUSED, v, "L", tFuel > 0.002f ? T.text : T.dim, st);
-  if (st) { panel(6, 144, 308, 68, 4, CUT_BL | CUT_BR, T.panel, T.line); lab(S_EACHMIN, LB_TILE, 14, thai ? 160 : 157, T.dim, T.panel); }
-  tripBars();
-}
-static int tbN = -1; static uint32_t tbAt = 0;
 static void tripBars() {
-  static bool first = true;
-  if (!redraw && !first && tbN == nMin && millis() - tbAt < 4000) return;
-  first = false; tbN = nMin; tbAt = millis();
-  float eff[31]; int ne = 0;
+  float eff[32]; int ne = 0;
   for (int i = max(0, nMin - 29); i < nMin; i++) eff[ne++] = minFuel[i] > 0.0004f ? minDist[i] / minFuel[i] : 0;
   if (curMinF > 0.0004f && ne < 30) eff[ne++] = curMinD / curMinF;
-  float al = tripAvgL100(), avg = al > 0 ? 100.0f / al : 0, mx = 20;
+  float al = tripAvgL100(), avg = al > 0 ? 100 / al : 0, mx = 20;
   for (int i = 0; i < ne; i++) mx = fmaxf(mx, eff[i] * 1.15f);
   if (avg > 0) mx = fmaxf(mx, avg * 1.3f);
-  tft.fillRect(8, 160, 304, 50, T.panel);
-  const int BASE = 206, BH = 38;
+  const int BASE = 166, BH = 24;
   for (int i = 0; i < ne; i++) {
-    int slot = 30 - ne + i, x = 12 + slot * 10, h = constrain((int)lroundf(eff[i] / mx * BH), eff[i] > 0 ? 2 : 0, BH);
-    tft.fillRect(x, BASE - h, 7, h, (avg > 0 && eff[i] >= avg) ? T.good : T.dim);
+    int slot = 30 - ne + i, x = (int)(15 + slot * 9.6f), h = clampi((int)lroundf(eff[i] / mx * BH), eff[i] > 0 ? 2 : 0, BH);
+    rr(x, BASE - h, 7, h, 2, (avg > 0 && eff[i] >= avg) ? T.good : T.dim);
   }
-  if (avg > 0) { int y = BASE - constrain((int)lroundf(avg / mx * BH), 0, BH); for (int x = 10; x < 312; x += 6) tft.drawFastHLine(x, y, 3, T.good); }
-  char t[24]; if (avg > 0) snprintf(t, sizeof t, "%s %.1f", EN[S_AVG], avg); else snprintf(t, sizeof t, "%s --", EN[S_AVG]);
-  txt(F_LS, t, 200, 157, avg > 0 ? T.good : T.dim, T.panel, AL_R, 0);
-  lab(S_LAST30, LB_TILE, 306, thai ? 160 : 157, T.dim, T.panel, AL_R);
+  if (avg > 0) { int y = BASE - clampi((int)lroundf(avg / mx * BH), 0, BH); for (int x = 14; x < 304; x += 6) hl(x, y, 3, T.good); }
+  { char at[12]; if (avg > 0) snprintf(at, sizeof at, "%.1f", avg); else strcpy(at, "--"); uint16_t ac = avg > 0 ? T.good : T.dim;
+    txt(F_LS, at, 210, tby(142), ac, AL_R); lab(S_AVG, LB_TILE, 210 - textW(F_LS, at) - 4, tby(142), ac, AL_R); }
+  lab(S_LAST30, LB_TILE, 304, tby(142), T.dim, AL_R);
 }
-static void tripStatic() {
-  titleBar(S_TRIP, 1);
-  tripDraw(true);
-  btnId(S_RESET, 6, 214, 100, 24, false, LB_BTNM); btnId(S_UNITS, 110, 214, 100, 24, false, LB_BTNM); btnId(S_PEAKS, 214, 214, 100, 24, false, LB_BTNM);
+static void drawTrip() {
+  topBar(gv0(0x0C)); modeChips(TRIP_MODES, 2, 0);
+  bool have = tFuel > 0.002f || tNow > 0 || tNowKmL > 0; float rg = rangeKm();
+  char rt[16]; if (rg >= 0) snprintf(rt, sizeof rt, "%d km", (int)rg); else strcpy(rt, "-- km");
+  int rw = textW(F_US, rt);
+  txt(F_US, rt, 311, tby(45), T.text, AL_R); lab(S_RANGE, LB_TILE, 311 - rw - 5, tby(45), T.dim, AL_R);
+  float nowv = unitL100 ? tNow : tNowKmL; const char* uL = unitL100 ? "L/100km" : "km/L";
+  char b[16];
+  tile(9, 55, 149, 38); lab(S_NOW, LB_TILE, 17, tby(66), T.dim);
+  if (!have || nowv <= 0) strcpy(b, "--"); else fmtv(b, sizeof b, nowv, 1);
+  txtVU(F_NHL, b, F_LS, uL, 17, 88, T.text, T.dim, AL_L);
+  float al = tripAvgL100(), avgv = al > 0 ? (unitL100 ? al : 100 / al) : 0;
+  tile(162, 55, 149, 38); lab(S_TAVG, LB_TILE, 170, tby(66), T.dim);
+  if (al > 0) { char t[24]; snprintf(t, sizeof t, "%.1f %s", unitL100 ? 100 / al : al, unitL100 ? "km/L" : "L/100km"); txt(F_LS, t, 303, tby(66), T.dim, AL_R); }
+  if (avgv > 0) fmtv(b, sizeof b, avgv, 1); else strcpy(b, "--");
+  txtVU(F_NHL, b, F_LS, uL, 170, 88, avgv > 0 ? T.good : T.dim, T.dim, AL_L);
+  int mins = (int)(tSec / 60); float avs = tSec > 5 ? tDist / (tSec / 3600) : 0; char c1[16], c2[16], c3[16], c4[16];
+  fmtv(c1, sizeof c1, tDist, 1); smallTile(GX[0], 96, 71, 30, S_DIST, c1, "km", T.text);
+  snprintf(c2, sizeof c2, "%d:%02d", mins / 60, mins % 60); smallTile(GX[1], 96, 71, 30, S_DTIME, c2, "h", T.text);
+  fmtv(c3, sizeof c3, avs, 0); smallTile(GX[2], 96, 71, 30, S_ASPD, c3, "km/h", T.text);
+  if (tFuel > 0.002f) fmtv(c4, sizeof c4, tFuel, 2); else strcpy(c4, "--"); smallTile(GX[3], 96, 71, 30, S_FUELUSED, c4, "L", tFuel > 0.002f ? T.text : T.dim);
+  tile(9, 130, 302, 42); lab(S_EACHMIN, LB_TILE, 17, tby(142), T.dim);
+  tripBars();
+  chipId(S_RESET, 9, 176, 146, 20, false); chipId(S_UNITS, 165, 176, 146, 20, false);
+  tabBar(3);
 }
-static void tripDyn() { tripDraw(false); }
+static void tapTrip(int x, int y, bool first) {
+  if (!first) return;
+  if (tabTap(x, y, PG_TRIP)) return;
+  if (modeTap(TRIP_MODES, 2, x, y) == 1) { nav(PG_PEAKS); return; }
+  if (hit(x, y, 9, 176, 146, 20)) tripReset();
+  else if (hit(x, y, 165, 176, 146, 20)) { unitL100 = !unitL100; saveSoon(); }
+}
 
 // ---------- peaks ----------
-static const int PKX[3] = {6, 110, 214}, PKY[3] = {34, 93, 152};
-static char pcache[9][26];
-static void clockStr(char* d, size_t n, uint32_t s) { if (s >= 3600) snprintf(d, n, "%u:%02u", (unsigned)(s / 3600), (unsigned)(s / 60 % 60)); else snprintf(d, n, "%u:%02u", (unsigned)(s / 60), (unsigned)(s % 60)); }
-static void peaksDraw(bool st) {
+static const int PKX[3] = {9, 112, 215}, PKY[3] = {56, 103, 150};
+static void drawPeaks() {
   const Peaks& p = pkAllMode ? pkA : pkD;
+  topBar(gv0(0x0C)); modeChips(TRIP_MODES, 2, 1);
+  chipId(pkAllMode ? S_ALLTIME : S_THISDRIVE, 181, 32, 72, 20, pkAllMode); chipId(S_RESET, 257, 32, 54, 20, false);
   struct E { StrId lb; float v; int dec; const char* unit; uint32_t t; bool good, bad; };
-  const E e[9] = {
+  E e[9] = {
     {S_MAXRPM, p.rpm, 0, "", p.tr, false, false}, {S_TOPSPEED, p.spd, 0, "km/h", p.ts, false, false}, {S_BEST0100, p.best, 2, "s", 0, true, false},
     {S_MAXCOOL, p.cool, 0, DEGC, p.tc, false, p.cool >= 108}, {S_MAXOIL, p.oil, 0, DEGC, p.to, false, p.oil >= 130}, {S_MAXLOAD, p.load, 0, "%", p.tl, false, false},
     {S_MAXINT, p.intake, 0, DEGC, p.ti, false, false}, {S_MINBATT, p.minB, 1, "V", p.tmin, false, p.minB < 11.8f && p.minB > 1}, {S_MAXBATT, p.maxB, 1, "V", p.tmax, false, false}};
   for (int i = 0; i < 9; i++) {
-    int x = PKX[i % 3], y = PKY[i / 3]; char v[16], key[26], tm[16] = "";
-    bool has = i == 7 ? (p.minB < 90) : (e[i].v > 0.0001f);
-    if (!has) strcpy(v, "--"); else if (i == 0) fmtThou(v, sizeof v, (int)e[i].v); else fmtv(v, sizeof v, e[i].v, e[i].dec);
-    if (has && !pkAllMode && i != 2) clockStr(tm, sizeof tm, e[i].t);
-    uint16_t col = !has ? T.dim : e[i].bad ? T.hot : e[i].good ? T.good : T.text;
-    snprintf(key, sizeof key, "%s|%s|%04X", v, tm, col);
-    if (st) { panel(x, y, 100, 56, 4, CUT_BL | CUT_BR, T.panel, T.line); bracket(x, y, 100, e[i].good ? T.good : T.acc, true, true); lab(e[i].lb, LB_TILE, x + 50, thai ? y + 15 : y + 13, T.dim, T.panel, AL_C); pcache[i][0] = 0; }
-    if (!st && !strcmp(key, pcache[i])) continue;
-    strcpy(pcache[i], key);
-    valueFit(v, e[i].unit, x + 50, y + 38, col, T.panel, AL_C, 90, 90, true);
-    if (tm[0]) { int aw = labW(S_ATTIME, LB_TILE), tw = textW(F_LS, tm), x0 = x + 50 - (aw + 4 + tw) / 2; tft.fillRect(x + 6, y + 44, 88, 11, T.panel); lab(S_ATTIME, LB_TILE, x0, thai ? y + 54 : y + 52, T.dim, T.panel); txt(F_LS, tm, x0 + aw + 4, y + 52, T.dim, T.panel); }
-    else tft.fillRect(x + 6, y + 44, 88, 11, T.panel);
+    int x = PKX[i % 3], y = PKY[i / 3]; const E& E_ = e[i]; bool has = i == 7 ? p.minB < 90 : E_.v > 0.0001f;
+    char v[16] = "--", tm[16] = "";
+    if (has) { if (i == 0) fmtThou(v, sizeof v, (int)E_.v); else fmtv(v, sizeof v, E_.v, E_.dec); }
+    if (has && !pkAllMode && i != 2) clockStr(tm, sizeof tm, E_.t);
+    uint16_t col = !has ? T.dim : E_.bad ? T.hot : E_.good ? T.good : T.text;
+    tile(x, y, 96, 44);
+    lab(E_.lb, LB_TILE, x + 48, thai ? y + 14 : y + 11, T.dim, AL_C, 88);
+    valueFit(v, E_.unit, x + 48, y + 29, col, AL_C, 86);
+    if (tm[0]) { int aw = labW(S_ATTIME, LB_TILE), w2 = textW(F_LS, tm), x0 = x + 48 - (aw + 4 + w2) / 2, aby = thai ? y + 41 : y + 39; lab(S_ATTIME, LB_TILE, x0, aby, T.dim); txt(F_LS, tm, x0 + aw + 4, aby, T.dim); }
   }
+  tabBar(3);
 }
-static void peaksStatic() {
-  titleBar(S_PEAKS, 2);
-  lab(pkAllMode ? S_ALLTIME : S_THISDRIVE, LB_TILE, 8, thai ? 20 : 19, T.dim, T.bg);
-  peaksDraw(true);
-  btnId(S_RESET, 6, 214, 150, 24, false, LB_BTNM); btnId(pkAllMode ? S_THISDRIVE : S_ALLTIME, 164, 214, 150, 24, pkAllMode, LB_BTNM);
+static void tapPeaks(int x, int y, bool first) {
+  if (!first) return;
+  if (tabTap(x, y, PG_TRIP)) return;
+  if (modeTap(TRIP_MODES, 2, x, y) == 0) { nav(PG_TRIP); return; }
+  if (hit(x, y, 181, 32, 72, 20)) pkAllMode = !pkAllMode;
+  else if (hit(x, y, 257, 32, 54, 20)) { peaksClear(pkAllMode ? pkA : pkD); if (pkAllMode) pkDirty = true; }
 }
-static void peaksDyn() { peaksDraw(false); }
 
 // =====================================================================================
-//  CODES, STATUS (monitors / freeze frame / ECU info), SETUP, SETUP 2, BLUETOOTH, VEHICLE
+//  Pages, part 2: codes, monitors, freeze frame, ECU info, setup, more settings, Bluetooth, vehicle, splash, alerts, park
 // =====================================================================================
-
 struct DtcD { const char* c; const char* d; };
 static const DtcD DTCD[] = {
-  {"P0016", "CRANK / CAM CORRELATION B1 A"}, {"P0100", "MAF SENSOR CIRCUIT"}, {"P0101", "MAF RANGE / PERFORMANCE"}, {"P0102", "MAF CIRCUIT LOW"}, {"P0103", "MAF CIRCUIT HIGH"},
-  {"P0105", "MAP SENSOR CIRCUIT"}, {"P0106", "MAP RANGE / PERFORMANCE"}, {"P0107", "MAP CIRCUIT LOW"}, {"P0108", "MAP CIRCUIT HIGH"},
-  {"P0110", "INTAKE AIR TEMP CIRCUIT"}, {"P0112", "INTAKE AIR TEMP LOW"}, {"P0113", "INTAKE AIR TEMP HIGH"},
-  {"P0115", "COOLANT TEMP CIRCUIT"}, {"P0116", "COOLANT TEMP RANGE"}, {"P0117", "COOLANT TEMP LOW"}, {"P0118", "COOLANT TEMP HIGH"},
-  {"P0120", "THROTTLE SENSOR A CIRCUIT"}, {"P0121", "THROTTLE SENSOR A RANGE"}, {"P0122", "THROTTLE SENSOR A LOW"}, {"P0123", "THROTTLE SENSOR A HIGH"},
-  {"P0125", "COOLANT TOO COLD FOR CLOSED LOOP"}, {"P0128", "COOLANT BELOW THERMOSTAT TEMP"},
-  {"P0130", "O2 SENSOR CIRCUIT B1 S1"}, {"P0131", "O2 SENSOR LOW VOLTAGE B1 S1"}, {"P0132", "O2 SENSOR HIGH VOLTAGE B1 S1"}, {"P0133", "O2 SENSOR SLOW RESPONSE B1 S1"},
-  {"P0134", "O2 SENSOR NO ACTIVITY B1 S1"}, {"P0135", "O2 HEATER CIRCUIT B1 S1"}, {"P0136", "O2 SENSOR CIRCUIT B1 S2"}, {"P0137", "O2 SENSOR LOW VOLTAGE B1 S2"},
-  {"P0138", "O2 SENSOR HIGH VOLTAGE B1 S2"}, {"P0139", "O2 SENSOR SLOW RESPONSE B1 S2"}, {"P0141", "O2 HEATER CIRCUIT B1 S2"},
-  {"P0171", "SYSTEM TOO LEAN BANK 1"}, {"P0172", "SYSTEM TOO RICH BANK 1"}, {"P0174", "SYSTEM TOO LEAN BANK 2"}, {"P0175", "SYSTEM TOO RICH BANK 2"},
-  {"P0190", "FUEL RAIL PRESSURE SENSOR"}, {"P0191", "FUEL RAIL PRESSURE RANGE"}, {"P0192", "FUEL RAIL PRESSURE LOW"}, {"P0193", "FUEL RAIL PRESSURE HIGH"},
-  {"P0201", "INJECTOR CIRCUIT CYL 1"}, {"P0202", "INJECTOR CIRCUIT CYL 2"}, {"P0203", "INJECTOR CIRCUIT CYL 3"}, {"P0204", "INJECTOR CIRCUIT CYL 4"},
-  {"P0217", "ENGINE OVERTEMPERATURE"}, {"P0219", "ENGINE OVERSPEED"}, {"P0230", "FUEL PUMP PRIMARY CIRCUIT"},
-  {"P0234", "TURBO OVERBOOST"}, {"P0235", "TURBO BOOST SENSOR A"}, {"P0237", "TURBO BOOST SENSOR LOW"}, {"P0238", "TURBO BOOST SENSOR HIGH"}, {"P0299", "TURBO UNDERBOOST"},
-  {"P0300", "RANDOM / MULTIPLE CYLINDER MISFIRE"}, {"P0301", "CYLINDER 1 MISFIRE"}, {"P0302", "CYLINDER 2 MISFIRE"}, {"P0303", "CYLINDER 3 MISFIRE"}, {"P0304", "CYLINDER 4 MISFIRE"},
-  {"P0325", "KNOCK SENSOR 1 CIRCUIT"}, {"P0335", "CRANKSHAFT SENSOR A CIRCUIT"}, {"P0336", "CRANKSHAFT SENSOR A RANGE"}, {"P0340", "CAMSHAFT SENSOR A CIRCUIT"}, {"P0341", "CAMSHAFT SENSOR A RANGE"},
-  {"P0351", "IGNITION COIL A CIRCUIT"}, {"P0352", "IGNITION COIL B CIRCUIT"}, {"P0353", "IGNITION COIL C CIRCUIT"}, {"P0354", "IGNITION COIL D CIRCUIT"},
-  {"P0400", "EGR FLOW"}, {"P0401", "EGR FLOW INSUFFICIENT"}, {"P0402", "EGR FLOW EXCESSIVE"}, {"P0403", "EGR CIRCUIT"},
-  {"P0420", "CATALYST EFFICIENCY BELOW LIMIT B1"}, {"P0430", "CATALYST EFFICIENCY BELOW LIMIT B2"},
-  {"P0440", "EVAP SYSTEM"}, {"P0441", "EVAP PURGE FLOW"}, {"P0442", "EVAP SMALL LEAK"}, {"P0443", "EVAP PURGE VALVE CIRCUIT"}, {"P0446", "EVAP VENT CONTROL"}, {"P0455", "EVAP LARGE LEAK"}, {"P0456", "EVAP VERY SMALL LEAK"},
-  {"P0480", "COOLING FAN 1 CONTROL"}, {"P0500", "VEHICLE SPEED SENSOR"}, {"P0505", "IDLE CONTROL SYSTEM"}, {"P0506", "IDLE RPM LOWER THAN EXPECTED"}, {"P0507", "IDLE RPM HIGHER THAN EXPECTED"},
-  {"P0562", "SYSTEM VOLTAGE LOW"}, {"P0563", "SYSTEM VOLTAGE HIGH"}, {"P0571", "BRAKE SWITCH CIRCUIT"},
-  {"P0600", "SERIAL COMMUNICATION LINK"}, {"P0601", "ECU MEMORY CHECKSUM"}, {"P0606", "ECU PROCESSOR FAULT"}, {"P0627", "FUEL PUMP CONTROL CIRCUIT"},
-  {"P0638", "THROTTLE ACTUATOR RANGE B1"}, {"P0650", "MIL CONTROL CIRCUIT"}, {"P0700", "TRANSMISSION CONTROL SYSTEM"},
-  {"P2002", "DPF EFFICIENCY BELOW LIMIT B1"}, {"P2101", "THROTTLE ACTUATOR MOTOR CIRCUIT"}, {"P2135", "THROTTLE SENSOR A / B CORRELATION"},
-  {"P2452", "DPF PRESSURE SENSOR A"}, {"P2459", "DPF REGENERATION FREQUENCY"}, {"P20EE", "SCR NOX CATALYST EFFICIENCY"},
-  {"U0100", "LOST COMMUNICATION WITH ECM / PCM"}, {"U0101", "LOST COMMUNICATION WITH TCM"}, {"U0121", "LOST COMMUNICATION WITH ABS"},
-  {"U0140", "LOST COMMUNICATION WITH BODY CONTROL"}, {"U0155", "LOST COMMUNICATION WITH CLUSTER"},
+  {"P0016", "Crank / cam correlation B1 A"},
+  {"P0100", "MAF sensor circuit"},
+  {"P0101", "MAF range / performance"},
+  {"P0102", "MAF circuit low"},
+  {"P0103", "MAF circuit high"},
+  {"P0105", "MAP sensor circuit"},
+  {"P0106", "MAP range / performance"},
+  {"P0107", "MAP circuit low"},
+  {"P0108", "MAP circuit high"},
+  {"P0110", "Intake air temp circuit"},
+  {"P0112", "Intake air temp low"},
+  {"P0113", "Intake air temp high"},
+  {"P0115", "Coolant temp circuit"},
+  {"P0116", "Coolant temp range"},
+  {"P0117", "Coolant temp low"},
+  {"P0118", "Coolant temp high"},
+  {"P0120", "Throttle sensor A circuit"},
+  {"P0121", "Throttle sensor A range"},
+  {"P0122", "Throttle sensor A low"},
+  {"P0123", "Throttle sensor A high"},
+  {"P0125", "Coolant too cold for closed loop"},
+  {"P0128", "Coolant below thermostat temp"},
+  {"P0130", "O2 sensor circuit B1 S1"},
+  {"P0131", "O2 sensor low voltage B1 S1"},
+  {"P0132", "O2 sensor high voltage B1 S1"},
+  {"P0133", "O2 sensor slow response B1 S1"},
+  {"P0134", "O2 sensor no activity B1 S1"},
+  {"P0135", "O2 heater circuit B1 S1"},
+  {"P0136", "O2 sensor circuit B1 S2"},
+  {"P0137", "O2 sensor low voltage B1 S2"},
+  {"P0138", "O2 sensor high voltage B1 S2"},
+  {"P0139", "O2 sensor slow response B1 S2"},
+  {"P0141", "O2 heater circuit B1 S2"},
+  {"P0171", "System too lean bank 1"},
+  {"P0172", "System too rich bank 1"},
+  {"P0174", "System too lean bank 2"},
+  {"P0175", "System too rich bank 2"},
+  {"P0190", "Fuel rail pressure sensor"},
+  {"P0191", "Fuel rail pressure range"},
+  {"P0192", "Fuel rail pressure low"},
+  {"P0193", "Fuel rail pressure high"},
+  {"P0201", "Injector circuit cyl 1"},
+  {"P0202", "Injector circuit cyl 2"},
+  {"P0203", "Injector circuit cyl 3"},
+  {"P0204", "Injector circuit cyl 4"},
+  {"P0217", "Engine overtemperature"},
+  {"P0219", "Engine overspeed"},
+  {"P0230", "Fuel pump primary circuit"},
+  {"P0234", "Turbo overboost"},
+  {"P0235", "Turbo boost sensor A"},
+  {"P0237", "Turbo boost sensor low"},
+  {"P0238", "Turbo boost sensor high"},
+  {"P0299", "Turbo underboost"},
+  {"P0300", "Random / multiple cylinder misfire"},
+  {"P0301", "Cylinder 1 misfire"},
+  {"P0302", "Cylinder 2 misfire"},
+  {"P0303", "Cylinder 3 misfire"},
+  {"P0304", "Cylinder 4 misfire"},
+  {"P0325", "Knock sensor 1 circuit"},
+  {"P0335", "Crankshaft sensor A circuit"},
+  {"P0336", "Crankshaft sensor A range"},
+  {"P0340", "Camshaft sensor A circuit"},
+  {"P0341", "Camshaft sensor A range"},
+  {"P0351", "Ignition coil A circuit"},
+  {"P0352", "Ignition coil B circuit"},
+  {"P0353", "Ignition coil C circuit"},
+  {"P0354", "Ignition coil D circuit"},
+  {"P0400", "EGR flow"},
+  {"P0401", "EGR flow insufficient"},
+  {"P0402", "EGR flow excessive"},
+  {"P0403", "EGR circuit"},
+  {"P0420", "Catalyst efficiency below limit B1"},
+  {"P0430", "Catalyst efficiency below limit B2"},
+  {"P0440", "EVAP system"},
+  {"P0441", "EVAP purge flow"},
+  {"P0442", "EVAP small leak"},
+  {"P0443", "EVAP purge valve circuit"},
+  {"P0446", "EVAP vent control"},
+  {"P0455", "EVAP large leak"},
+  {"P0456", "EVAP very small leak"},
+  {"P0480", "Cooling fan 1 control"},
+  {"P0500", "Vehicle speed sensor"},
+  {"P0505", "Idle control system"},
+  {"P0506", "Idle RPM lower than expected"},
+  {"P0507", "Idle RPM higher than expected"},
+  {"P0562", "System voltage low"},
+  {"P0563", "System voltage high"},
+  {"P0571", "Brake switch circuit"},
+  {"P0600", "Serial communication link"},
+  {"P0601", "ECU memory checksum"},
+  {"P0606", "ECU processor fault"},
+  {"P0627", "Fuel pump control circuit"},
+  {"P0638", "Throttle actuator range B1"},
+  {"P0650", "MIL control circuit"},
+  {"P0700", "Transmission control system"},
+  {"P2002", "DPF efficiency below limit B1"},
+  {"P2101", "Throttle actuator motor circuit"},
+  {"P2135", "Throttle sensor A / B correlation"},
+  {"P2452", "DPF pressure sensor A"},
+  {"P2459", "DPF regeneration frequency"},
+  {"P20EE", "SCR NOx catalyst efficiency"},
+  {"U0100", "Lost communication with ECM / PCM"},
+  {"U0101", "Lost communication with TCM"},
+  {"U0121", "Lost communication with ABS"},
+  {"U0140", "Lost communication with body control"},
+  {"U0155", "Lost communication with cluster"},
 };
 static const char* dtcDesc(const char* c) {
   for (const DtcD& e : DTCD) if (!strcmp(e.c, c)) return e.d;
   switch (c[0]) {
-    case 'P': return c[1] == '0' || c[1] == '2' ? "GENERIC POWERTRAIN CODE" : "MAKER SPECIFIC POWERTRAIN CODE";
-    case 'B': return "BODY CODE";
-    case 'C': return "CHASSIS CODE";
-    case 'U': return "NETWORK COMMUNICATION CODE";
+    case 'P': return c[1] == '0' || c[1] == '2' ? "Generic powertrain code" : "Maker specific powertrain code";
+    case 'B': return "Body code";
+    case 'C': return "Chassis code";
+    case 'U': return "Network communication code";
   }
   return "";
 }
 
+
 // ---------- fault codes ----------
-static const int CODE_ROWS = 5;
-static int codePg = 0; static bool demoCleared = false, clearArmed = false; static uint32_t clearAt = 0, codesSig = 0xFFFFFFFFu;
+static const int CODE_ROWS = 4;
+static int codePg = 0; static bool demoCleared = false, clearArmed = false; static uint32_t clearAt = 0;
 static void demoReadCodes() {
   memset(codeList, 0, sizeof codeList);
   if (demoCleared) { codeCount = 0; codeState = 2; mil = false; }
@@ -1812,8 +1999,12 @@ static void codesClear() {
   if (linkState != 2) { codeState = 4; codeVer = codeVer + 1; return; }
   codeState = 1; codeVer = codeVer + 1; req = 2;
 }
+static const ModeChip CODE_MODES[4] = {{S_CODES, 9, 48}, {S_MONITORS, 61, 63}, {S_FREEZE, 128, 65}, {S_ECUINFO, 197, 68}};
+static const Page CODE_PAGE[4] = {PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU};
+static const int READ_X = 269;
+static void codeChips(int active) { modeChips(CODE_MODES, 4, active); chipId(S_READ, READ_X, 32, 42, 20, false); }
 static void codesBanner() {
-  panel(6, 34, 308, 21, 4, CUT_TL | CUT_BR, T.panel, T.line);
+  tile(9, 55, 302, 19, 8);
   int n = codeCount, st = codeState; bool linkOk = demoMode || linkState == 2;
   uint16_t col; StrId single = S_COUNT, lamp = S_COUNT;
   if (clearArmed) { col = T.warn; single = S_SURE; }
@@ -1825,48 +2016,37 @@ static void codesBanner() {
   else { col = mil ? RED_AL : T.warn; lamp = mil ? S_LAMPON : S_LAMPOFF; }
   if (single != S_COUNT) {
     int w = labW(single, LB_TILE), x0 = 160 - (w + 10) / 2;
-    tft.fillCircle(x0 + 3, 44, 3, col); lab(single, LB_TILE, x0 + 10, tby(48), col, T.panel);
+    disc(x0 + 3, 64, 3, col); lab(single, LB_TILE, x0 + 10, tby(68), col);
   } else {
     char nb[8]; snprintf(nb, sizeof nb, "%d", n);
     int wn = textW(F_LS, nb), wc = labW(S_CODESW, LB_TILE), wl = labW(lamp, LB_TILE), tot = 10 + wn + 4 + wc + 14 + wl, x0 = 160 - tot / 2;
-    tft.fillCircle(x0 + 3, 44, 3, col);
-    txt(F_LS, nb, x0 + 10, 48, col, T.panel); lab(S_CODESW, LB_TILE, x0 + 14 + wn, tby(48), col, T.panel);
-    txt(F_LS, "-", x0 + 10 + wn + 4 + wc + 4, 48, T.dim, T.panel); lab(lamp, LB_TILE, x0 + tot - wl, tby(48), col, T.panel);
+    disc(x0 + 3, 64, 3, col);
+    txt(F_LS, nb, x0 + 10, tby(68), col); lab(S_CODESW, LB_TILE, x0 + 14 + wn, tby(68), col);
+    txt(F_LS, "-", x0 + 10 + wn + 4 + wc + 4, tby(68), T.dim); lab(lamp, LB_TILE, x0 + tot - wl, tby(68), col);
   }
 }
 static void codeRow(int r) {
-  int y = 58 + r * 22, k = codePg * CODE_ROWS + r;
-  tft.fillRect(6, y, 308, 22, T.bg);
+  int y = 77 + r * 23, k = codePg * CODE_ROWS + r;
   if (k >= codeCount || k >= 24) return;
   const DtcRec& d = codeList[k]; uint16_t c = d.pend ? T.warn : RED_AL;
-  panel(6, y, 308, 21, 3, 0, T.panel, T.line);
-  tft.fillRect(6, y, 3, 21, c);
-  txt(F_UL, d.code, 16, y + 17, T.text, T.panel);
-  char ds[44]; fitText(ds, sizeof ds, dtcDesc(d.code), F_LS, 172); txt(F_LS, ds, 76, y + 14, T.text, T.panel);
-  lab(d.pend ? S_PENDING : S_STORED, LB_TILE, 308, tby(y + 14), c, T.panel, AL_R);
+  tile(9, y, 302, 21, 7); rr(15, y + 5, 3, 11, 1, c);
+  txt(F_UL, d.code, 24, y + 15, T.text);
+  int x = 24 + textW(F_UL, d.code) + 9;
+  char ds[56]; fitText(ds, sizeof ds, dtcDesc(d.code), F_LS, 250 - x); txt(F_LS, ds, x, y + 13, T.text);
+  lab(d.pend ? S_PENDING : S_STORED, LB_TILE, 303, tby(y + 13), c, AL_R);
 }
-static void codesBtns() {
-  int pages = max(1, (min((int)codeCount, 24) + CODE_ROWS - 1) / CODE_ROWS);
-  btnId(S_READ, 6, 214, 96, 24, false, LB_BTNM);
-  btnId(S_CLEAR, 106, 214, 124, 24, codeCount > 0 || mil || clearArmed, LB_BTNM);
-  btnS("<", 236, 214, 36, 24, false); btnS(">", 278, 214, 36, 24, false);
-  (void)pages;
-}
-static void codesStatic() {
-  titleBar(S_FAULT, 2); leftBtn(S_STATUS);
+static void drawCodes() {
+  if (clearArmed && uiNow - clearAt > 4000) clearArmed = false;
+  int pages = max(1, (min((int)codeCount, 24) + CODE_ROWS - 1) / CODE_ROWS); codePg = clampi(codePg, 0, pages - 1);
+  topBar(gv0(0x0C)); codeChips(0);
   codesBanner();
-  for (int r = 0; r < CODE_ROWS; r++) codeRow(r);
-  lab(S_CLRNOTE1, LB_TILE, 160, tby(183), T.dim, T.bg, AL_C); lab(S_CLRNOTE2, LB_TILE, 160, tby(198), T.dim, T.bg, AL_C);
-  codesBtns(); codesSig = 0xFFFFFFFFu;
-}
-static void codesDyn() {
-  if (clearArmed && millis() - clearAt > 4000) clearArmed = false;
-  int pages = max(1, (min((int)codeCount, 24) + CODE_ROWS - 1) / CODE_ROWS); codePg = constrain(codePg, 0, pages - 1);
-  uint32_t sig = (uint32_t)codeVer * 256u + (uint32_t)codePg * 16u + (clearArmed ? 1 : 0) + ((demoMode || linkState == 2) ? 2 : 0) + (mil ? 4 : 0) + ((uint32_t)codeState << 20);
-  if (sig == codesSig) return;
-  codesSig = sig; codesBanner();
-  for (int r = 0; r < CODE_ROWS; r++) codeRow(r);
-  codesBtns();
+  if (clearArmed) {
+    rrG(9, 77, 302, 89, 9, TA.panel2, TA.panel, T.warn);
+    lab(S_CLRNOTE1, LB_TILE, 160, tby(114), T.text, AL_C); lab(S_CLRNOTE2, LB_TILE, 160, tby(134), T.warn, AL_C);
+  } else for (int r = 0; r < CODE_ROWS; r++) codeRow(r);
+  chipId(S_CLEAR, 9, 172, 166, 22, codeCount > 0 || mil || clearArmed);
+  chipArrow(181, 172, 62, 22, -1, false); chipArrow(249, 172, 62, 22, 1, false);
+  tabBar(4);
 }
 
 // ---------- readiness monitors ----------
@@ -1878,44 +2058,35 @@ static int monState(const MonDef& m, uint32_t raw) {        // 0 = not supported
   if (m.kind == 0) { sup = B & (1u << m.bit); inc = B & (0x10u << m.bit); } else { sup = C_ & (1u << m.bit); inc = D & (1u << m.bit); }
   return !sup ? 0 : inc ? 2 : 1;
 }
-static uint32_t monSig = 0xFFFFFFFFu;
+static void statusEnter() { if (demoMode) { monRaw = 0x0007E504u; monValid = true; monVer = monVer + 1; } }
 static void monitorsDraw() {
   uint32_t raw = monRaw; bool valid = monValid || demoMode, dsl = valid && ((raw >> 16) & 8);
-  int nm = dsl ? 9 : 8, rows = (nm + 1) / 2, sup = 0, rdy = 0, pitch = rows > 4 ? 22 : 24, rh = pitch - 2;
+  int nm = dsl ? 9 : 8, rows = (nm + 1) / 2, pitch = rows > 4 ? 18 : 22, rh = pitch - 2, sup = 0, rdy = 0;
   for (int i = 0; i < nm; i++) {
     const MonDef& m = dsl ? MON_D[i] : MON_P[i]; int s = valid ? monState(m, raw) : 0;
-    int x = 6 + (i & 1) * 158, y = 36 + (i >> 1) * pitch;
+    int x = 9 + (i & 1) * 154, y = 77 + (i >> 1) * pitch;
     if (s) { sup++; if (s == 1) rdy++; }
-    uint16_t c = s == 1 ? T.good : s == 2 ? T.warn : T.dim;
-    panel(x, y, 150, rh, 3, 0, T.panel, T.line);
-    tft.fillCircle(x + 9, y + rh / 2, 3, c);
-    lab(m.lb, LB_ROW, x + 18, y + rh / 2 + (thai ? 5 : 4), s ? T.text : T.dim, T.panel);
-    lab(s == 0 ? S_NA : s == 1 ? S_READY : S_NOTREADY, LB_TILE, x + 144, y + rh / 2 + (thai ? 6 : 4), c, T.panel, AL_R);
+    uint16_t c = s == 1 ? T.good : s == 2 ? T.warn : T.dim; int mid = y + (rh >> 1);
+    tile(x, y, 148, rh, 7);
+    disc(x + 10, mid, 3, c);
+    lab(m.lb, LB_ROW, x + 19, mid + (thai ? 5 : 4), s ? T.text : T.dim);
+    lab(s == 0 ? S_NA : s == 1 ? S_READY : S_NOTREADY, LB_TILE, x + 142, mid + (thai ? 5 : 4), c, AL_R);
   }
-  int sy = 36 + rows * pitch + 4, sh = 212 - sy;
   bool all = valid && sup > 0 && rdy == sup; uint16_t c = !valid ? T.dim : all ? T.good : T.warn;
-  panel(6, sy, 308, sh, 5, CUT_TL | CUT_BR, T.panel, c);
-  if (!valid) lab(S_READING, LB_TILE, 160, tby(sy + 15), T.dim, T.panel, AL_C);
-  else if (all) lab(S_ALLREADY, LB_TILE, 160, tby(sy + 15), c, T.panel, AL_C);
-  else { char nb[16]; snprintf(nb, sizeof nb, "%d OF %d", rdy, sup); int wn = textW(F_LS, nb), wl = labW(S_READYOF, LB_TILE), x0 = 160 - (wn + 5 + wl) / 2; txt(F_LS, nb, x0, sy + 15, c, T.panel); lab(S_READYOF, LB_TILE, x0 + wn + 5, tby(sy + 15), c, T.panel); }
+  tile(9, 55, 302, 19, 8);
+  if (!valid) lab(S_READING, LB_TILE, 160, tby(68), T.dim, AL_C);
+  else if (all) lab(S_ALLREADY, LB_TILE, 160, tby(68), c, AL_C);
+  else { char nb[16]; snprintf(nb, sizeof nb, "%d/%d", rdy, sup); int wn = textW(F_LS, nb), wl = labW(S_READYOF, LB_TILE), x0 = 160 - (wn + 5 + wl) / 2; txt(F_LS, nb, x0, tby(68), c); lab(S_READYOF, LB_TILE, x0 + wn + 5, tby(68), c); }
+  int sy = 77 + rows * pitch + 2, sh = 197 - sy;
+  tile(9, sy, 302, sh, 9);
   static const struct { StrId lb; uint8_t pid; const char* unit; } ST3[3] = {{S_SINCECLR, 0x31, "km"}, {S_WARMUPS, 0x30, ""}, {S_LAMPFOR, 0x21, "km"}};
   for (int i = 0; i < 3; i++) {
-    int cx = 6 + 51 + i * 103; bool ok; float v = getVal(ST3[i].pid, ok); char b[14]; if (ok) fmtv(b, sizeof b, v, 0); else strcpy(b, "--");
-    lab(ST3[i].lb, LB_TILE, cx, sy + sh - 31, T.dim, T.panel, AL_C);
-    txtVU(F_NL, b, F_LS, ST3[i].unit, cx, sy + sh - 9, ok ? T.text : T.dim, T.dim, T.panel, AL_C, 96);
+    int cx = 60 + i * 100; bool ok; float v = getVal(ST3[i].pid, ok); char b[14]; if (ok) fmtv(b, sizeof b, v, 0); else strcpy(b, "--");
+    lab(ST3[i].lb, LB_TILE, cx, tby(sy + 11), T.dim, AL_C);
+    txtVU(F_NM, b, F_LS, ST3[i].unit, cx, sy + sh - 5, ok ? T.text : T.dim, T.dim, AL_C);
   }
 }
-static void statusTabs(int active) {
-  static const StrId TS[3] = {S_MONITORS, S_FREEZE, S_ECUINFO};
-  for (int i = 0; i < 3; i++) btnId(TS[i], 6 + i * 104, 214, 100, 24, i == active, LB_BTNM);
-}
-static void statusEnter() { if (demoMode) { monRaw = 0x0007E504u; monValid = true; monVer = monVer + 1; } }
-static void statusStatic() { titleBar(S_STATUS, 2); leftBtn(S_READ); monitorsDraw(); statusTabs(0); monSig = 0; }
-static void statusDyn() {
-  uint32_t sig = (uint32_t)monVer + ((uint32_t)(millis() / 2000) << 8);        // the three counters refresh every 2 s
-  if (sig == monSig) return;
-  monSig = sig; monitorsDraw();
-}
+static void drawStatus() { topBar(gv0(0x0C)); codeChips(1); monitorsDraw(); tabBar(4); }
 
 // ---------- freeze frame ----------
 static const uint8_t FZM[12] = {MI_RPM, MI_SPEED, MI_COOL, MI_LOAD, MI_STFT, MI_LTFT, MI_MAP, MI_INTAKE, MI_THR, MI_MAF, MI_TIMING, MI_BATT};
@@ -1928,24 +2099,25 @@ static void freezeRead() {
   if (linkState != 2) { frzState = 3; frzVer = frzVer + 1; return; }
   frzState = 1; frzVer = frzVer + 1; req = 3;
 }
-static void freezeStatic() {
-  titleBar(S_STATUS, 2); leftBtn(S_READ);
-  panel(6, 34, 308, 32, 4, CUT_TL | CUT_BR, T.panel, T.line);
+static void drawFreeze() {
+  topBar(gv0(0x0C)); codeChips(2);
+  tile(9, 56, 302, 28, 9);
   if (frzState == 2 && frzCode[0]) {
-    txt(F_UL, frzCode, 16, 56, T.text, T.panel);
-    char ds[44]; fitText(ds, sizeof ds, dtcDesc(frzCode), F_LS, 200); txt(F_LS, ds, 90, 46, T.text, T.panel);
-    lab(S_COND, LB_TILE, 90, tby(59), T.dim, T.panel);
-  } else if (frzState == 1) lab(S_READING, LB_TILE, 160, tby(54), T.warn, T.panel, AL_C);
-  else lab(S_NOFREEZE, LB_TILE, 160, tby(54), T.dim, T.panel, AL_C);
+    txt(F_UL, frzCode, 19, 75, T.text);
+    int x = 19 + textW(F_UL, frzCode) + 10;
+    char ds[56]; fitText(ds, sizeof ds, dtcDesc(frzCode), F_LS, 304 - x); txt(F_LS, ds, x, 67, T.text);
+    lab(S_COND, LB_TILE, x, tby(78), T.dim);
+  } else if (frzState == 1) lab(S_READING, LB_TILE, 160, tby(73), T.warn, AL_C);
+  else lab(S_NOFREEZE, LB_TILE, 160, tby(73), T.dim, AL_C);
   for (int i = 0; i < 12; i++) {
-    int x = GX[i & 3], y = 70 + (i >> 2) * 48; const Met& m = MET[FZM[i]];
-    panel(x, y, 73, 44, 4, CUT_BL | CUT_BR, T.panel, T.line);
-    lab(m.lab, LB_TILE, x + 36, thai ? y + 15 : y + 13, T.dim, T.panel, AL_C);
-    char b[14]; bool has = frzState == 2 && frzOk[i];
+    int x = GX[i & 3], y = 88 + (i >> 2) * 35; const Met& m = MET[FZM[i]];
+    tile(x, y, 71, 32);
+    lab(m.lab, LB_TILE, x + 35, thai ? y + 14 : y + 11, T.dim, AL_C, 64);
+    bool has = frzState == 2 && frzOk[i]; char b[16];
     if (has) fmtv(b, sizeof b, frzVal[i] * m.mul, m.dec); else strcpy(b, "--");
-    valueFit(b, m.unit, x + 36, y + 37, has ? T.text : T.dim, T.panel, AL_C, 64, 64, true);
+    valueFit(b, m.unit, x + 35, y + 27, has ? T.text : T.dim, AL_C, 62);
   }
-  statusTabs(1);
+  tabBar(4);
 }
 
 // ---------- ECU info ----------
@@ -1953,90 +2125,166 @@ static void ecuRead() {
   if (demoMode) { strcpy(vinBuf, "JETOBD2DEMO000000"); strcpy(ecuName, "DEMO-ECM"); strcpy(calId, "DEMOCAL01"); ecuInfoVer = ecuInfoVer + 1; return; }
   if (linkState == 2) req = 4;
 }
-static void ecuBox(int y, int h, StrId lb, const char* v) {
-  panel(6, y, 308, h, 5, CUT_TL | CUT_BR, T.panel, T.line); bracket(6, y, 308, T.acc, true, true);
-  lab(lb, LB_TILE, 160, tby(y + 14), T.dim, T.panel, AL_C);
+static void ecuBox(int y, StrId lb, const char* v) {
+  tile(9, y, 302, 36);
+  lab(lb, LB_TILE, 18, tby(y + 13), T.dim);
   char t[32]; FontId f = F_UL; strncpy(t, v[0] ? v : "--", sizeof t - 1); t[sizeof t - 1] = 0;
-  if (textW(f, t) > 292) f = F_UM;
-  if (textW(f, t) > 292) fitText(t, sizeof t, t, f, 292);
-  txt(f, t, 160, y + h - 11, v[0] ? T.text : T.dim, T.panel, AL_C);
+  if (textW(f, t) > 284) f = F_UM;
+  if (textW(f, t) > 284) { char t2[32]; fitText(t2, sizeof t2, t, f, 284); strcpy(t, t2); }
+  txt(f, t, 18, y + 30, v[0] ? T.text : T.dim);
 }
-static void ecuStatic() {
-  titleBar(S_STATUS, 2); leftBtn(S_READ);
-  ecuBox(34, 46, S_VIN, vinBuf); ecuBox(84, 46, S_ECUNAME, ecuName); ecuBox(134, 46, S_CALID, calId);
-  panel(6, 184, 308, 26, 5, CUT_TL | CUT_BR, T.panel, T.line);
-  lab(S_PROTO, LB_TILE, 16, tby(201), T.dim, T.panel);
-  const char* pn = demoMode ? "--" : (protoNum ? protoName(protoNum) : "--"); txt(F_UM, pn, 306, 202, T.text, T.panel, AL_R);
-  statusTabs(2);
+static void drawEcu() {
+  topBar(gv0(0x0C)); codeChips(3);
+  ecuBox(56, S_VIN, vinBuf); ecuBox(96, S_ECUNAME, ecuName); ecuBox(136, S_CALID, calId);
+  tile(9, 175, 302, 22, 8);
+  lab(S_PROTO, LB_TILE, 18, tby(189), T.dim);
+  txt(F_UM, demoMode ? "--" : (protoNum ? protoName(protoNum) : "--"), 303, thai ? 192 : 189, T.text, AL_R);
+  tabBar(4);
+}
+// the four code pages share one row of chips (and its Read chip); returns true when the touch was handled
+static bool codeTouch(int x, int y, Page cur) {
+  if (tabTap(x, y, PG_CODES)) return true;
+  if (y < 32 || y >= 52) return false;
+  int i = modeTap(CODE_MODES, 4, x, y);
+  if (i >= 0) { if (CODE_PAGE[i] != cur) nav(CODE_PAGE[i]); return true; }
+  if (hit(x, y, READ_X, 32, 42, 20)) {
+    switch (cur) { case PG_CODES: codesRead(); break; case PG_STATUS: statusEnter(); break; case PG_FREEZE: freezeRead(); break; case PG_ECU: ecuRead(); break; default: break; }
+    return true;
+  }
+  return false;
+}
+static void tapCodes(int x, int y, bool first) {
+  if (!first) return;
+  if (codeTouch(x, y, PG_CODES)) return;
+  if (hit(x, y, 9, 172, 166, 22)) { if (!clearArmed) { clearArmed = true; clearAt = millis(); } else codesClear(); }
+  else if (hit(x, y, 181, 172, 62, 22)) { if (codePg > 0) codePg--; }
+  else if (hit(x, y, 249, 172, 62, 22)) codePg++;
 }
 
 // ---------- setup ----------
-static const int SU_Y0 = 74, SU_H = 35;
-static void ctlBtn(int x, int y, int w, int h, StrId id, bool on) { btnId(id, x, y, w, h, on, LB_BTNM); }
-static void ctlTxt(int x, int y, int w, int h, const char* s, bool on) { btnS(s, x, y, w, h, on, F_UM); }
-static void rowLabel(int y, int h, StrId mainL, StrId sub) {
-  tft.fillRect(6, y, 308, h, T.bg); tft.drawFastHLine(6, y + h - 1, 308, T.dark);
-  tft.fillCircle(11, y + h / 2, 2, T.acc);
-  if (sub != S_COUNT) {
-    lab(mainL, LB_ROW, 20, y + (thai ? h / 2 - 1 : h / 2 - 3), T.text, T.bg);
-    lab(sub, LB_TILE, 20, y + h - (thai ? 4 : 6), T.dim, T.bg);
-  } else lab(mainL, LB_ROW, 20, y + h / 2 + (thai ? 5 : 4), T.text, T.bg);
+static const int SU_Y0 = 64, SU_H = 28;
+static void rowLabel(int y, int h, StrId mainL, StrId sub, bool hasSub) {
+  hl(9, y + h - 1, 302, T.sep);
+  if (hasSub) { lab(mainL, LB_ROW, 14, y + 11, T.text); lab(sub, LB_TILE, 14, y + h - (thai ? 3 : 5), T.dim); }
+  else lab(mainL, LB_ROW, 14, y + (h >> 1) + (thai ? 5 : 4), T.text);
 }
 static void stepBtns(int y, int h, const char* val, const char* unit) {
-  btnS("-", 154, y + 4, 38, h - 8, false); btnS("+", 276, y + 4, 38, h - 8, false);
-  txtVU(F_NL, val, F_UM, unit, 234, y + h / 2 + 9, T.text, T.dim, T.bg, AL_C, 78);
+  chipS("-", 164, y + 4, 30, h - 9, false); chipS("+", 281, y + 4, 30, h - 9, false);
+  txtVU(F_NL, val, F_UM, unit, 237, y + (h >> 1) + 6, T.text, T.dim, AL_C);
 }
 static void setupRow(int i) {
   int y = SU_Y0 + i * SU_H; char b[16];
   switch (i) {
-    case 0: rowLabel(y, SU_H, S_SRC, S_COUNT); ctlBtn(154, y + 4, 76, SU_H - 8, S_DEMO, demoMode); ctlTxt(234, y + 4, 80, SU_H - 8, "OBD BT", !demoMode); break;
-    case 1: rowLabel(y, SU_H, S_LANG, S_COUNT); ctlTxt(154, y + 4, 76, SU_H - 8, "EN", !thai); ctlBtn(234, y + 4, 80, SU_H - 8, S_THAI, thai); break;
-    case 2: rowLabel(y, SU_H, S_SHIFT, S_SHIFTD); fmtThou(b, sizeof b, shiftRpm); stepBtns(y, SU_H, b, ""); break;
-    case 3: rowLabel(y, SU_H, S_COLORS, S_COLTIP); ctlBtn(154, y + 4, 76, SU_H - 8, S_STD, !invScreen); ctlBtn(234, y + 4, 80, SU_H - 8, S_INV, invScreen); break;
+    case 0: rowLabel(y, SU_H, S_SRC, S_COUNT, false); chipId(S_DEMO, 164, y + 4, 70, SU_H - 9, demoMode); chipS("OBD BT", 238, y + 4, 73, SU_H - 9, !demoMode); break;
+    case 1: rowLabel(y, SU_H, S_LANG, S_COUNT, false); chipS("EN", 164, y + 4, 70, SU_H - 9, !thai); chipId(S_THAI, 238, y + 4, 73, SU_H - 9, thai); break;
+    case 2: rowLabel(y, SU_H, S_SHIFT, S_SHIFTD, true); fmtThou(b, sizeof b, shiftRpm); stepBtns(y, SU_H, b, ""); break;
+    case 3: rowLabel(y, SU_H, S_COLORS, S_COLTIP, true); chipId(S_STD, 164, y + 4, 70, SU_H - 9, !invScreen); chipId(S_INV, 238, y + 4, 73, SU_H - 9, invScreen); break;
   }
 }
 static void themeCard(int i) {
-  int x = 6 + i * 156, y = 34; bool sel = theme == i; uint16_t bg = sel ? T.panel2 : T.panel;
-  panel(x, y, 152, 36, 5, CUT_TL | CUT_BR, bg, sel ? T.acc : T.line);
-  hexagon(x + 22, y + 18, 10, THEMES[i].bg, THEMES[i].acc, true); tft.fillCircle(x + 22, y + 18, 3, THEMES[i].acc);
-  lab(i ? S_THRED : S_THBLUE, LB_BTNM, x + 42, y + (thai ? 16 : 15), sel ? T.text : T.dim, bg);
-  lab(sel ? S_SELECTED : S_TAPUSE, LB_TILE, x + 42, y + (thai ? 32 : 29), sel ? T.accL : T.dim, bg);
+  int x = 9 + i * 154, y = 32; bool sel = theme == i; const Theme& th = THEMES[i];
+  if (sel) halo(x, y, 148, 28, 9, T.acc, 3);
+  if (sel) rr(x, y, 148, 28, 9, T.panel2, T.acc); else rrG(x, y, 148, 28, 9, TA.panel2, TA.panel, T.line);
+  discA(x + 17, y + 14, 8, c565(th.acc), 71); disc(x + 17, y + 14, 6.4f, c565(th.bg)); disc(x + 17, y + 14, 3.4f, c565(th.acc));
+  lab(i ? S_THRED : S_THBLUE, LB_BTNM, x + 32, y + (thai ? 19 : 18), sel ? T.text : T.dim);
+  lab(sel ? S_SELECTED : S_TAPUSE, LB_TILE, x + 142, y + (thai ? 20 : 17), sel ? T.accL : T.dim, AL_R);
 }
-static void setupStatic() {
-  titleBar(S_SETUP, 1);
-  txt(F_LS, FW_VERSION, 10, 20, T.dim, T.bg);
+static void drawSetup() {
+  topBar(gv0(0x0C));
   themeCard(0); themeCard(1);
   for (int i = 0; i < 4; i++) setupRow(i);
-  btnId(S_BTNAME, 6, 214, 100, 24, false, LB_BTNM); btnId(S_VEHICLE, 110, 214, 100, 24, false, LB_BTNM); btnId(S_MORE, 214, 214, 100, 24, false, LB_BTNM);
+  chipId(S_BTNAME, 9, 177, 96, 20, false); chipId(S_VEHICLE, 111, 177, 96, 20, false); chipId(S_MORE, 213, 177, 98, 20, false);
+  tabBar(5);
+}
+static void applyVehicle(int idx) {                 // idx = -1: automatic (from the VIN)
+  vehModel = idx;
+  if (idx >= 0) { tankL = MODELS[idx].tank; shiftRpm = max(3000, MODELS[idx].redline * 100 - 300); }
+  carBuf[0] = 0; slotsCustom = false; autoSlots();
+  savePrefs(); nav(PG_SETUP);
+}
+static void setSource(bool demo) {
+  if (demo == demoMode) return;
+  demoMode = demo; carBuf[0] = 0; vinBuf[0] = 0; ecuName[0] = 0; calId[0] = 0;
+  ecuDieselKnown = false; ecuDiesel = false; ecuHybrid = false; mil = false; codeCount = 0; codeState = 0; monValid = false;
+  memset(psup, 0, sizeof psup); memset(page, 0, sizeof page); engineRan = false; rpmZeroAt = 0;
+  if (demo) { linkState = 0; simT = 0; if (!slotsCustom) autoSlots(); }
+  else { linkState = selAddr[0] ? 1 : 3; reconnectReq = true; if (!slotsCustom) autoSlots(); }
+  savePrefs(); updateWants();
+}
+static void stepVal(int& v, int lo, int hi, int dir, int st) { v = constrain(v + dir * st, lo, hi); }
+static void tapSetup(int x, int y, bool first) {
+  if (first) {
+    if (tabTap(x, y, PG_SETUP)) return;
+    for (int i = 0; i < NTHEME; i++) if (hit(x, y, 9 + i * 154, 32, 148, 28)) { if (theme != i) { applyTheme(i); savePrefs(); } return; }
+    if (hit(x, y, 9, 177, 96, 20)) { nav(PG_BT); return; }
+    if (hit(x, y, 111, 177, 96, 20)) { nav(PG_VEH); return; }
+    if (hit(x, y, 213, 177, 98, 20)) { nav(PG_SETUP2); return; }
+  }
+  for (int i = 0; i < 4; i++) {
+    int ry = SU_Y0 + i * SU_H + 4, rh = SU_H - 9;
+    if (y < ry || y >= ry + rh) continue;
+    if (i == 0 && first) {
+      if (hit(x, y, 164, ry, 70, rh)) setSource(true);
+      else if (hit(x, y, 238, ry, 73, rh)) { setSource(false); if (!selAddr[0]) nav(PG_BT); }
+    } else if (i == 1 && first) {
+      if (hit(x, y, 164, ry, 70, rh) && thai) { thai = false; savePrefs(); }
+      else if (hit(x, y, 238, ry, 73, rh) && !thai) { thai = true; savePrefs(); }
+    } else if (i == 2) {
+      if (hit(x, y, 164, ry, 30, rh)) { stepVal(shiftRpm, 3000, 9000, -1, 100); saveSoon(); }
+      else if (hit(x, y, 281, ry, 30, rh)) { stepVal(shiftRpm, 3000, 9000, 1, 100); saveSoon(); }
+    } else if (i == 3 && first) {
+      if (hit(x, y, 164, ry, 70, rh) && invScreen) { invScreen = false; applyInvert(); savePrefs(); }
+      else if (hit(x, y, 238, ry, 73, rh) && !invScreen) { invScreen = true; applyInvert(); savePrefs(); }
+    }
+  }
 }
 
-// ---------- setup 2 ----------
-static const int S2_Y0 = 34, S2_H = 30;
-static uint32_t uprotoAt = 0; static int userProtoShown = -1;
+// ---------- more settings (setup 2) ----------
+static const int S2_Y0 = 32, S2_H = 29;
+static uint32_t uprotoAt = 0;
 static void setup2Row(int i) {
   int y = S2_Y0 + i * S2_H, h = S2_H; char b[16];
   switch (i) {
-    case 0: rowLabel(y, h, S_ALERTS, S_ALERTSD); ctlBtn(154, y + 3, 76, h - 6, S_ON, warnOn); ctlBtn(234, y + 3, 80, h - 6, S_OFF, !warnOn); break;
-    case 1: rowLabel(y, h, S_PARKSCR, S_PARKSCRD); ctlBtn(154, y + 3, 76, h - 6, S_ON, parkOn); ctlBtn(234, y + 3, 80, h - 6, S_OFF, !parkOn); break;
-    case 2: rowLabel(y, h, S_BRIGHT, S_COUNT); snprintf(b, sizeof b, "%d", bright); stepBtns(y, h, b, "%"); break;
-    case 3: rowLabel(y, h, S_TANK, S_TANKD); snprintf(b, sizeof b, "%d", tankL); stepBtns(y, h, b, "L"); break;
-    case 4: rowLabel(y, h, S_FUELCAL, S_FUELCALD); snprintf(b, sizeof b, "%d", fuelCal); stepBtns(y, h, b, "%"); break;
+    case 0: rowLabel(y, h, S_ALERTS, S_ALERTSD, true); chipId(S_ON, 164, y + 4, 70, h - 9, warnOn); chipId(S_OFF, 238, y + 4, 73, h - 9, !warnOn); break;
+    case 1: rowLabel(y, h, S_PARKSCR, S_PARKSCRD, true); chipId(S_ON, 164, y + 4, 70, h - 9, parkOn); chipId(S_OFF, 238, y + 4, 73, h - 9, !parkOn); break;
+    case 2: rowLabel(y, h, S_BRIGHT, S_COUNT, false); snprintf(b, sizeof b, "%d", bright); stepBtns(y, h, b, "%"); break;
+    case 3: rowLabel(y, h, S_TANK, S_TANKD, true); snprintf(b, sizeof b, "%d", tankL); stepBtns(y, h, b, "L"); break;
+    case 4: rowLabel(y, h, S_FUELCAL, S_FUELCALD, true); snprintf(b, sizeof b, "%d", fuelCal); stepBtns(y, h, b, "%"); break;
     case 5:
-      rowLabel(y, h, S_PROTO, S_PROTOD);
-      btnS("-", 154, y + 4, 38, h - 8, false); btnS("+", 276, y + 4, 38, h - 8, false);
-      tft.fillRect(196, y + 2, 78, h - 4, T.bg);
-      if (userProto == 0) lab(S_AUTO, LB_BTNM, 235, y + h / 2 + 5, T.text, T.bg, AL_C); else txt(F_UM, protoName(userProto), 235, y + h / 2 + 5, T.text, T.bg, AL_C);
+      rowLabel(y, h, S_PROTO, S_PROTOD, true);
+      chipS("-", 164, y + 4, 30, h - 9, false); chipS("+", 281, y + 4, 30, h - 9, false);
+      if (userProto == 0) lab(S_AUTO, LB_BTNM, 237, y + (h >> 1) + (thai ? 6 : 5), T.text, AL_C); else txt(F_UM, protoName(userProto), 237, y + (h >> 1) + 5, T.text, AL_C);
       break;
   }
 }
-static void setup2Static() {
-  titleBar(S_SETUP2, 1); btnS("<", 6, 4, 44, 22, false);
+static void drawSetup2() {
+  subHeader(S_SETUP2, S_COUNT, false);
+  txt(F_LM, FW_VERSION, 311, 18, T.dim, AL_R);
   for (int i = 0; i < 6; i++) setup2Row(i);
-  btnId(S_TESTALERT, 6, 214, 150, 24, false, LB_BTNM); btnId(S_RESETPK, 164, 214, 150, 24, false, LB_BTNM);
+  chipId(S_TESTALERT, 9, 210, 146, 22, false); chipId(S_RESETPK, 165, 210, 146, 22, false);
+}
+static void startTestAlert();
+static void tapSetup2(int x, int y, bool first) {
+  if (first) {
+    if (hitBack(x, y)) { savePrefs(); nav(PG_SETUP); return; }
+    if (hit(x, y, 9, 210, 146, 22)) { startTestAlert(); return; }
+    if (hit(x, y, 165, 210, 146, 22)) { peaksClear(pkA); peaksClear(pkD); pkDirty = true; savePrefs(); return; }
+  }
+  for (int i = 0; i < 6; i++) {
+    int ry = S2_Y0 + i * S2_H + 4, rh = S2_H - 9;
+    if (y < ry || y >= ry + rh) continue;
+    bool minus = hit(x, y, 164, ry, 30, rh), plus = hit(x, y, 281, ry, 30, rh), on = hit(x, y, 164, ry, 70, rh), off = hit(x, y, 238, ry, 73, rh);
+    if (i == 0 && first && (on || off)) { warnOn = on; saveSoon(); }
+    else if (i == 1 && first && (on || off)) { parkOn = on; saveSoon(); }
+    else if (i == 2 && (minus || plus)) { stepVal(bright, 10, 100, plus ? 1 : -1, 10); applyBright(); saveSoon(); }
+    else if (i == 3 && (minus || plus)) { stepVal(tankL, 10, 200, plus ? 1 : -1, 1); saveSoon(); }
+    else if (i == 4 && (minus || plus)) { stepVal(fuelCal, 70, 130, plus ? 1 : -1, 1); saveSoon(); }
+    else if (i == 5 && first && (minus || plus)) { userProto = (userProto + (plus ? 1 : 9)) % 10; uprotoAt = millis(); saveSoon(); }
+  }
 }
 
-// ---------- bluetooth ----------
-static BtDev btView[MAXBT]; static int nBtView = 0, btOff = 0, btViewVer = -1, btViewScan = -1; static uint32_t lastBtDraw = 0;
+// ---------- Bluetooth ----------
+static BtDev btView[MAXBT]; static int nBtView = 0, btOff = 0;
 static void btBuildView() {
   portENTER_CRITICAL(&btMux); nBtView = btCount; memcpy(btView, btList, sizeof(BtDev) * nBtView); portEXIT_CRITICAL(&btMux);
   bool byRssi = scanState != 1;                 // keep the rows still while the scan is running
@@ -2049,51 +2297,39 @@ static void btBuildView() {
 }
 static void btStartScan() { if (scanState != 1) { scanState = 1; btVer = btVer + 1; scanReq = true; btOff = 0; } }
 static void btSelRow() {
-  panel(6, 34, 308, 28, 4, CUT_TL | CUT_BR, T.panel2, T.acc);
+  halo(9, 32, 302, 26, 9, T.acc, 2);
+  rr(9, 32, 302, 26, 9, T.panel2, T.acc);
   if (selAddr[0]) {
-    char t[32]; fitText(t, sizeof t, selName[0] ? selName : selAddr, F_UM, 190); txt(F_UM, t, 14, 53, T.text, T.panel2);
+    char t[32]; fitText(t, sizeof t, selName[0] ? selName : selAddr, F_UM, 190); txt(F_UM, t, 19, 49, T.text);
     StrId s = demoMode ? S_DEMO : linkState == 2 ? S_CONNECTED : S_CONNECTING; uint16_t c = demoMode ? T.dim : linkState == 2 ? T.good : T.warn;
-    lab(s, LB_TILE, 306, tby(52), c, T.panel2, AL_R);
-  } else lab(S_NOSEL, LB_BTNM, 160, 53, T.dim, T.panel2, AL_C);
+    lab(s, LB_TILE, 303, tby(48), c, AL_R);
+  } else lab(S_NOSEL, LB_BTNM, 160, 49, T.dim, AL_C);
 }
 static void btRow(int r) {
   int y = 76 + r * 28, i = btOff + r;
-  tft.fillRect(6, y, 308, 28, T.bg);
   if (i >= nBtView) return;
-  const BtDev& d = btView[i]; bool sel = d.ble == selBle && !strcmp(d.addr, selAddr); uint16_t bg = sel ? T.panel2 : T.panel;
-  panel(6, y, 308, 26, 3, 0, bg, sel ? T.acc : T.line);
-  int x = 14;
-  if (d.obd) { panel(12, y + 6, 30, 14, 3, 0, T.acc, T.acc); txt(F_LS, "OBD", 27, y + 16, T.text, T.acc, AL_C); x = 50; }
-  char t[32]; fitText(t, sizeof t, d.name[0] ? d.name : d.addr, F_UM, (d.ble ? 176 : 196) - x);
-  txt(F_UM, t, x, y + 18, d.name[0] ? (sel ? T.text : T.accL) : T.dim, bg);
-  if (d.ble) { tft.drawRect(194, y + 6, 28, 14, T.accL); txt(F_LS, "BLE", 208, y + 16, T.accL, bg, AL_C); }
-  if (sel) { tft.drawLine(228, y + 13, 232, y + 17, T.good); tft.drawLine(229, y + 13, 233, y + 17, T.good); tft.drawLine(233, y + 17, 241, y + 7, T.good); tft.drawLine(234, y + 17, 242, y + 7, T.good); }
+  const BtDev& d = btView[i]; bool sel = d.ble == selBle && !strcmp(d.addr, selAddr);
+  if (sel) rr(9, y, 302, 26, 8, T.panel2, T.acc); else rrG(9, y, 302, 26, 8, TA.panel2, TA.panel, T.line);
+  int x = 19;
+  if (d.obd) { rr(16, y + 6, 30, 14, 5, T.acc); txt(F_LS, "OBD", 31, y + 16, T.onacc, AL_C); x = 54; }
+  const char* nm = d.name[0] ? d.name : d.addr; char t[32]; fitText(t, sizeof t, nm, F_UM, (d.ble ? 176 : 196) - x);
+  txt(F_UM, t, x, y + 18, d.name[0] ? (sel ? T.text : T.accL) : T.dim);
+  if (d.ble) { rr(194, y + 6, 28, 14, 5, T.panel, T.accL); txt(F_LS, "BLE", 208, y + 16, T.accL, AL_C); }
+  if (sel) { ln(228, y + 13, 232, y + 17, T.good); ln(229, y + 13, 233, y + 17, T.good); ln(233, y + 17, 241, y + 7, T.good); ln(234, y + 17, 242, y + 7, T.good); }
   int lv = !d.rssi ? 0 : d.rssi >= -55 ? 4 : d.rssi >= -67 ? 3 : d.rssi >= -78 ? 2 : 1;
-  for (int k = 0; k < 4; k++) { int h = 4 + k * 3; tft.fillRect(268 + k * 8, y + 22 - h, 5, h, k < lv ? T.accL : T.dark); }
+  for (int k = 0; k < 4; k++) { int h = 4 + k * 3; rr(268 + k * 8, y + 22 - h, 5, h, 1, k < lv ? T.accL : T.dark); }
 }
-static void btListDraw() {
-  btBuildView(); btViewVer = btVer; btViewScan = scanState; lastBtDraw = millis();
-  int st = scanState, n = nBtView;
-  tft.fillRect(6, 64, 308, 12, T.bg);
-  lab(S_NEARBY, LB_TILE, 8, tby(73), T.dim, T.bg);
-  if (st == 1) lab(S_SCANNING, LB_TILE, 312, tby(73), T.warn, T.bg, AL_R);
-  else if (n > 0) { char c[12]; snprintf(c, sizeof c, "%d", n); int w = labW(S_FOUND, LB_TILE), cw = textW(F_LS, c); txt(F_LS, c, 312 - w - 4 - cw, 73, T.accL, T.bg); lab(S_FOUND, LB_TILE, 312, tby(73), T.dim, T.bg, AL_R); }
+static void drawBt() {
+  subHeader(S_BTDEV, S_SCAN, true);
+  btSelRow();
+  int n = nBtView, st = scanState;
+  lab(S_NEARBY, LB_TILE, 11, tby(70), T.dim);
+  if (st == 1) lab(S_SCANNING, LB_TILE, 309, tby(70), T.warn, AL_R);
+  else if (n > 0) { char c[8]; snprintf(c, sizeof c, "%d", n); int w = labW(S_FOUND, LB_TILE), cw = textW(F_LS, c); txt(F_LS, c, 309 - w - 4 - cw, tby(70), T.accL); lab(S_FOUND, LB_TILE, 309, tby(70), T.dim, AL_R); }
   for (int r = 0; r < 4; r++) btRow(r);
-  if (n == 0) { StrId m = st == 1 ? S_SCANNING : st == 2 ? S_NOTFOUND : st == 3 ? S_SCANFAIL : S_PRESSSCAN; lab(m, LB_BTNM, 160, 134, st == 3 ? T.hot : T.dim, T.bg, AL_C); }
-  bool up = btOff > 0, dn = btOff + 4 < nBtView;
-  btnS("<", 6, 214, 50, 24, up); btnS(">", 62, 214, 50, 24, dn);
-  lab(S_TAPPICK, LB_TILE, 220, tby(230), T.dim, T.bg, AL_C, 190);
-}
-static void btStatic() {
-  titleBar(S_BTDEV, 2); leftBtn(S_SCAN);
-  btSelRow(); btListDraw();
-  if (!selAddr[0] && scanState != 1 && !demoMode) btStartScan();
-}
-static void btDyn() {
-  bool stateChg = btViewScan != scanState;
-  if (btViewVer == btVer && !stateChg) return;
-  if (!stateChg && millis() - lastBtDraw < 250) return;
-  btListDraw(); if (stateChg) btSelRow();
+  if (n == 0) { StrId m = st == 1 ? S_SCANNING : st == 2 ? S_NOTFOUND : st == 3 ? S_SCANFAIL : S_PRESSSCAN; lab(m, LB_BTNM, 160, 134, st == 3 ? T.hot : T.dim, AL_C); }
+  chipArrow(9, 210, 50, 22, -1, btOff > 0); chipArrow(65, 210, 50, 22, 1, btOff + 4 < n);
+  lab(S_TAPPICK, LB_TILE, 215, tby(225), T.dim, AL_C, 190);
 }
 static void btPick(int i) {                  // the user tapped a device: remember it, switch to OBD mode and connect
   BtDev d = btView[i];
@@ -2106,32 +2342,40 @@ static void btPick(int i) {                  // the user tapped a device: rememb
   demoMode = false; carBuf[0] = 0; vinBuf[0] = 0; linkState = 1; memset(psup, 0, sizeof psup); engineRan = false;
   scanStop = true; reconnectReq = true;
   savePrefs(); updateWants();
-  btSelRow(); btListDraw();
+}
+static void tapBt(int x, int y, bool first) {
+  if (!first) return;
+  if (hitBack(x, y)) { nav(PG_SETUP); return; }
+  if (hit(x, y, 247, 4, 64, 20)) { btStartScan(); return; }
+  if (hit(x, y, 9, 210, 50, 22)) { if (btOff > 0) btOff = max(0, btOff - 4); return; }
+  if (hit(x, y, 65, 210, 50, 22)) { if (btOff + 4 < nBtView) btOff += 4; return; }
+  for (int r = 0; r < 4; r++) if (hit(x, y, 9, 76 + r * 28, 302, 26) && btOff + r < nBtView) { btPick(btOff + r); return; }
 }
 
 // ---------- vehicle ----------
 static int vehStep = 0, vehBrandSel = 0;
-static const int VBX[2] = {6, 164};
-static void vehStatic() {
-  titleBar(S_VEHICLE, 2);
+static const int VBX[2] = {9, 161};
+static void drawVeh() {
+  subHeader(S_VEHICLE, S_COUNT, false);
   if (vehStep == 0) {
     for (int i = 0; i < 6; i++) {
       int x = VBX[i & 1], y = 36 + (i >> 1) * 42; bool cur = vehModel >= 0 && MODELS[vehModel].brand == i;
-      panel(x, y, 150, 38, 5, CUT_TL | CUT_BR, cur ? T.panel2 : T.panel, cur ? T.acc : T.line);
-      txt(F_UL, BRANDS[i], x + 75, y + 25, cur ? T.text : T.accL, cur ? T.panel2 : T.panel, AL_C);
+      if (cur) halo(x, y, 150, 38, 10, T.acc, 3);
+      if (cur) rr(x, y, 150, 38, 10, T.panel2, T.acc); else rrG(x, y, 150, 38, 10, TA.panel2, TA.panel, T.line);
+      txt(F_UL, BRANDS[i], x + 75, y + 25, cur ? T.text : T.accL, AL_C);
     }
-    btnId(S_AUTOVIN, 6, 166, 308, 30, vehModel < 0, LB_BTNM);
-    lab(S_PICKBRAND, LB_TILE, 160, tby(210), T.dim, T.bg, AL_C);
+    chipId(S_AUTOVIN, 9, 166, 302, 30, vehModel < 0);
+    lab(S_PICKBRAND, LB_TILE, 160, tby(214), T.dim, AL_C);
   } else {
     int r = 0;
-    for (int i = 0; i < NMODEL; i++) {
+    for (int i = 0; i < NMODEL && r < 12; i++) {
       if (MODELS[i].brand != vehBrandSel) continue;
-      int x = VBX[r & 1], y = 36 + (r >> 1) * 29; bool cur = i == vehModel;
-      char t[24]; fitText(t, sizeof t, MODELS[i].name, F_UM, 136);
-      btnBox(x, y, 150, 26, cur); txt(F_UM, t, x + 75, y + 18, T.text, cur ? T.acc : T.panel2, AL_C);
+      int x = VBX[r & 1], y = 31 + (r >> 1) * 29; bool cur = i == vehModel;
+      chipBox(x, y, 150, 26, cur);
+      char t[32]; fitText(t, sizeof t, MODELS[i].name, F_UM, 136); txt(F_UM, t, x + 75, y + 18, cur ? T.onacc : T.text, AL_C);
       r++;
     }
-    btnS("<", 6, 214, 50, 24, false); btnId(S_AUTOVIN, 62, 214, 252, 24, vehModel < 0, LB_BTNM);
+    chipArrow(9, 210, 50, 22, -1, false); chipId(S_AUTOVIN, 65, 210, 246, 22, vehModel < 0);
   }
 }
 static int vehModelAt(int slot) {            // slot-th model of the chosen brand
@@ -2139,37 +2383,50 @@ static int vehModelAt(int slot) {            // slot-th model of the chosen bran
   for (int i = 0; i < NMODEL; i++) { if (MODELS[i].brand != vehBrandSel) continue; if (r == slot) return i; r++; }
   return -1;
 }
+static void tapVeh(int x, int y, bool first) {
+  if (!first) return;
+  if (hitBack(x, y)) { nav(PG_SETUP); return; }
+  if (vehStep == 0) {
+    for (int i = 0; i < 6; i++) if (hit(x, y, VBX[i & 1], 36 + (i >> 1) * 42, 150, 38)) { vehBrandSel = i; vehStep = 1; return; }
+    if (hit(x, y, 9, 166, 302, 30)) applyVehicle(-1);
+  } else {
+    if (hit(x, y, 9, 210, 50, 22)) { vehStep = 0; return; }
+    if (hit(x, y, 65, 210, 246, 22)) { applyVehicle(-1); return; }
+    for (int r = 0; r < 12; r++) if (hit(x, y, VBX[r & 1], 31 + (r >> 1) * 29, 150, 26)) { int m = vehModelAt(r); if (m >= 0) applyVehicle(m); return; }
+  }
+}
 
-// =====================================================================================
-//  Splash (logo), warning / check-engine overlays, park screen
-// =====================================================================================
+// ---------- splash (logo) ----------
 static uint32_t splashAt = 0;
-static int splashPx = -1;
 static uint32_t splashMs() { return firstRun ? 7000u : 2300u; }
-static void splashDraw() {
-  tft.fillScreen(T.bg);
-  tft.pushImage(60, 2, LOGO_W, LOGO_H, LOGO_PX);
+static void drawLogo() {                                       // 200 x 200 artwork at (60, 2)
+  int y0 = max(2, bandY0), y1 = min(2 + LOGO_H, bandY1);
+  for (int y = y0; y < y1; y++) {
+    uint16_t* d = rowPtr(y) + 60; const uint16_t* s = LOGO_PX + (y - 2) * LOGO_W;
+    for (int i = 0; i < LOGO_W; i++) d[i] = pgm_read_word(&s[i]);
+  }
+}
+static void drawSplash() {
+  fillBand(0);
+  drawLogo();
   if (firstRun) {                                  // the language is not chosen yet: show the tip in Thai and in English
     bool t0 = thai;
-    thai = true;  lab(S_FIRSTTIP, LB_BTNM, 160, 222, T.warn, T.bg, AL_C);
-    thai = false; lab(S_FIRSTTIP, LB_TILE, 160, 236, T.dim, T.bg, AL_C);
+    thai = true;  lab(S_FIRSTTIP, LB_BTNM, 160, 222, T.warn, AL_C);
+    thai = false; lab(S_FIRSTTIP, LB_TILE, 160, 236, T.dim, AL_C);
     thai = t0;
   } else {
-    char t[28]; snprintf(t, sizeof t, "%s  %s", EN[S_SPLASHHINT], FW_VERSION);
-    txt(F_UM, t, 160, 226, T.dim, T.bg, AL_C);
+    char t[40]; snprintf(t, sizeof t, "%s  %s", EN[S_SPLASHHINT], FW_VERSION);
+    txt(F_UM, t, 160, 226, T.dim, AL_C);
   }
-  splashPx = -1;
-}
-static void splashDyn() {
-  uint32_t el = millis() - splashAt; int px = (int)min<uint32_t>(100, el * 100 / splashMs());
-  if (px != splashPx) { splashPx = px; tft.fillRect(110, 207, 100, 3, T.dark); tft.fillRect(110, 207, px, 3, T.acc); }
+  int px = (int)min<uint32_t>(100, (uiNow - splashAt) * 100 / splashMs());
+  rr(110, 207, 100, 3, 1, T.dark);
+  if (px >= 3) { halo(110, 207, px, 3, 1, T.acc, 2); rr(110, 207, px, 3, 1, T.acc); }
 }
 
 // ---------- alerts ----------
 enum { AK_NONE = 0, AK_COOL, AK_OIL, AK_BATT, AK_MIL, AK_N };
 static int alertOn = AK_NONE; static bool alertArmed[AK_N] = {true, true, true, true, true}; static uint32_t alertSnooze[AK_N]; static bool alertTest = false; static uint32_t alertTestAt = 0;
 static int testNext = 0;
-static const uint16_t ALBG = C(20, 5, 8);
 static float alertVal(int k, bool& ok) {
   switch (k) {
     case AK_COOL: return getVal(0x05, ok);
@@ -2189,29 +2446,38 @@ static bool alertCond(int k, bool release) {                 // true while the c
   }
   return false;
 }
-static void alertValueDraw(bool force) {
-  static char last[16];
-  char b[16]; bool ok = false; float v;
-  if (alertOn == AK_MIL) { if (!force) return; strcpy(b, ""); }
-  else { v = alertTest ? (alertOn == AK_BATT ? 10.6f : alertOn == AK_OIL ? 131.0f : 107.0f) : alertVal(alertOn, ok); if (alertTest) ok = true;
-         if (ok) fmtv(b, sizeof b, v, alertOn == AK_BATT ? 1 : 0); else strcpy(b, "--"); }
-  if (!force && !strcmp(b, last)) return;
-  strcpy(last, b);
-  if (alertOn == AK_MIL) lab(S_LAMPON2, LB_BTN, 190, 140, RED_AL, ALBG, AL_C, 130);
-  else txtVU(F_NXL, b, F_UM, alertOn == AK_BATT ? "V" : DEGC, 190, 148, RED_AL, T.dim, ALBG, AL_C, 130);
+static void ringStroke(float cx, float cy, float R, float wd, uint16_t col) {
+  int y0 = max((int)floorf(cy - R - wd - 1), bandY0), y1 = min((int)ceilf(cy + R + wd + 1), bandY1 - 1);
+  for (int py = y0; py <= y1; py++) for (int px = (int)floorf(cx - R - wd - 1); px <= (int)ceilf(cx + R + wd + 1); px++) {
+    if (px < 0 || px >= SCR_W) continue;
+    float dx = px - cx, dy = py - cy, cv = clampf(wd * 0.5f - fabsf(sqrtf(dx * dx + dy * dy) - R) + 0.5f, 0, 1);
+    if (cv > 0.004f) { uint16_t* p = rowPtr(py) + px; *p = blendA(*p, col, (uint32_t)(cv * 255 + 0.5f)); }
+  }
 }
-static void alertDraw() {
-  tft.fillScreen(T.bg);
-  panel(24, 36, 272, 170, 8, CUT_TL | CUT_BR, ALBG, RED_AL);
-  panel(26, 38, 268, 26, 6, CUT_TL, RED_AL, RED_AL);
-  lab(alertOn == AK_MIL ? S_CHECKENG : S_WARNT, LB_BTN, 160, 58, C(255, 255, 255), RED_AL, AL_C);
-  if (alertOn != AK_MIL) lab(alertOn == AK_COOL ? S_COOLANT : alertOn == AK_OIL ? S_OIL : S_BATT, LB_TILE, 160, tby(82), T.dim, ALBG, AL_C);
-  hexagon(78, 126, 24, C(46, 8, 12), RED_AL, true); txt(F_UL, "!", 78, 134, RED_AL, C(46, 8, 12), AL_C);
-  alertValueDraw(true);
-  StrId m = alertOn == AK_COOL ? S_HOT : alertOn == AK_OIL ? S_OILHOT : alertOn == AK_BATT ? S_LOWV : S_NEWFAULT;
-  lab(m, LB_TILE, 160, tby(170), T.text, ALBG, AL_C);
-  panel(40, 180, 118, 22, 4, CUT_TL | CUT_BR, RED_AL, RED_AL); lab(S_OK, LB_BTNM, 99, 196, C(255, 255, 255), RED_AL, AL_C);
-  panel(162, 180, 118, 22, 4, CUT_TL | CUT_BR, T.panel2, T.line); lab(S_SNOOZE, LB_BTNM, 221, 196, T.text, T.panel2, AL_C);
+static void drawAlert() {
+  int k = alertOn;
+  fillBand(ALBG);
+  halo(20, 26, 280, 188, 14, RED_AL, 4);
+  rr(20, 26, 280, 188, 14, ALCARD);
+  rrBorder(20, 26, 280, 188, 14, 1.5f, RED_AL);
+  if (k == AK_MIL) lab(S_CHECKENG, LB_BTN, 160, thai ? 58 : 56, RED_AL, AL_C);
+  else {
+    StrId sid = k == AK_COOL ? S_COOLANT : k == AK_OIL ? S_OIL : S_BATT;
+    int w1 = labW(S_WARNT, LB_BTN), w2 = labW(sid, LB_BTN), x0 = 160 - (w1 + 14 + w2) / 2;
+    lab(S_WARNT, LB_BTN, x0, thai ? 58 : 56, RED_AL); txt(F_UM, "-", x0 + w1 + 5, 56, RED_AL); lab(sid, LB_BTN, x0 + w1 + 14, thai ? 58 : 56, RED_AL);
+  }
+  if (k == AK_MIL) {
+    ringStroke(160, 98, 22, 2, RED_AL);
+    rr(159, 86, 3, 14, 1, RED_AL); rr(159, 104, 3, 3, 1, RED_AL);
+    lab(S_LAMPON2, LB_BTN, 160, thai ? 140 : 138, WHITE, AL_C, 130);
+  } else {
+    bool ok = false; float v = alertTest ? (k == AK_BATT ? 10.6f : k == AK_OIL ? 131.0f : 107.0f) : alertVal(k, ok); if (alertTest) ok = true;
+    char b[16]; if (ok) fmtv(b, sizeof b, v, k == AK_BATT ? 1 : 0); else strcpy(b, "--");
+    txtVU(F_NXL, b, F_UM, k == AK_BATT ? "V" : DEGC, 160, 118, WHITE, T.dim, AL_C);
+  }
+  lab(k == AK_COOL ? S_HOT : k == AK_OIL ? S_OILHOT : k == AK_BATT ? S_LOWV : S_NEWFAULT, LB_ROW, 160, thai ? 157 : 154, ALTXT, AL_C, 250);
+  chipBox(36, 170, 116, 26, true); lab(S_OK, LB_BTNM, 94, thai ? 188 : 187, T.onacc, AL_C);
+  chipBox(168, 170, 116, 26, false); lab(S_SNOOZE, LB_BTNM, 226, thai ? 188 : 187, T.text, AL_C);
 }
 static void alertClose(bool snooze) {
   if (snooze) alertSnooze[alertOn] = millis() + 300000u;
@@ -2231,53 +2497,42 @@ static void alertsStep() {
     else if (warnOn && alertArmed[k] && alertCond(k, false) && (int32_t)(now - alertSnooze[k]) > 0 && scr != PG_SPLASH) { alertOpen(k); return; }
   }
 }
+static void tapAlert(int x, int y, bool first) {
+  if (!first) return;
+  if (hit(x, y, 36, 170, 116, 26)) alertClose(false); else if (hit(x, y, 168, 170, 116, 26)) alertClose(true);
+}
 
 // ---------- park screen ----------
 static uint32_t parkAt = 0; static float parkBatt = 0;
-static char pkCache[8][24];
-static void parkStatic() {
-  lab(S_PARKED, LB_BTNM, 160, 26, T.dim, T.bg, AL_C);
-  tft.fillRect(110, 92, 100, 2, T.acc);
-  panel(6, 100, 152, 52, 5, CUT_TL | CUT_BR, T.panel, T.line); bracket(6, 100, 152, T.good, true, false);
-  lab(S_LASTBATT, LB_TILE, 82, tby(116), T.dim, T.panel, AL_C);
-  panel(162, 100, 152, 52, 5, CUT_TR | CUT_BL, T.panel, T.line); bracket(162, 100, 152, T.acc, false, true);
-  lab(S_RANGE, LB_TILE, 238, tby(116), T.dim, T.panel, AL_C);
-  panel(6, 158, 308, 50, 5, CUT_TL | CUT_BR, T.panel, T.line);
+static void drawPark() {
+  uint32_t secs = (uiNow - parkAt) / 1000; char b[24], c[12];
+  lab(S_PARKED, LB_BTNM, 160, thai ? 27 : 26, T.dim, AL_C);
+  halo(110, 90, 100, 3, 1, T.acc, 2); rr(110, 90, 100, 3, 1, T.acc);
+  clockStr(b, sizeof b, secs); txt(F_NXL, b, 160, 78, T.text, AL_C);
+  tile(9, 100, 149, 52); lab(S_LASTBATT, LB_TILE, 83, tby(116), T.dim, AL_C);
+  tile(162, 100, 149, 52); lab(S_RANGE, LB_TILE, 236, tby(116), T.dim, AL_C);
+  tile(9, 158, 302, 50);
   static const StrId LB4[4] = {S_THISDRIVE, S_DTIME, S_AVG, S_TOPSPEED};
-  for (int i = 0; i < 4; i++) lab(LB4[i], LB_TILE, 6 + 38 + i * 77, tby(173), T.dim, T.panel, AL_C);
-  for (int i = 0; i < 8; i++) pkCache[i][0] = 0;
-}
-static void parkSet(int i, const char* s, uint16_t col, int cx, int by, FontId f, const char* unit, int clearW, uint16_t bg) {
-  char key[24]; snprintf(key, sizeof key, "%s|%04X", s, col);
-  if (!strcmp(key, pkCache[i])) return;
-  strcpy(pkCache[i], key);
-  txtVU(f, s, F_LS, unit, cx, by, col, T.dim, bg, AL_C, clearW);
-}
-static void parkDyn() {
-  uint32_t secs = (millis() - parkAt) / 1000; char b[24];
-  clockStr(b, sizeof b, secs); parkSet(0, b, T.text, 160, 78, F_NXL, "", 150, T.bg);
-  if (parkBatt > 1) { fmtv(b, sizeof b, parkBatt, 1); parkSet(1, b, parkBatt >= 12.3f ? T.good : T.warn, 82, 143, F_NHL, "V", 140, T.panel); } else parkSet(1, "--", T.dim, 82, 143, F_NHL, "", 140, T.panel);
-  float rg = rangeKm(); if (rg >= 0) { snprintf(b, sizeof b, "%d", (int)rg); parkSet(2, b, T.text, 238, 143, F_NHL, "km", 140, T.panel); } else parkSet(2, "--", T.dim, 238, 143, F_NHL, "", 140, T.panel);
-  fmtv(b, sizeof b, tDist, 1); parkSet(3, b, T.text, 44, 198, F_NL, "km", 72, T.panel);
-  int mins = (int)(tSec / 60); snprintf(b, sizeof b, "%d:%02d", mins / 60, mins % 60); parkSet(4, b, T.text, 121, 198, F_NL, "h", 72, T.panel);
-  float al = tripAvgL100(); if (al > 0) { fmtv(b, sizeof b, 100.0f / al, 1); parkSet(5, b, T.text, 198, 198, F_NL, "km/L", 72, T.panel); } else parkSet(5, "--", T.dim, 198, 198, F_NL, "", 72, T.panel);
-  fmtv(b, sizeof b, pkD.spd, 0); parkSet(6, b, T.text, 275, 198, F_NL, "km/h", 72, T.panel);
-  uint32_t left = secs >= 180 ? 0 : 180 - secs; char c[12]; snprintf(c, sizeof c, "%u:%02u", (unsigned)(left / 60), (unsigned)(left % 60));
-  char key[24]; snprintf(key, sizeof key, "%s", c);
-  if (strcmp(key, pkCache[7])) {
-    strcpy(pkCache[7], key);
-    int w1 = labW(S_SCROFF, LB_TILE), w2 = textW(F_LS, c), w3 = labW(S_TAPGAUGE, LB_TILE), tot = w1 + 4 + w2 + 12 + w3, x0 = 160 - tot / 2;
-    tft.fillRect(0, 216, 320, 24, T.bg);
-    lab(S_SCROFF, LB_TILE, x0, tby(231), T.dim, T.bg); txt(F_LS, c, x0 + w1 + 4, 231, T.text, T.bg); lab(S_TAPGAUGE, LB_TILE, x0 + w1 + 4 + w2 + 12, tby(231), T.dim, T.bg);
-  }
+  for (int i = 0; i < 4; i++) lab(LB4[i], LB_TILE, 9 + 38 + i * 76, tby(173), T.dim, AL_C);
+  float pb = parkBatt;
+  if (pb > 1) { fmtv(b, sizeof b, pb, 1); txtVU(F_NHL, b, F_LS, "V", 83, 143, pb >= 12.3f ? T.good : T.warn, T.dim, AL_C); } else txt(F_NHL, "--", 83, 143, T.dim, AL_C);
+  float rg = rangeKm();
+  if (rg >= 0) { snprintf(b, sizeof b, "%d", (int)rg); txtVU(F_NHL, b, F_LS, "km", 236, 143, T.text, T.dim, AL_C); } else txt(F_NHL, "--", 236, 143, T.dim, AL_C);
+  fmtv(b, sizeof b, tDist, 1); txtVU(F_NL, b, F_LS, "km", 47, 198, T.text, T.dim, AL_C);
+  int mins = (int)(tSec / 60); snprintf(b, sizeof b, "%d:%02d", mins / 60, mins % 60); txtVU(F_NL, b, F_LS, "h", 123, 198, T.text, T.dim, AL_C);
+  float al = tripAvgL100();
+  if (al > 0) { fmtv(b, sizeof b, 100.0f / al, 1); txtVU(F_NL, b, F_LS, "km/L", 199, 198, T.text, T.dim, AL_C); } else txt(F_NL, "--", 199, 198, T.dim, AL_C);
+  fmtv(b, sizeof b, pkD.spd, 0); txtVU(F_NL, b, F_LS, "km/h", 275, 198, T.text, T.dim, AL_C);
+  uint32_t left = secs >= 180 ? 0 : 180 - secs; snprintf(c, sizeof c, "%u:%02u", (unsigned)(left / 60), (unsigned)(left % 60));
+  int w1 = labW(S_SCROFF, LB_TILE), w2 = textW(F_LS, c), w3 = labW(S_TAPGAUGE, LB_TILE), tot = w1 + 4 + w2 + 12 + w3, x0 = 160 - tot / 2;
+  lab(S_SCROFF, LB_TILE, x0, tby(231), T.dim); txt(F_LS, c, x0 + w1 + 4, tby(231), T.text); lab(S_TAPGAUGE, LB_TILE, x0 + w1 + 4 + w2 + 12, tby(231), T.dim);
 }
 
 // =====================================================================================
-//  Navigation, drawing dispatch, touch handling, main loop
+//  Navigation, frame composition, touch, main loop
 // =====================================================================================
 static bool prefsDirty = false; static uint32_t prefsAt = 0;
 static void saveSoon() { prefsDirty = true; prefsAt = millis(); }
-
 static void newDrive() { peaksClear(pkD); driveStart = millis(); }
 static void nav(Page p) {
   goPage(p);
@@ -2288,215 +2543,70 @@ static void nav(Page p) {
     case PG_FREEZE: freezeRead(); break;
     case PG_ECU: ecuRead(); break;
     case PG_VEH: vehStep = 0; break;
-    default: break;
-  }
-}
-static void fullDraw() {
-  if (alertOn != AK_NONE) { alertDraw(); return; }
-  if (scr == PG_SPLASH) { splashDraw(); return; }
-  tft.fillScreen(T.bg);
-  switch (scr) {
-    case PG_DASH: dashStatic(); break;
-    case PG_DATA: dataStatic(); break;
-    case PG_ALL: allStatic(); break;
-    case PG_GRAPH: graphStatic(); break;
-    case PG_TRIP: tripStatic(); break;
-    case PG_PEAKS: peaksStatic(); break;
-    case PG_CODES: codesStatic(); break;
-    case PG_STATUS: statusStatic(); break;
-    case PG_FREEZE: freezeStatic(); break;
-    case PG_ECU: ecuStatic(); break;
-    case PG_SETUP: setupStatic(); break;
-    case PG_SETUP2: setup2Static(); break;
-    case PG_BT: btStatic(); break;
-    case PG_VEH: vehStatic(); break;
-    case PG_PARK: parkStatic(); break;
-    default: break;
-  }
-}
-static void updateScreen() {
-  if (alertOn != AK_NONE) { alertValueDraw(false); return; }
-  static int fv = -1, ev = -1, ls = -1;
-  switch (scr) {
-    case PG_SPLASH: splashDyn(); break;
-    case PG_DASH: dashDyn(); break;
-    case PG_DATA: dataDyn(); break;
-    case PG_ALL: allDyn(); break;
-    case PG_GRAPH: graphDyn(); break;
-    case PG_TRIP: tripDyn(); break;
-    case PG_PEAKS: peaksDyn(); break;
-    case PG_CODES: codesDyn(); break;
-    case PG_STATUS: statusDyn(); break;
-    case PG_FREEZE: if (fv != frzVer) { fv = frzVer; redraw = true; } break;
-    case PG_ECU: if (ev != ecuInfoVer) { ev = ecuInfoVer; redraw = true; } break;
-    case PG_BT: btDyn(); if (ls != linkState) { ls = linkState; btSelRow(); } break;
-    case PG_PARK: parkDyn(); break;
+    case PG_BT: btOff = 0; if (!selAddr[0] && scanState != 1 && !demoMode) btStartScan(); break;
+    case PG_PARK: parkAt = millis(); break;
     default: break;
   }
 }
 
-// ---------- touch ----------
-static bool doneHit(int x, int y) { return hit(x, y, 246, 4, 68, 22); }
-static void applyVehicle(int idx) {                 // idx = -1: automatic (from the VIN)
-  vehModel = idx;
-  if (idx >= 0) { tankL = MODELS[idx].tank; shiftRpm = max(3000, MODELS[idx].redline * 100 - 300); }
-  carBuf[0] = 0; slotsCustom = false; autoSlots();
-  savePrefs(); nav(PG_SETUP);
+static void drawScene() {
+  if (alertOn != AK_NONE) { drawAlert(); return; }
+  switch (scr) {
+    case PG_SPLASH: drawSplash(); break;
+    case PG_DASH: drawDash(); break;
+    case PG_DATA: drawData(); break;
+    case PG_ALL: drawAll(); break;
+    case PG_GRAPH: drawGraph(); break;
+    case PG_TRIP: drawTrip(); break;
+    case PG_PEAKS: drawPeaks(); break;
+    case PG_CODES: drawCodes(); break;
+    case PG_STATUS: drawStatus(); break;
+    case PG_FREEZE: drawFreeze(); break;
+    case PG_ECU: drawEcu(); break;
+    case PG_SETUP: drawSetup(); break;
+    case PG_SETUP2: drawSetup2(); break;
+    case PG_BT: drawBt(); break;
+    case PG_VEH: drawVeh(); break;
+    case PG_PARK: drawPark(); break;
+  }
 }
-static void setSource(bool demo) {
-  if (demo == demoMode) return;
-  demoMode = demo; carBuf[0] = 0; vinBuf[0] = 0; ecuName[0] = 0; calId[0] = 0; vehModel = vehModel;     // (the chosen model stays)
-  ecuDieselKnown = false; ecuDiesel = false; ecuHybrid = false; mil = false; codeCount = 0; codeState = 0; monValid = false;
-  memset(psup, 0, sizeof psup); memset(page, 0, sizeof page); engineRan = false; rpmZeroAt = 0;
-  if (demo) { linkState = 0; simT = 0; if (!slotsCustom) autoSlots(); }
-  else { linkState = selAddr[0] ? 1 : 3; reconnectReq = true; if (!slotsCustom) autoSlots(); }
-  savePrefs(); updateWants();
+static void renderFrame() {
+  uiNow = snapNow = millis();                                   // one consistent snapshot of the car data for all bands
+  memcpy(pvS, pv, sizeof pv); memcpy(psupS, psup, sizeof psup); memcpy(pageS, page, sizeof page);
+  snapOn = true;
+  if (scr == PG_ALL) allBuild();
+  if (scr == PG_BT) btBuildView();
+  for (int b = 0; b < NBAND; b++) {
+    bandY0 = b * BAND_H; bandY1 = bandY0 + BAND_H;
+    fillBand(alertOn != AK_NONE ? ALBG : (scr == PG_SPLASH ? C(0, 0, 0) : T.bg));
+    drawScene();
+    presentBand(b);
+  }
+  snapOn = false;
 }
-static void stepVal(int& v, int lo, int hi, int dir, int st) { v = constrain(v + dir * st, lo, hi); }
 
+static void tapStatus(int x, int y, bool first) { if (first) codeTouch(x, y, scr); }
 static void handleTouch(int x, int y, bool first) {
-  if (alertOn != AK_NONE) {
-    if (!first) return;
-    if (hit(x, y, 40, 180, 118, 22)) alertClose(false); else if (hit(x, y, 162, 180, 118, 22)) alertClose(true);
-    return;
-  }
+  if (alertOn != AK_NONE) { tapAlert(x, y, first); return; }
   switch (scr) {
     case PG_SPLASH:
       if (!first) return;
-      if (firstRun) { invScreen = !invScreen; applyInvert(); splashAt = millis(); splashPx = -1; }
+      if (firstRun) { invScreen = !invScreen; applyInvert(); splashAt = millis(); }
       else nav(PG_DASH);
       return;
-    case PG_DASH: {
-      if (!first) return;
-      if (y >= 214) {
-        static const Page P5[5] = {PG_DATA, PG_GRAPH, PG_TRIP, PG_CODES, PG_SETUP};
-        for (int i = 0; i < 5; i++) if (hit(x, y, NAVX[i], 214, 58, 24)) { nav(P5[i]); return; }
-        return;
-      }
-      for (int i = 0; i < 6; i++) if (hit(x, y, DT_X[i], DT_Y[i], 64, 40)) {
-        slots[i] = (uint8_t)nextMetric(slots[i], i); slotsCustom = true; dtileStatic(i); updateWants(); saveSoon(); return;
-      }
-      if (hit(x, y, 76, 36, 168, 176)) { crpMain = !crpMain; dashSwap(); saveSoon(); }
-      return;
-    }
-    case PG_DATA:
-      if (!first) return;
-      if (doneHit(x, y)) nav(PG_DASH); else if (hit(x, y, 6, 4, 76, 22)) nav(PG_ALL);
-      return;
-    case PG_ALL:
-      if (!first) return;
-      if (doneHit(x, y)) nav(PG_DATA);
-      else if (hit(x, y, 6, 214, 50, 24)) { if (allPg > 0) { allPg--; redraw = true; } }
-      else if (hit(x, y, 62, 214, 50, 24)) { if (allPg + 1 < allPages()) { allPg++; redraw = true; } }
-      else if (hit(x, y, 232, 214, 82, 24)) { allMode = !allMode; allPg = 0; redraw = true; }
-      return;
-    case PG_GRAPH:
-      if (!first) return;
-      if (doneHit(x, y)) { nav(PG_DASH); return; }
-      for (int i = 0; i < 4; i++) if (hit(x, y, NAVX[i], 214, 58, 24)) { gsel = i; updateWants(); redraw = true; return; }
-      if (hit(x, y, NAVX[4], 214, 58, 24)) { gmode ^= 1; redraw = true; }
-      return;
-    case PG_TRIP:
-      if (!first) return;
-      if (doneHit(x, y)) nav(PG_DASH);
-      else if (hit(x, y, 6, 214, 100, 24)) { tripReset(); redraw = true; }
-      else if (hit(x, y, 110, 214, 100, 24)) { unitL100 = !unitL100; saveSoon(); redraw = true; }
-      else if (hit(x, y, 214, 214, 100, 24)) nav(PG_PEAKS);
-      return;
-    case PG_PEAKS:
-      if (!first) return;
-      if (doneHit(x, y)) nav(PG_TRIP);
-      else if (hit(x, y, 6, 214, 150, 24)) { peaksClear(pkAllMode ? pkA : pkD); if (pkAllMode) pkDirty = true; redraw = true; }
-      else if (hit(x, y, 164, 214, 150, 24)) { pkAllMode = !pkAllMode; redraw = true; }
-      return;
-    case PG_CODES:
-      if (!first) return;
-      if (doneHit(x, y)) nav(PG_DASH);
-      else if (hit(x, y, 6, 4, 76, 22)) nav(PG_STATUS);
-      else if (hit(x, y, 6, 214, 96, 24)) codesRead();
-      else if (hit(x, y, 106, 214, 124, 24)) { if (!clearArmed) { clearArmed = true; clearAt = millis(); } else codesClear(); codesSig = 0xFFFFFFFFu; }
-      else if (hit(x, y, 236, 214, 36, 24)) { if (codePg > 0) codePg--; codesSig = 0xFFFFFFFFu; }
-      else if (hit(x, y, 278, 214, 36, 24)) { codePg++; codesSig = 0xFFFFFFFFu; }
-      return;
-    case PG_STATUS: case PG_FREEZE: case PG_ECU:
-      if (!first) return;
-      if (doneHit(x, y)) nav(PG_DASH);
-      else if (hit(x, y, 6, 4, 76, 22)) nav(PG_CODES);
-      else if (hit(x, y, 6, 214, 100, 24)) { if (scr != PG_STATUS) nav(PG_STATUS); }
-      else if (hit(x, y, 110, 214, 100, 24)) { if (scr != PG_FREEZE) nav(PG_FREEZE); }
-      else if (hit(x, y, 214, 214, 100, 24)) { if (scr != PG_ECU) nav(PG_ECU); }
-      return;
-    case PG_SETUP: {
-      if (first) {
-        if (doneHit(x, y)) { savePrefs(); nav(PG_DASH); return; }
-        for (int i = 0; i < NTHEME; i++) if (hit(x, y, 6 + i * 156, 34, 152, 36)) { if (theme != i) { applyTheme(i); savePrefs(); redraw = true; } return; }
-        if (hit(x, y, 6, 214, 100, 24)) { nav(PG_BT); return; }
-        if (hit(x, y, 110, 214, 100, 24)) { nav(PG_VEH); return; }
-        if (hit(x, y, 214, 214, 100, 24)) { nav(PG_SETUP2); return; }
-      }
-      for (int i = 0; i < 4; i++) {
-        int ry = SU_Y0 + i * SU_H + 4, rh = SU_H - 8;
-        if (y < ry || y >= ry + rh) continue;
-        if (i == 0 && first) {
-          if (hit(x, y, 154, ry, 76, rh)) { setSource(true); setupRow(0); }
-          else if (hit(x, y, 234, ry, 80, rh)) { setSource(false); if (!selAddr[0]) nav(PG_BT); else setupRow(0); }
-        } else if (i == 1 && first) {
-          if (hit(x, y, 154, ry, 76, rh) && thai) { thai = false; savePrefs(); redraw = true; }
-          else if (hit(x, y, 234, ry, 80, rh) && !thai) { thai = true; savePrefs(); redraw = true; }
-        } else if (i == 2) {
-          if (hit(x, y, 154, ry, 38, rh)) { stepVal(shiftRpm, 3000, 9000, -1, 100); setupRow(2); saveSoon(); }
-          else if (hit(x, y, 276, ry, 38, rh)) { stepVal(shiftRpm, 3000, 9000, 1, 100); setupRow(2); saveSoon(); }
-        } else if (i == 3 && first) {
-          if (hit(x, y, 154, ry, 76, rh) && invScreen) { invScreen = false; applyInvert(); savePrefs(); setupRow(3); }
-          else if (hit(x, y, 234, ry, 80, rh) && !invScreen) { invScreen = true; applyInvert(); savePrefs(); setupRow(3); }
-        }
-      }
-      return;
-    }
-    case PG_SETUP2: {
-      if (first) {
-        if (doneHit(x, y)) { savePrefs(); nav(PG_DASH); return; }
-        if (hit(x, y, 6, 4, 44, 22)) { savePrefs(); nav(PG_SETUP); return; }
-        if (hit(x, y, 6, 214, 150, 24)) { startTestAlert(); return; }
-        if (hit(x, y, 164, 214, 150, 24)) { peaksClear(pkA); peaksClear(pkD); pkDirty = true; savePrefs(); return; }
-      }
-      for (int i = 0; i < 6; i++) {
-        int ry = S2_Y0 + i * S2_H + 3, rh = S2_H - 6;
-        if (y < ry || y >= ry + rh) continue;
-        bool minus = hit(x, y, 154, ry + 1, 38, rh - 2), plus = hit(x, y, 276, ry + 1, 38, rh - 2), on = hit(x, y, 154, ry, 76, rh), off = hit(x, y, 234, ry, 80, rh);
-        if (i == 0 && first && (on || off)) { warnOn = on; saveSoon(); setup2Row(0); }
-        else if (i == 1 && first && (on || off)) { parkOn = on; saveSoon(); setup2Row(1); }
-        else if (i == 2 && (minus || plus)) { stepVal(bright, 10, 100, plus ? 1 : -1, 10); applyBright(); saveSoon(); setup2Row(2); }
-        else if (i == 3 && (minus || plus)) { stepVal(tankL, 10, 200, plus ? 1 : -1, 1); saveSoon(); setup2Row(3); }
-        else if (i == 4 && (minus || plus)) { stepVal(fuelCal, 70, 130, plus ? 1 : -1, 1); saveSoon(); setup2Row(4); }
-        else if (i == 5 && first && (minus || plus)) { userProto = (userProto + (plus ? 1 : 9)) % 10; uprotoAt = millis(); saveSoon(); setup2Row(5); }
-      }
-      return;
-    }
-    case PG_BT:
-      if (!first) return;
-      if (doneHit(x, y)) { nav(PG_SETUP); return; }
-      if (hit(x, y, 6, 4, 76, 22)) { btStartScan(); btListDraw(); return; }
-      if (hit(x, y, 6, 214, 50, 24)) { if (btOff > 0) { btOff = max(0, btOff - 4); btListDraw(); } return; }
-      if (hit(x, y, 62, 214, 50, 24)) { if (btOff + 4 < nBtView) { btOff += 4; btListDraw(); } return; }
-      for (int r = 0; r < 4; r++) if (hit(x, y, 6, 76 + r * 28, 308, 26) && btOff + r < nBtView) { btPick(btOff + r); return; }
-      return;
-    case PG_VEH:
-      if (!first) return;
-      if (doneHit(x, y)) { nav(PG_SETUP); return; }
-      if (vehStep == 0) {
-        for (int i = 0; i < 6; i++) if (hit(x, y, VBX[i & 1], 36 + (i >> 1) * 42, 150, 38)) { vehBrandSel = i; vehStep = 1; redraw = true; return; }
-        if (hit(x, y, 6, 166, 308, 30)) applyVehicle(-1);
-      } else {
-        if (hit(x, y, 6, 214, 50, 24)) { vehStep = 0; redraw = true; return; }
-        if (hit(x, y, 62, 214, 252, 24)) { applyVehicle(-1); return; }
-        for (int r = 0; r < 14; r++) if (hit(x, y, VBX[r & 1], 36 + (r >> 1) * 29, 150, 26)) { int m = vehModelAt(r); if (m >= 0) applyVehicle(m); return; }
-      }
-      return;
-    case PG_PARK:
-      if (first) nav(PG_DASH);
-      return;
-    default: return;
+    case PG_DASH: tapDash(x, y, first); return;
+    case PG_DATA: tapData(x, y, first); return;
+    case PG_ALL: tapAll(x, y, first); return;
+    case PG_GRAPH: tapGraph(x, y, first); return;
+    case PG_TRIP: tapTrip(x, y, first); return;
+    case PG_PEAKS: tapPeaks(x, y, first); return;
+    case PG_CODES: tapCodes(x, y, first); return;
+    case PG_STATUS: case PG_FREEZE: case PG_ECU: tapStatus(x, y, first); return;
+    case PG_SETUP: tapSetup(x, y, first); return;
+    case PG_SETUP2: tapSetup2(x, y, first); return;
+    case PG_BT: tapBt(x, y, first); return;
+    case PG_VEH: tapVeh(x, y, first); return;
+    case PG_PARK: if (first) nav(PG_DASH); return;
   }
 }
 
@@ -2512,7 +2622,7 @@ static void parkStep(uint32_t now) {
   if (!parkOn || demoMode || scr == PG_SPLASH || alertOn != AK_NONE || !engineRan) return;
   if (rpm < 300) {
     if (!rpmZeroAt) rpmZeroAt = now;
-    else if (now - rpmZeroAt > 6000) { parkAt = now; engineRan = false; screenOff = false; rpmZeroAt = 0; nav(PG_PARK); }
+    else if (now - rpmZeroAt > 6000) { engineRan = false; screenOff = false; rpmZeroAt = 0; nav(PG_PARK); }
   } else rpmZeroAt = 0;
 }
 
@@ -2521,7 +2631,7 @@ void setup() {
   pinMode(4, OUTPUT); pinMode(16, OUTPUT); pinMode(17, OUTPUT);              // CYD RGB LED off (active low)
   digitalWrite(4, HIGH); digitalWrite(16, HIGH); digitalWrite(17, HIGH);
   loadPrefs();
-  tft.init(); tft.setRotation(1); tft.setSwapBytes(true); applyInvert(); tft.fillScreen(T.bg);
+  tft.init(); tft.setRotation(1); tft.setSwapBytes(true); applyInvert(); tft.fillScreen(0);
   ledcSetup(0, 5000, 8); ledcAttachPin(21, 0); applyBright();
   tsSPI.begin(25, 39, 32, 33); ts.begin(tsSPI); ts.setRotation(1);
   analogSetPinAttenuation(CRP_PIN, ADC_11db);
@@ -2551,19 +2661,15 @@ void loop() {
   if (pkDirty && now - pkSaved > 60000u) { pkDirty = false; pkSaved = now; savePrefs(); }
   if (uprotoAt && now - uprotoAt > 1500) { uprotoAt = 0; if (!demoMode) reconnectReq = true; }
 
-  static uint32_t tSim = 0, tUI = 0, tGraph = 0; static int lastLs = -1; static bool lastDsl = false;
+  static uint32_t tSim = 0, tUI = 0, tGraph = 0; static int lastLs = -1;
   if (now - tSim >= 100) {
     float dt = (now - tSim) / 1000.0f; tSim = now;
     if (demoMode) simStep(dt); else crpV = crpV * 0.7f + readCrp() * 0.3f;
     tripStep(dt); peaksStep(); alertsStep(); parkStep(now);
-    if (linkState != lastLs) { lastLs = linkState; if (linkState == 2 && !slotsCustom) { autoSlots(); if (scr == PG_DASH || scr == PG_DATA) redraw = true; } }
-    bool dsl = vehDiesel(); if (dsl != lastDsl) { lastDsl = dsl; if (scr == PG_DASH || scr == PG_DATA || scr == PG_GRAPH) redraw = true; }
+    if (linkState != lastLs) { lastLs = linkState; if (linkState == 2 && !slotsCustom) autoSlots(); }
     if (scr == PG_SPLASH && now - splashAt > splashMs()) { if (firstRun) savePrefs(); nav(PG_DASH); }
   }
   if (now - tGraph >= 1000) { tGraph = now; graphSample(); }
-  if (now - tUI >= 80) {
-    tUI = now;
-    if (redraw) { redraw = false; fullDraw(); } else updateScreen();
-  }
+  if (!screenOff && (redraw || now - tUI >= 80)) { tUI = now; redraw = false; renderFrame(); }
   delay(5);
 }
