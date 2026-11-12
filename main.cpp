@@ -1403,7 +1403,7 @@ static void applyInvert() { tft.invertDisplay(invScreen); }
 // =====================================================================================
 //  Screens
 // =====================================================================================
-enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK };
+enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG };
 static Page scr = PG_SPLASH;
 static bool redraw = true;
 static int gsel = 0, gmode = 0;                           // graph set (0 rpm, 1 temps, 2 afr, 3 batt) and time base (0 = 60 s, 1 = 15 min)
@@ -1594,9 +1594,10 @@ static void tapDash(int x, int y, bool first) {
 }
 
 // ---------- data grid ----------
-static const ModeChip DATA_MODES[2] = {{S_MAIN, 9, 46}, {S_ALLPID, 59, 60}};
+static ModeChip DATA_MODES[3] = {{S_MAIN, 9, 46}, {S_ALLPID, 59, 60}, {S_CRPLOG, 123, 66}};
+static ModeChip* dataModes() { DATA_MODES[2].id = vehDiesel() ? S_CRPLOG : S_AFRLOG; return DATA_MODES; }
 static void drawData() {
-  topBar(gv0(0x0C)); modeChips(DATA_MODES, 2, 0);
+  topBar(gv0(0x0C)); modeChips(dataModes(), 3, 0);
   for (int i = 0; i < 16; i++) {
     DTile t; dtileOf(i, t); int x = GX[i & 3], y = GY[i >> 2];
     tile(x, y, 71, 33);
@@ -1610,7 +1611,73 @@ static void drawData() {
 static void tapData(int x, int y, bool first) {
   if (!first) return;
   if (tabTap(x, y, PG_DATA)) return;
-  if (modeTap(DATA_MODES, 2, x, y) == 1) nav(PG_ALL);
+  int m = modeTap(dataModes(), 3, x, y);
+  if (m == 1) nav(PG_ALL); else if (m == 2) nav(PG_LOG);
+}
+
+// ---------- data log: CRP volts (diesel) or AFR (petrol) for each 1000 rpm band ----------
+static const int LOGN = 8;
+struct LogBin { uint32_t n; float sum, mn, mx; };
+static LogBin logB[2][LOGN];
+static const int TBN = 7, TBV[TBN] = {0, 5, 10, 20, 35, 50, 75};            // AFR map: throttle rows x 1000 rpm columns
+static uint32_t amN[TBN][LOGN]; static float amSum[TBN][LOGN];
+static int tpsRow(float t) { int r = 0; for (int i = 0; i < TBN; i++) if (t >= TBV[i]) r = i; return r; }
+static void logClear() { memset(amN, 0, sizeof amN); memset(amSum, 0, sizeof amSum); for (auto& s : logB) for (auto& b : s) { b.n = 0; b.sum = 0; b.mn = 1e9f; b.mx = -1e9f; } }
+static void logStep() {
+  bool ok; float rpm = getVal(0x0C, ok); if (!ok || rpm < 400) return;
+  int b = min(LOGN - 1, (int)(rpm / 1000));
+  { bool o1, o2; float t = getVal(0x11, o1), a = metricVal(M_AFR, o2); if (o1 && o2) { int r = tpsRow(t); amN[r][b]++; amSum[r][b] += a; } }
+  for (int k = 0; k < 2; k++) { bool o; float v = metricVal(k ? M_AFR : M_CRP, o); if (!o) continue; LogBin& L = logB[k][b]; L.n++; L.sum += v; L.mn = fminf(L.mn, v); L.mx = fmaxf(L.mx, v); }
+}
+static void afrMap(bool rok, float rpm) {                         // petrol: average AFR for each throttle row and 1000 rpm column
+  tile(9, 56, 302, 141);
+  bool ot, oa; float tps = getVal(0x11, ot), afr = metricVal(M_AFR, oa);
+  int cc = rok && rpm >= 400 ? min(LOGN - 1, (int)(rpm / 1000)) : -1, cr = ot ? tpsRow(tps) : -1; char b[40];
+  if (rok) { char t[12]; fmtThou(t, sizeof t, (int)rpm); snprintf(b, sizeof b, "%s rpm   TPS ", t); } else strcpy(b, "-- rpm   TPS ");
+  { char t[8]; if (ot) snprintf(t, sizeof t, "%d%%", (int)lroundf(tps)); else strcpy(t, "--"); strcat(b, t); }
+  txt(F_US, b, 18, 70, T.text);
+  { char t[16]; strcpy(t, "AFR "); if (oa) { char u[8]; fmtv(u, sizeof u, afr, 1); strcat(t, u); } else strcat(t, "--"); txt(F_US, t, 303, 70, oa && afr >= 14.2f && afr <= 15.2f ? T.good : T.text, AL_R); }
+  for (int r = 0; r < TBN; r++) {
+    int y = 78 + (TBN - 1 - r) * 13; char l[6]; snprintf(l, sizeof l, "%d", TBV[r]);
+    txt(F_LS, l, 34, y + 10, T.dim, AL_R);
+    for (int c = 0; c < LOGN; c++) {
+      int x = 38 + c * 33; uint32_t n = amN[r][c]; float v = n ? amSum[r][c] / n : 0; bool cur = r == cr && c == cc;
+      uint16_t fill = !n ? mixRgb(TA.panel, TA.line, 115) : (v >= 13.8f && v <= 15.2f ? mixRgb(TA.panel, TA.good, 128) : mixRgb(TA.line, TA.dim, 77));
+      rr(x, y, 32, 12, 3, fill, cur ? T.good : -1);
+      if (n) { fmtv(b, sizeof b, v, 1); txt(F_LS, b, x + 16, y + 10, T.text, AL_C); }
+      if (cur) disc(x + 3, y + 3, 1.6f, T.good);
+    }
+  }
+  for (int c = 0; c < LOGN; c++) { snprintf(b, sizeof b, "%dK", c); txt(F_LS, b, 38 + c * 33 + 16, 183, T.dim, AL_C); }
+}
+static void drawLog() {
+  bool dsl = vehDiesel(); const LogBin* L = logB[dsl ? 0 : 1]; int rows = dsl ? 6 : 8, dec = dsl ? 2 : 1; bool ok; float rpm = getVal(0x0C, ok);
+  int cur = ok && rpm >= 400 ? min(LOGN - 1, (int)(rpm / 1000)) : -1;
+  topBar(ok ? rpm : 0); modeChips(dataModes(), 3, 2); chipId(S_RESET, 257, 32, 54, 20, false);
+  if (!dsl) { afrMap(ok, rpm); tabBar(1); return; }
+  tile(9, 56, 302, 141);
+  lab(S_RPM, LB_TILE, 18, tby(68), T.dim); lab(S_AVG, LB_TILE, 138, tby(68), T.dim, AL_R); lab(S_LOGMIN, LB_TILE, 200, tby(68), T.dim, AL_R); lab(S_GMAX, LB_TILE, 262, tby(68), T.dim, AL_R);
+  hl(15, 73, 290, T.sep);
+  uint32_t nmax = 1; for (int i = 0; i < rows; i++) nmax = max(nmax, L[i].n);
+  for (int i = 0; i < rows; i++) {
+    int y = 75 + i * 15; uint32_t n = L[i].n; char b[16], lb[8];
+    if (i == cur) rr(12, y, 296, 14, 5, T.panel2, T.acc);
+    if (i == LOGN - 1) strcpy(lb, "7K+"); else snprintf(lb, sizeof lb, "%d-%dK", i, i + 1);
+    txt(F_US, lb, 18, y + 11, i == cur ? T.accL : T.text);
+    uint16_t col = n ? T.text : T.dim;
+    if (n) fmtv(b, sizeof b, L[i].sum / n, dec); else strcpy(b, "--"); txt(F_US, b, 138, y + 11, col, AL_R);
+    if (n) fmtv(b, sizeof b, L[i].mn, dec); else strcpy(b, "--"); txt(F_US, b, 200, y + 11, col, AL_R);
+    if (n) fmtv(b, sizeof b, L[i].mx, dec); else strcpy(b, "--"); txt(F_US, b, 262, y + 11, col, AL_R);
+    rr(272, y + 5, 32, 4, 1, T.dark); int w = (int)lroundf(32.0f * n / nmax); if (w >= 2) rr(272, y + 5, w, 4, 1, T.acc);
+  }
+  tabBar(1);
+}
+static void tapLog(int x, int y, bool first) {
+  if (!first) return;
+  if (tabTap(x, y, PG_LOG)) return;
+  int m = modeTap(dataModes(), 3, x, y);
+  if (m == 0) nav(PG_DATA); else if (m == 1) nav(PG_ALL);
+  else if (hit(x, y, 257, 32, 54, 20)) logClear();
 }
 
 // ---------- all PIDs ----------
@@ -2555,6 +2622,7 @@ static void drawScene() {
     case PG_SPLASH: drawSplash(); break;
     case PG_DASH: drawDash(); break;
     case PG_DATA: drawData(); break;
+    case PG_LOG: drawLog(); break;
     case PG_ALL: drawAll(); break;
     case PG_GRAPH: drawGraph(); break;
     case PG_TRIP: drawTrip(); break;
@@ -2596,6 +2664,7 @@ static void handleTouch(int x, int y, bool first) {
       return;
     case PG_DASH: tapDash(x, y, first); return;
     case PG_DATA: tapData(x, y, first); return;
+    case PG_LOG: tapLog(x, y, first); return;
     case PG_ALL: tapAll(x, y, first); return;
     case PG_GRAPH: tapGraph(x, y, first); return;
     case PG_TRIP: tapTrip(x, y, first); return;
@@ -2637,7 +2706,7 @@ void setup() {
   analogSetPinAttenuation(CRP_PIN, ADC_11db);
   linkState = demoMode ? 0 : (selAddr[0] ? 1 : 3);
   if (demoMode && !slotsCustom) autoSlots();
-  tripReset(); peaksClear(pkD);
+  tripReset(); peaksClear(pkD); logClear();
   scr = PG_SPLASH; splashAt = millis(); redraw = true; updateWants();
   xTaskCreatePinnedToCore(obdTask, "obd", 16384, nullptr, 1, nullptr, 0);   // BLE service discovery runs on this stack too
 }
@@ -2665,7 +2734,7 @@ void loop() {
   if (now - tSim >= 100) {
     float dt = (now - tSim) / 1000.0f; tSim = now;
     if (demoMode) simStep(dt); else crpV = crpV * 0.7f + readCrp() * 0.3f;
-    tripStep(dt); peaksStep(); alertsStep(); parkStep(now);
+    tripStep(dt); peaksStep(); logStep(); alertsStep(); parkStep(now);
     if (linkState != lastLs) { lastLs = linkState; if (linkState == 2 && !slotsCustom) autoSlots(); }
     if (scr == PG_SPLASH && now - splashAt > splashMs()) { if (firstRun) savePrefs(); nav(PG_DASH); }
   }
