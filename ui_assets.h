@@ -2333,6 +2333,9 @@ enum StrId : uint8_t {
   S_FUELCALD,
   S_SURE,
   S_SCROFF,
+  S_CRPLOG,
+  S_AFRLOG,
+  S_LOGMIN,
   S_COUNT
 };
 static const char* const EN[S_COUNT] = {
@@ -2535,6 +2538,9 @@ static const char* const EN[S_COUNT] = {
   "Pump L / trip L",
   "Tap again to confirm",
   "Screen off in",
+  "CRP log",
+  "AFR log",
+  "Min",
 };
 struct ThBmp { const uint8_t* d; uint8_t w; };
 static const uint8_t THS_DASH[] PROGMEM = {
@@ -5685,6 +5691,9 @@ static const ThBmp THS[S_COUNT] PROGMEM = {
   {THS_FUELCALD,124},
   {THS_SURE,99},
   {THS_SCROFF,43},
+  {nullptr,0},
+  {nullptr,0},
+  {nullptr,0},
 };
 static const uint8_t THS_H = 15, THS_BASE = 12;
 static const uint8_t THL_DASH[] PROGMEM = {
@@ -10280,6 +10289,9 @@ static const ThBmp THL[S_COUNT] PROGMEM = {
   {THL_FUELCALD,155},
   {THL_SURE,126},
   {THL_SCROFF,53},
+  {nullptr,0},
+  {nullptr,0},
+  {nullptr,0},
 };
 static const uint8_t THL_H = 19, THL_BASE = 15;
 static const uint8_t LOGO_W = 200, LOGO_H = 200;
