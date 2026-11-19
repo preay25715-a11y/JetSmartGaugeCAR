@@ -15,6 +15,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include "mbedtls/version.h"
 #include "mbedtls/sha256.h"
 #include <map>
 typedef int esp_ble_addr_type_t;
@@ -2649,8 +2650,8 @@ static void drawPark() {
 
 static bool updLeaving = false; static uint32_t updLeaveAt = 0;                  // restart requested (a short delay lets the last frame draw)
 static uint8_t updErr = 0;
-enum UpdErr : uint8_t { UE_NONE, UE_WIFI, UE_NET, UE_NOFW, UE_DL, UE_SHA, UE_BIG, UE_NOUPD, UE_NOGAUGE };
-static const StrId UE_STR[] = {S_COUNT, S_ERRWIFI, S_ERRNET, S_ERRNOFW, S_ERRDL, S_ERRSHA, S_ERRBIG, S_ERRNOUPD, S_UPDNOGAUGE};
+enum UpdErr : uint8_t { UE_NONE, UE_WIFI, UE_NET, UE_NOFW, UE_DL, UE_SHA, UE_BIG, UE_NOUPD, UE_NOGAUGE, UE_MOVING };
+static const StrId UE_STR[] = {S_COUNT, S_ERRWIFI, S_ERRNET, S_ERRNOFW, S_ERRDL, S_ERRSHA, S_ERRBIG, S_ERRNOUPD, S_UPDNOGAUGE, S_ERRMOVING};
 
 static void updNoteVersion() {                                                   // the gauge tells the updater which version is installed
   Preferences p;
@@ -2729,6 +2730,8 @@ static void tapUpd(int x, int y, bool first) {
   if (!first || updLeaving) return;
   if (hitBack(x, y)) { nav(PG_SETUP); return; }
   if (hit(x, y, 9, 160, 302, 30)) {
+    bool ok; float spd = getVal(0x0D, ok);
+    if (!demoMode && ok && spd > 3) { updErr = UE_MOVING; redraw = true; return; }       // never restart the gauge while the car is moving
     savePrefs();
     if (updBootTo(true)) { updErr = UE_NONE; updRestartSoon(); } else { updErr = UE_NOUPD; redraw = true; }
   }
