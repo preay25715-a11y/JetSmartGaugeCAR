@@ -1,8 +1,13 @@
-# เปรี้ยว จูนเนอร์ Smart Gauge v1.0.0 — ESP32 CYD + OBD-II
+# เปรี้ยว จูนเนอร์ Smart Gauge v1.0.1 — ESP32 CYD + OBD-II
 
 มาตรวัดอัจฉริยะบนจอ ESP32-2432S028R (320x240) อ่านค่าจากรถผ่านอะแดปเตอร์ OBD-II Bluetooth (KONNWEI KW90x / ELM327)
 
-## ของใหม่ในเวอร์ชันนี้ (v1.0.0)
+## ของใหม่ใน v1.0.1
+- **หน้า Dash สลับได้ 3 ค่า**: แตะที่วงกลมกลางหรือแถบล่าง จะวนเป็น **km/h → CRP volts → AFR → km/h** (แถบล่างแสดงค่าถัดไปที่จะสลับมา) เครื่องจำค่าที่เลือกไว้ตอนเปิดใหม่
+- **เอาคำว่า DEMO ออกจากหน้า Dash**: มุมซ้ายบนแสดงเลขเวอร์ชันของจอ (เช่น `v1.0.1`) แทน ส่วนการเลือกแหล่งข้อมูล DEMO / OBD BT ยังอยู่ที่ SETUP ตามเดิม
+- เครื่องที่ลง v1.0.0 อยู่แล้วอัปเดตผ่าน Wi-Fi ได้เลย (SETUP → UPDATE) ไม่ต้องแฟลชสาย USB
+
+## ของใหม่ใน v1.0.0
 - **อัปเดตเฟิร์มแวร์ผ่าน Wi-Fi** (SETUP → ปุ่ม **UPDATE**): เครื่องเช็คเวอร์ชันล่าสุดจาก GitHub Releases แล้วโหลด+ติดตั้งเอง ไม่ต้องต่อสาย USB — หน้าอัปเดตมีโลโก้ เปรี้ยว จูนเนอร์ มีแป้นพิมพ์บนจอสำหรับรหัส Wi-Fi และจำเครือข่ายไว้
 - เลขเวอร์ชันเริ่มนับที่ **v1.0.0** (แสดงที่หน้าโลโก้, SETUP → MORE และหน้า UPDATE)
 - **รองรับรถไทย 6 ยี่ห้อ**: Toyota, Honda, Isuzu, Mitsubishi, Nissan, Mazda — ตรวจยี่ห้อจากเลขตัวถัง (VIN) อัตโนมัติ, เลือกรุ่นเองได้ 62 รุ่น (SETUP → VEHICLE), รองรับโปรโตคอลทั้ง 9 แบบของ ELM327 (CAN, KWP, ISO 9141, J1850), ตรวจดีเซล/ไฮบริดเอง
@@ -26,8 +31,8 @@
 3. แฟลชที่ https://espressif.github.io/esptool-js/ → Connect → Flash Address `0x0` → เลือกไฟล์ `smart-gauge-…-full.bin` → Program
 
 ## ออกเวอร์ชันใหม่ให้ลูกค้า (สำหรับเจ้าของ)
-1. แก้เลขเวอร์ชันใน `main.cpp` บรรทัด `#define FW_VERSION "v1.0.0"` (เช่น `v1.0.1`) พร้อมแก้โค้ดที่ต้องการ แล้ว Commit
-2. GitHub → **Releases → Draft a new release** → ช่อง *Choose a tag* พิมพ์ `v1.0.1` (ต้องตรงกับ FW_VERSION เป๊ะ) → **Create new tag** → **Publish release**
+1. แก้เลขเวอร์ชันใน `main.cpp` บรรทัด `#define FW_VERSION "v1.0.1"` (เช่น `v1.0.2`) พร้อมแก้โค้ดที่ต้องการ แล้ว Commit
+2. GitHub → **Releases → Draft a new release** → ช่อง *Choose a tag* พิมพ์ `v1.0.2` (ต้องตรงกับ FW_VERSION เป๊ะ) → **Create new tag** → **Publish release**
 3. ระบบ Actions บิลด์แล้วแนบไฟล์เข้า Release ให้เอง: `firmware_cyd.bin`, `firmware_cyd_st7789.bin` (ใช้อัปเดตผ่าน Wi-Fi) และ `smart-gauge-…-full.bin` (ใช้แฟลชผ่าน USB) — รอจนขึ้นครบ (ประมาณ 5–8 นาที)
 4. ลูกค้าเปิดเครื่อง → SETUP → UPDATE ก็จะเห็น "New version available"
 - **repo ที่เก็บ Release ต้องเป็น Public** เครื่องลูกค้าไม่มี token จึงอ่าน repo ส่วนตัวไม่ได้ (ตั้งชื่อ repo/เจ้าของที่ `UPD_OWNER` / `UPD_REPO` ใน `platformio.ini`, ค่าเริ่มต้น `preay25715-a11y/JetSmartGaugeCAR`)

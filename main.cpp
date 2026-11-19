@@ -47,7 +47,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "v1.0.0"
+#define FW_VERSION "v1.0.1"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -60,7 +60,7 @@ Preferences prefs;
 static bool demoMode = true, warnOn = true, parkOn = true;
 static int shiftRpm = 6500, bright = 80, tankL = 44, fuelCal = 100;
 static bool invScreen = false;                   // panel colour polarity (runtime INVON / INVOFF)
-static bool crpMain = false;                     // dash centre shows CRP volts (true) or speed (false)
+static uint8_t dashMain = 0;                      // dash centre shows 0 speed, 1 CRP volts, 2 AFR
 static uint8_t slots[6] = {0, 1, 2, 3, 4, 5};
 static bool firstRun = true;                     // nothing saved yet (every re-flash starts here)
 static bool engineRan = false, screenOff = false;   // park screen: the engine has run since connecting / the backlight is off
@@ -1388,7 +1388,7 @@ static void loadPrefs() {
   firstRun = !prefs.isKey("inv");
   thai = prefs.getBool("thai", false); demoMode = prefs.getBool("demo", true); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true);
   shiftRpm = prefs.getInt("shift", 6500); bright = prefs.getInt("bright", 80); int th = prefs.getInt("theme", 0);
-  crpMain = prefs.getBool("crpm", false); tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100);
+  dashMain = prefs.getUChar("dmain", prefs.getBool("crpm", false) ? 1 : 0); if (dashMain > 2) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100);
 #ifdef TFT_INVERSION_ON
   invScreen = prefs.getBool("inv", true);                    // ST7789 boards normally need the inversion on
 #else
@@ -1416,7 +1416,7 @@ static void loadPrefs() {
 }
 static void savePrefs() {
   prefs.begin("gauge", false);
-  prefs.putBool("thai", thai); prefs.putBool("demo", demoMode); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putBool("crpm", crpMain);
+  prefs.putBool("thai", thai); prefs.putBool("demo", demoMode); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putUChar("dmain", dashMain);
   prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6); prefs.putBool("slc", slotsCustom);
   prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
   prefs.putBool("unitl", unitL100);
@@ -1517,8 +1517,9 @@ static void topBar(float rpm) {
   bool linkOk = linkState == 2 || demoMode;
   uint16_t dc = linkOk ? T.good : T.warn;
   discA(14, 13, 4.6f, dc, 41); discA(14, 13, 3.6f, dc, 71); disc(14, 13, 2.5f, dc);
-  StrId sid = demoMode ? S_DEMO : linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_SELDEV;
-  if (!demoMode && linkState == 2) txt(F_LM, selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
+  StrId sid = linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_SELDEV;
+  if (demoMode) txt(F_LM, FW_VERSION, 22, 16, T.dim);                  // no "DEMO" text here any more: the screen's firmware version instead
+  else if (linkState == 2) txt(F_LM, selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
   else lab(sid, LB_SM, 22, thai ? 17 : 16, T.dim);
   const char* pn = demoMode ? "" : protoName(protoNum);
   if (pn[0]) txt(F_LM, pn, 311, 16, T.dim, AL_R);
@@ -1593,33 +1594,37 @@ static void ringDraw(float rpm) {                                 // tacho: trac
     }
   }
 }
+// dash centre + bottom bar show one of three values: 0 speed, 1 CRP volts, 2 AFR (a tap on the ring or the bar steps to the next)
+static void dashOf(int m, char* t, size_t n, const char*& unit, float& frac, StrId& lid) {
+  if (m == 1) { int cv = (int)lroundf(clampf(crpV, 0, 9.99f) * 100); snprintf(t, n, "%d.%02d", cv / 100, cv % 100); unit = "V"; frac = crpV / 5; lid = S_CRPV; }
+  else if (m == 2) { bool o; float a = metricVal(M_AFR, o); if (o) fmtv(t, n, clampf(a, 0, 99.9f), 1); else strcpy(t, "--"); unit = ""; frac = o ? (a - 10) / 10 : 0; lid = S_AFR; }
+  else { float sp = gv0(0x0D); snprintf(t, n, "%d", (int)sp); unit = "km/h"; frac = sp / 200; lid = S_SPEED; }
+}
 static void drawDash() {
-  float rpm = gv0(0x0C), spd = gv0(0x0D);
+  float rpm = gv0(0x0C);
   topBar(rpm);
   for (int i = 0; i < 6; i++) dtile(i);
   ringDraw(rpm);
   char b[16]; fmtThou(b, sizeof b, (int)rpm);
   txtVU(F_NS, b, F_LS, "rpm", RCX, 76, T.accL, T.accL, AL_C);
-  int cv = (int)lroundf(clampf(crpV, 0, 9.99f) * 100); char crpS[12]; snprintf(crpS, sizeof crpS, "%d.%02d", cv / 100, cv % 100);
-  char sp[12]; snprintf(sp, sizeof sp, "%d", (int)spd);
-  if (!crpMain) { txt(F_NXL, sp, RCX, 115, T.text, AL_C); txt(F_LS, "km/h", RCX, 131, T.dim, AL_C); }
-  else { txt(F_NXM, crpS, RCX, 111, T.accL, AL_C); txt(F_LS, "CRP volts", RCX, 131, T.dim, AL_C); }
+  char ct[12], bt[12]; const char *cu, *bu; float cf, bf; StrId cl, lid;
+  dashOf(dashMain, ct, sizeof ct, cu, cf, cl); dashOf((dashMain + 1) % 3, bt, sizeof bt, bu, bf, lid);   // centre value, and the one a tap brings next
+  if (dashMain == 0) { txt(F_NXL, ct, RCX, 115, T.text, AL_C); txt(F_LS, "km/h", RCX, 131, T.dim, AL_C); }
+  else { txt(F_NXM, ct, RCX, 111, T.accL, AL_C); txt(F_LS, dashMain == 1 ? "CRP volts" : "AFR", RCX, 131, T.dim, AL_C); }
   tile(9, 168, 302, 29);
-  StrId lid = crpMain ? S_SPEED : S_CRPV; int lw = labW(lid, LB_TILE), vx = max(67, 18 + lw + 8);
+  int lw = labW(lid, LB_TILE), vx = max(67, 18 + lw + 8);
   lab(lid, LB_TILE, 18, thai ? 188 : 185, T.dim);
-  const char* vtxt; const char* vun; float frac;
-  if (!crpMain) { vtxt = crpS; vun = "V"; frac = crpV / 5; } else { vtxt = sp; vun = "km/h"; frac = spd / 200; }
-  txtVU(F_NL, vtxt, F_LS, vun, vx, 188, T.text, T.dim, AL_L);
-  int bx = max(122, vx + textW(F_NL, vtxt) + 2 + textW(F_LS, vun) + 10), bl = 302 - bx;
+  txtVU(F_NL, bt, F_LS, bu, vx, 188, T.text, T.dim, AL_L);
+  int bx = max(122, vx + textW(F_NL, bt) + 2 + textW(F_LS, bu) + 10), bl = 302 - bx;
   rr(bx, 181, bl, 3, 1, T.dark);
-  int bw = (int)lroundf(bl * clampf(frac, 0, 1)); if (bw >= 2) rr(bx, 181, bw, 3, 1, T.acc);
+  int bw = (int)lroundf(bl * clampf(bf, 0, 1)); if (bw >= 2) rr(bx, 181, bw, 3, 1, T.acc);
   tabBar(0);
 }
 static void tapDash(int x, int y, bool first) {
   if (!first) return;
   if (tabTap(x, y, PG_DASH)) return;
   for (int i = 0; i < 6; i++) if (hit(x, y, DT_X[i], DT_Y[i], 83, 38)) { slots[i] = (uint8_t)nextMetric(slots[i], i); slotsCustom = true; updateWants(); saveSoon(); return; }
-  if (hit(x, y, 94, 34, 132, 132) || hit(x, y, 9, 168, 302, 29)) { crpMain = !crpMain; saveSoon(); }
+  if (hit(x, y, 94, 34, 132, 132) || hit(x, y, 9, 168, 302, 29)) { dashMain = (uint8_t)((dashMain + 1) % 3); saveSoon(); }
 }
 
 // ---------- data grid ----------
