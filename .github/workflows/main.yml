@@ -29,8 +29,9 @@ jobs:
           gs=$(stat -c%s $G); us=$(stat -c%s $U)
           echo "gauge   $gs bytes (slot 2228224)"
           echo "updater $us bytes (slot 1900544)"
-          [ $gs -le 2228224 ] || { echo "::error::The gauge image is too big for its OTA slot"; exit 1; }
-          [ $us -le 1900544 ] || { echo "::error::The updater image is too big for its OTA slot"; exit 1; }
+          echo "::notice title=Image sizes ${{ matrix.variant }}::gauge $gs of 2228224 bytes, updater $us of 1900544 bytes"
+          [ $gs -le 2228224 ] || { echo "::error::The gauge image ($gs bytes) is too big for its OTA slot (2228224)"; exit 1; }
+          [ $us -le 1900544 ] || { echo "::error::The updater image ($us bytes) is too big for its OTA slot (1900544)"; exit 1; }
           VER=$(grep -oP '#define FW_VERSION "\K[^"]+' main.cpp)
           echo "FW_VERSION = $VER"
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "$VER" ]; then
