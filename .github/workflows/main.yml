@@ -21,21 +21,25 @@ jobs:
       - run: pip install platformio "esptool<5"
       - name: Build the gauge and the Wi-Fi updater
         run: |
-          pio run -e ${{ matrix.variant }}
-          pio run -e ${{ matrix.variant }}_upd
+          V=${{ matrix.variant }}
+          mkdir stage
+          # PlatformIO wipes .pio/build when the next env has different flags, so copy each result out straight away
+          pio run -e $V
+          cp .pio/build/$V/firmware.bin stage/gauge.bin
+          cp .pio/build/$V/bootloader.bin .pio/build/$V/partitions.bin stage/
+          pio run -e ${V}_upd
+          cp .pio/build/${V}_upd/firmware.bin stage/updater.bin
       - name: Check sizes and version
         shell: bash {0}
         run: |
           V=${{ matrix.variant }}
-          G=.pio/build/$V/firmware.bin
-          U=.pio/build/${V}_upd/firmware.bin
-          echo "::notice title=Files $V::$(ls -l .pio/build/*/firmware.bin 2>&1 | tr '\n' ';')"
-          gs=$(stat -c%s "$G" 2>/dev/null || echo 0)
-          us=$(stat -c%s "$U" 2>/dev/null || echo 0)
+          echo "::notice title=Files $V::$(ls -l stage 2>&1 | tr '\n' ';')"
+          gs=$(stat -c%s stage/gauge.bin 2>/dev/null || echo 0)
+          us=$(stat -c%s stage/updater.bin 2>/dev/null || echo 0)
           echo "::notice title=Image sizes $V::gauge $gs of 2228224 bytes, updater $us of 1900544 bytes"
           fail=0
-          [ "$gs" -gt 0 ] || { echo "::error::gauge firmware.bin was not built"; fail=1; }
-          [ "$us" -gt 0 ] || { echo "::error::updater firmware.bin was not built"; fail=1; }
+          [ "$gs" -gt 0 ] || { echo "::error::gauge image was not built"; fail=1; }
+          [ "$us" -gt 0 ] || { echo "::error::updater image was not built"; fail=1; }
           [ "$gs" -le 2228224 ] || { echo "::error::The gauge image ($gs bytes) is too big for its OTA slot (2228224)"; fail=1; }
           [ "$us" -le 1900544 ] || { echo "::error::The updater image ($us bytes) is too big for its OTA slot (1900544)"; fail=1; }
           VER=$(grep -oP '#define FW_VERSION "\K[^"]+' main.cpp)
@@ -47,13 +51,12 @@ jobs:
       - name: Make the release files
         run: |
           V=${{ matrix.variant }}
-          B=.pio/build/$V
           BOOT=$(find ~/.platformio -name boot_app0.bin | head -1)
           mkdir out
-          cp $B/firmware.bin out/firmware_$V.bin
+          cp stage/gauge.bin out/firmware_$V.bin
           python -m esptool --chip esp32 merge_bin -o out/smart-gauge-$V-full.bin \
             --flash_mode dio --flash_freq 40m --flash_size 4MB \
-            0x1000 $B/bootloader.bin 0x8000 $B/partitions.bin 0xe000 $BOOT 0x10000 $B/firmware.bin 0x230000 .pio/build/${V}_upd/firmware.bin
+            0x1000 stage/bootloader.bin 0x8000 stage/partitions.bin 0xe000 $BOOT 0x10000 stage/gauge.bin 0x230000 stage/updater.bin
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.variant }}
