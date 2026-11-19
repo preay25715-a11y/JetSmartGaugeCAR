@@ -10,6 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         variant: [cyd, cyd_st7789]
     steps:
@@ -23,20 +24,26 @@ jobs:
           pio run -e ${{ matrix.variant }}
           pio run -e ${{ matrix.variant }}_upd
       - name: Check sizes and version
+        shell: bash {0}
         run: |
-          G=.pio/build/${{ matrix.variant }}/firmware.bin
-          U=.pio/build/${{ matrix.variant }}_upd/firmware.bin
-          gs=$(stat -c%s $G); us=$(stat -c%s $U)
-          echo "gauge   $gs bytes (slot 2228224)"
-          echo "updater $us bytes (slot 1900544)"
-          echo "::notice title=Image sizes ${{ matrix.variant }}::gauge $gs of 2228224 bytes, updater $us of 1900544 bytes"
-          [ $gs -le 2228224 ] || { echo "::error::The gauge image ($gs bytes) is too big for its OTA slot (2228224)"; exit 1; }
-          [ $us -le 1900544 ] || { echo "::error::The updater image ($us bytes) is too big for its OTA slot (1900544)"; exit 1; }
+          V=${{ matrix.variant }}
+          G=.pio/build/$V/firmware.bin
+          U=.pio/build/${V}_upd/firmware.bin
+          echo "::notice title=Files $V::$(ls -l .pio/build/*/firmware.bin 2>&1 | tr '\n' ';')"
+          gs=$(stat -c%s "$G" 2>/dev/null || echo 0)
+          us=$(stat -c%s "$U" 2>/dev/null || echo 0)
+          echo "::notice title=Image sizes $V::gauge $gs of 2228224 bytes, updater $us of 1900544 bytes"
+          fail=0
+          [ "$gs" -gt 0 ] || { echo "::error::gauge firmware.bin was not built"; fail=1; }
+          [ "$us" -gt 0 ] || { echo "::error::updater firmware.bin was not built"; fail=1; }
+          [ "$gs" -le 2228224 ] || { echo "::error::The gauge image ($gs bytes) is too big for its OTA slot (2228224)"; fail=1; }
+          [ "$us" -le 1900544 ] || { echo "::error::The updater image ($us bytes) is too big for its OTA slot (1900544)"; fail=1; }
           VER=$(grep -oP '#define FW_VERSION "\K[^"]+' main.cpp)
           echo "FW_VERSION = $VER"
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "$VER" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match FW_VERSION $VER in main.cpp"; exit 1
+            echo "::error::Tag $GITHUB_REF_NAME does not match FW_VERSION $VER in main.cpp"; fail=1
           fi
+          exit $fail
       - name: Make the release files
         run: |
           V=${{ matrix.variant }}
