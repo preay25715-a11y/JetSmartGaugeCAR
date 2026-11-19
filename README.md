@@ -32,7 +32,9 @@
 
 ## ออกเวอร์ชันใหม่ให้ลูกค้า (สำหรับเจ้าของ)
 1. แก้เลขเวอร์ชันใน `main.cpp` บรรทัด `#define FW_VERSION "v1.0.1"` (เช่น `v1.0.2`) พร้อมแก้โค้ดที่ต้องการ แล้ว Commit
-2. GitHub → **Releases → Draft a new release** → ช่อง *Choose a tag* พิมพ์ `v1.0.2` (ต้องตรงกับ FW_VERSION เป๊ะ) → **Create new tag** → **Publish release**
+2. ออก Release ได้ 2 วิธี (เลือกอย่างใดอย่างหนึ่ง):
+   - ใส่คำว่า `[release]` ในข้อความ commit บน main → Actions บิลด์แล้วสร้างแท็กและ Release ให้เองตามเลขใน FW_VERSION (ถ้าบิลด์ไม่ผ่านจะไม่ออก Release)
+   - หรือ GitHub → **Releases → Draft a new release** → ช่อง *Choose a tag* พิมพ์ `v1.0.2` (ต้องตรงกับ FW_VERSION เป๊ะ) → **Create new tag** → **Publish release**
 3. ระบบ Actions บิลด์แล้วแนบไฟล์เข้า Release ให้เอง: `firmware_cyd.bin`, `firmware_cyd_st7789.bin` (ใช้อัปเดตผ่าน Wi-Fi) และ `smart-gauge-…-full.bin` (ใช้แฟลชผ่าน USB) — รอจนขึ้นครบ (ประมาณ 5–8 นาที)
 4. ลูกค้าเปิดเครื่อง → SETUP → UPDATE ก็จะเห็น "New version available"
 - **repo ที่เก็บ Release ต้องเป็น Public** เครื่องลูกค้าไม่มี token จึงอ่าน repo ส่วนตัวไม่ได้ (ตั้งชื่อ repo/เจ้าของที่ `UPD_OWNER` / `UPD_REPO` ใน `platformio.ini`, ค่าเริ่มต้น `preay25715-a11y/JetSmartGaugeCAR`)

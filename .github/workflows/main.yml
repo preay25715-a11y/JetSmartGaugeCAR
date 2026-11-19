@@ -62,10 +62,14 @@ jobs:
           name: bin-${{ matrix.variant }}
           path: out/*
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Runs for a pushed v* tag, or for a push to main whose commit message contains [release]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release]'))
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Read FW_VERSION
+        run: echo "VER=$(grep -oP '#define FW_VERSION "\K[^"]+' main.cpp)" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           pattern: bin-*
@@ -73,5 +77,8 @@ jobs:
           path: out
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VER }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ env.VER }}
           files: out/*
           generate_release_notes: true
