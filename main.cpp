@@ -47,7 +47,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "v1.0.1"
+#define FW_VERSION "v1.0.2"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -57,7 +57,8 @@ Preferences prefs;
 
 
 // ---------- settings ----------
-static bool demoMode = true, warnOn = true, parkOn = true;
+static const bool demoMode = false;               // the built-in demo was removed in v1.0.2; the constant keeps the old branches compiled out
+static bool warnOn = true, parkOn = true;
 static int shiftRpm = 6500, bright = 80, tankL = 44, fuelCal = 100;
 static bool invScreen = false;                   // panel colour polarity (runtime INVON / INVOFF)
 static uint8_t dashMain = 0;                      // dash centre shows 0 speed, 1 CRP volts, 2 AFR
@@ -67,9 +68,10 @@ static bool engineRan = false, screenOff = false;   // park screen: the engine h
 static uint32_t rpmZeroAt = 0;
 
 // ---------- vehicles (Thai market) ----------
-enum { VF_D = 1, VF_H = 2, VF_T = 4 };           // diesel, hybrid, turbo
+enum { VF_D = 1, VF_H = 2, VF_T = 4, VF_M = 8 };    // diesel, hybrid, turbo, motorcycle
 struct Model { uint8_t brand; const char* name; uint8_t flags; uint8_t tank; uint16_t cc; uint8_t redline; };   // redline in 100 rpm
-static const char* const BRANDS[6] = {"TOYOTA", "HONDA", "ISUZU", "MITSUBISHI", "NISSAN", "MAZDA"};
+static const char* const BRANDS[7] = {"TOYOTA", "HONDA", "ISUZU", "MITSUBISHI", "NISSAN", "MAZDA", "HONDA BIKE"};
+static const int NBRAND = 7;
 static const Model MODELS[] = {
   {0, "VIOS", 0, 42, 1496, 66}, {0, "YARIS", 0, 42, 1197, 66}, {0, "YARIS ATIV", 0, 42, 1197, 66}, {0, "ALTIS", 0, 55, 1798, 66},
   {0, "ALTIS HYBRID", VF_H, 43, 1798, 60}, {0, "CAMRY", 0, 60, 2494, 66}, {0, "CAMRY HYBRID", VF_H, 50, 2487, 60}, {0, "COROLLA CROSS", 0, 47, 1798, 66},
@@ -88,6 +90,52 @@ static const Model MODELS[] = {
   {5, "MAZDA 2", 0, 44, 1496, 66}, {5, "MAZDA 2 DIESEL", VF_D | VF_T, 44, 1498, 52}, {5, "MAZDA 3", 0, 51, 1998, 66}, {5, "CX-3", 0, 48, 1998, 66},
   {5, "CX-30", 0, 51, 1998, 66}, {5, "CX-5", 0, 56, 1998, 66}, {5, "CX-5 DIESEL", VF_D | VF_T, 58, 2191, 52}, {5, "CX-8", VF_D | VF_T, 74, 2191, 52},
   {5, "MAZDA 6", 0, 62, 1998, 66}, {5, "BT-50 1.9", VF_D | VF_T, 80, 1898, 48}, {5, "BT-50 3.2", VF_D | VF_T, 80, 3198, 46}, {5, "MX-5", 0, 45, 1998, 72},
+  {6, "WAVE 110", VF_M, 4, 109, 90},
+  {6, "WAVE 110i", VF_M, 4, 109, 90},
+  {6, "WAVE 125i", VF_M, 4, 125, 90},
+  {6, "SUPER CUB", VF_M, 4, 109, 90},
+  {6, "C125", VF_M, 4, 125, 90},
+  {6, "SCOOPY i", VF_M, 4, 110, 90},
+  {6, "LEAD 125", VF_M, 6, 125, 90},
+  {6, "CLICK 125", VF_M, 5, 125, 90},
+  {6, "CLICK 160", VF_M, 6, 157, 95},
+  {6, "GIORNO+", VF_M, 5, 125, 90},
+  {6, "PCX 160", VF_M, 8, 157, 95},
+  {6, "ADV 160", VF_M, 8, 157, 95},
+  {6, "ADV 350", VF_M, 12, 330, 85},
+  {6, "FORZA 350", VF_M, 12, 330, 85},
+  {6, "GROM", VF_M, 6, 125, 95},
+  {6, "MONKEY", VF_M, 6, 125, 95},
+  {6, "CB150R", VF_M, 12, 149, 110},
+  {6, "CBR150R", VF_M, 12, 149, 115},
+  {6, "CBR250RR", VF_M, 15, 249, 140},
+  {6, "CB300R", VF_M, 10, 286, 105},
+  {6, "CBR300R", VF_M, 13, 286, 105},
+  {6, "CB500X", VF_M, 18, 471, 95},
+  {6, "CBR500R", VF_M, 17, 471, 95},
+  {6, "NX500", VF_M, 18, 471, 95},
+  {6, "CB650R", VF_M, 15, 649, 120},
+  {6, "CBR650R", VF_M, 15, 649, 120},
+  {6, "CBR600RR", VF_M, 18, 599, 150},
+  {6, "CBR1000RR-R", VF_M, 16, 999, 150},
+  {6, "CB1000R", VF_M, 16, 998, 115},
+  {6, "CB1100RS", VF_M, 17, 1140, 85},
+  {6, "CB1300 SUPER 4", VF_M, 21, 1284, 90},
+  {6, "CB1300 BOL D'OR", VF_M, 21, 1284, 90},
+  {6, "CT125", VF_M, 5, 125, 90},
+  {6, "CRF300L", VF_M, 8, 286, 95},
+  {6, "CRF300 RALLY", VF_M, 13, 286, 95},
+  {6, "CRF450RL", VF_M, 8, 449, 95},
+  {6, "NC750X", VF_M, 14, 745, 70},
+  {6, "X-ADV 750", VF_M, 13, 745, 70},
+  {6, "AFRICA TWIN", VF_M, 19, 1084, 75},
+  {6, "AFRICA TWIN AS", VF_M, 25, 1084, 75},
+  {6, "REBEL 300", VF_M, 11, 286, 105},
+  {6, "REBEL 500", VF_M, 11, 471, 85},
+  {6, "REBEL 1100", VF_M, 12, 1084, 75},
+  {6, "GB350C", VF_M, 15, 348, 65},
+  {6, "NT1100", VF_M, 20, 1084, 75},
+  {6, "GOLD WING", VF_M, 21, 1833, 65},
 };
 static const int NMODEL = sizeof(MODELS) / sizeof(MODELS[0]);
 static int vehModel = -1;                        // chosen model (index into MODELS) or -1 = automatic (VIN)
@@ -97,7 +145,7 @@ struct Wmi { const char* w; uint8_t brand; };
 static const char* const OTHER[] = {"FORD", "SUZUKI", "MG", "CHEVROLET", "SUBARU", "BMW", "HINO", "GWM", "BENZ", "VOLVO", "KIA", "HYUNDAI"};
 static const Wmi WMIS[] = {
   {"MR0", 0}, {"MR1", 0}, {"MR2", 0}, {"JT", 0}, {"4T1", 0}, {"2T1", 0}, {"5TD", 0}, {"MHF", 0}, {"SB1", 0},
-  {"MRH", 1}, {"JHM", 1}, {"JH1", 1}, {"1HG", 1}, {"2HG", 1}, {"19X", 1}, {"SHH", 1}, {"MHR", 1}, {"LHG", 1},
+  {"MLH", 6}, {"MRH", 1}, {"JHM", 1}, {"JH1", 1}, {"1HG", 1}, {"2HG", 1}, {"19X", 1}, {"SHH", 1}, {"MHR", 1}, {"LHG", 1},
   {"MPA", 2}, {"MP1", 2}, {"JAA", 2}, {"JAB", 2}, {"JAL", 2}, {"JAC", 2},
   {"MMA", 3}, {"MMB", 3}, {"MMC", 3}, {"MMD", 3}, {"MMT", 3}, {"ML3", 3}, {"JA3", 3}, {"JA4", 3}, {"JA7", 3}, {"JMB", 3}, {"JMY", 3}, {"JMA", 3},
   {"MNT", 4}, {"MDH", 4}, {"JN1", 4}, {"JN6", 4}, {"JN8", 4}, {"SJN", 4}, {"3N1", 4}, {"1N4", 4},
@@ -110,7 +158,7 @@ static int brandFromVin(const char* vin) {
   for (const Wmi& w : WMIS) { if (!strncmp(vin, w.w, strlen(w.w))) return w.brand; }
   return -1;
 }
-static const char* brandName(int b) { return b >= 0 && b < 6 ? BRANDS[b] : (b >= 100 && b - 100 < (int)(sizeof(OTHER) / sizeof(OTHER[0])) ? OTHER[b - 100] : ""); }
+static const char* brandName(int b) { return b >= 0 && b < 7 ? BRANDS[b] : (b >= 100 && b - 100 < (int)(sizeof(OTHER) / sizeof(OTHER[0])) ? OTHER[b - 100] : ""); }
 // model name from the VIN where the code is known (Mazda Thailand: characters 4-5)
 static const char* modelFromVin(int brand, const char* vin) {
   if (brand != 5 || strlen(vin) < 11) return "";
@@ -762,32 +810,7 @@ void obdTask(void*) {
   }
 }
 
-// ---------- demo simulation (a petrol hatchback) ----------
-static float simT = 0, crpV = 0;
-static void simStep(float dt) {
-  simT += dt;
-  float ph = sinf(simT / 4) * .5f + .5f, spd = roundf(ph * 110);
-  int g = spd < 15 ? 1 : spd < 35 ? 2 : spd < 55 ? 3 : spd < 80 ? 4 : 5;
-  static const float K[6] = {0, 90, 55, 40, 32, 27};
-  float rpm = fmaxf(850, spd * K[g]) + 700 * fabsf(sinf(simT * 1.3f)), q = spd / 110, w = fminf(1, simT / 60);
-  for (int i = 0; i < NPID; i++) {
-    const Pid& p = PIDS[i]; float f;
-    switch (p.drv) {
-      case 'l': f = q * .8f + .1f * fabsf(sinf(simT)); break;
-      case 's': f = q; break;
-      case 'r': f = fminf(rpm / 7000, 1); break;
-      case 't': f = w; break;
-      case 'o': f = .5f + .5f * sinf(simT * 3 + p.id); break;
-      case 'k': f = simT / 3600; break;
-      default: f = .5f;
-    }
-    pv[p.id] = p.mn + (p.mx - p.mn) * f; page[p.id] = millis(); psup[p.id] = true;
-  }
-  pv[0x0C] = rpm; pv[0x0D] = spd; pv[0x44] = 1.0f + 0.03f * sinf(simT * 3); pv[0x24] = pv[0x44]; pv[0x5C] = 35 + 57 * w;
-  pv[0x51] = 1; psup[0x5B] = false; psup[0x78] = false; psup[0x59] = false;
-  pv[0x42] = 13.9f + 0.4f * sinf(simT * 0.7f);
-  crpV = fmaxf(0, .8f + fminf(rpm / 7000, 1) * 3.6f + sinf(simT * 40) * .15f);
-}
+static float crpV = 0;                                // CRP signal volts (GPIO35 through the divider)
 static float readCrp() {
   uint32_t s = 0;
   for (int i = 0; i < 32; i++) s += analogReadMilliVolts(CRP_PIN);
@@ -1178,9 +1201,12 @@ static void presentBand(int b) {                              // push the band u
 }
 static void invalidatePanel() { for (int i = 0; i < NBAND; i++) bandHashOk[i] = false; }
 
-static bool vehDiesel() { if (ecuDieselKnown && !demoMode) return ecuDiesel; return vehModel >= 0 && (MODELS[vehModel].flags & VF_D); }
+static bool vehDiesel() { if (ecuDieselKnown) return ecuDiesel; return vehModel >= 0 && (MODELS[vehModel].flags & VF_D); }
+static bool vehFromEcu() { return ecuDieselKnown; }           // true when petrol / diesel was read from the car itself
 static bool vehHybrid() { return (ecuHybrid && !demoMode) || (vehModel >= 0 && (MODELS[vehModel].flags & VF_H)); }
-static int ringMaxK() { return vehDiesel() ? 6 : 8; }          // tacho scale in 1000 rpm
+static bool vehBike() { return vehModel >= 0 && (MODELS[vehModel].flags & VF_M); }
+static int ringMaxK() { if (vehBike()) return constrain((MODELS[vehModel].redline + 9) / 10, 6, 16); return vehDiesel() ? 6 : 8; }          // tacho scale in 1000 rpm
+static int shiftMax() { return vehBike() ? 16000 : 9000; }
 static int vehCc() { return vehModel >= 0 ? MODELS[vehModel].cc : 1500; }
 
 enum { M_AFR = 256, M_BOOST, M_FUELRATE, M_LAMBDA, M_CRP };
@@ -1386,7 +1412,7 @@ static void graphSample() {
 static void loadPrefs() {
   prefs.begin("gauge", true);
   firstRun = !prefs.isKey("inv");
-  thai = prefs.getBool("thai", false); demoMode = prefs.getBool("demo", true); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true);
+  thai = prefs.getBool("thai", false); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true);
   shiftRpm = prefs.getInt("shift", 6500); bright = prefs.getInt("bright", 80); int th = prefs.getInt("theme", 0);
   dashMain = prefs.getUChar("dmain", prefs.getBool("crpm", false) ? 1 : 0); if (dashMain > 2) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100);
 #ifdef TFT_INVERSION_ON
@@ -1416,7 +1442,7 @@ static void loadPrefs() {
 }
 static void savePrefs() {
   prefs.begin("gauge", false);
-  prefs.putBool("thai", thai); prefs.putBool("demo", demoMode); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putUChar("dmain", dashMain);
+  prefs.putBool("thai", thai); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putUChar("dmain", dashMain);
   prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6); prefs.putBool("slc", slotsCustom);
   prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
   prefs.putBool("unitl", unitL100);
@@ -1470,7 +1496,7 @@ static const char* protoName(int p) {
 static void carName(char* d, size_t n) {
   d[0] = 0;
   if (vehModel >= 0) {
-    const Model& m = MODELS[vehModel]; const char* br = BRANDS[m.brand];
+    const Model& m = MODELS[vehModel]; const char* br = m.brand == 6 ? "HONDA" : BRANDS[m.brand];     // the bike tile is named HONDA BIKE, the car name just HONDA
     if (!strncmp(m.name, br, strlen(br))) snprintf(d, n, "%s", m.name); else snprintf(d, n, "%s %s", br, m.name);
   } else if (demoMode) snprintf(d, n, "MAZDA 2");
   else snprintf(d, n, "%s", carBuf);
@@ -1514,15 +1540,15 @@ static void shiftStrip(float rpm) {
   }
 }
 static void topBar(float rpm) {
-  bool linkOk = linkState == 2 || demoMode;
+  bool linkOk = linkState == 2;
   uint16_t dc = linkOk ? T.good : T.warn;
   discA(14, 13, 4.6f, dc, 41); discA(14, 13, 3.6f, dc, 71); disc(14, 13, 2.5f, dc);
   StrId sid = linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_SELDEV;
-  if (demoMode) txt(F_LM, FW_VERSION, 22, 16, T.dim);                  // no "DEMO" text here any more: the screen's firmware version instead
-  else if (linkState == 2) txt(F_LM, selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
+  if (linkState == 2) txt(F_LM, selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
   else lab(sid, LB_SM, 22, thai ? 17 : 16, T.dim);
-  const char* pn = demoMode ? "" : protoName(protoNum);
+  const char* pn = linkState == 2 ? protoName(protoNum) : "";
   if (pn[0]) txt(F_LM, pn, 311, 16, T.dim, AL_R);
+  else if (linkState != 2) txt(F_LM, FW_VERSION, 311, 16, T.dim, AL_R);         // the screen's firmware version while there is no link
   char nm[32]; carName(nm, sizeof nm);
   if (nm[0]) { char t[32]; if (textW(F_UM, nm) > 150) fitText(t, sizeof t, nm, F_UM, 150); else strcpy(t, nm); txt(F_UM, t, 160, 16, T.accL, AL_C); }
   else if (!demoMode && linkState == 2) lab(S_UNKNOWN, LB_BTNM, 160, thai ? 17 : 16, T.dim, AL_C);
@@ -1628,10 +1654,14 @@ static void tapDash(int x, int y, bool first) {
 }
 
 // ---------- data grid ----------
-static ModeChip DATA_MODES[3] = {{S_MAIN, 9, 46}, {S_ALLPID, 59, 60}, {S_CRPLOG, 123, 66}};
-static ModeChip* dataModes() { DATA_MODES[2].id = vehDiesel() ? S_CRPLOG : S_AFRLOG; return DATA_MODES; }
+static const ModeChip DATA_MODES[4] = {{S_MAIN, 9, 44}, {S_ALLPID, 57, 58}, {S_CRPLOG, 119, 64}, {S_AFRLOG, 187, 64}};
+static void fuelTag() {                                         // Petrol / Diesel / Hybrid: green = read from the car (ECU), grey = from the chosen model until the car has answered
+  StrId id = vehDiesel() ? S_FUELD : vehHybrid() ? S_FUELH : S_FUELP;
+  lab(id, LB_TILE, 311, thai ? 48 : 46, vehFromEcu() ? T.good : T.dim, AL_R);
+}
+static uint8_t logKind = 0;                                     // log page: 0 = CRP volts, 1 = AFR
 static void drawData() {
-  topBar(gv0(0x0C)); modeChips(dataModes(), 3, 0);
+  topBar(gv0(0x0C)); modeChips(DATA_MODES, 4, 0); fuelTag();
   for (int i = 0; i < 16; i++) {
     DTile t; dtileOf(i, t); int x = GX[i & 3], y = GY[i >> 2];
     tile(x, y, 71, 33);
@@ -1645,28 +1675,30 @@ static void drawData() {
 static void tapData(int x, int y, bool first) {
   if (!first) return;
   if (tabTap(x, y, PG_DATA)) return;
-  int m = modeTap(dataModes(), 3, x, y);
-  if (m == 1) nav(PG_ALL); else if (m == 2) nav(PG_LOG);
+  int m = modeTap(DATA_MODES, 4, x, y);
+  if (m == 1) nav(PG_ALL); else if (m == 2 || m == 3) { logKind = (uint8_t)(m - 2); nav(PG_LOG); }
 }
 
 // ---------- data log: CRP volts (diesel) or AFR (petrol) for each 1000 rpm band ----------
 static const int LOGN = 8;
 struct LogBin { uint32_t n; float sum, mn, mx; };
-static LogBin logB[2][LOGN];
+static LogBin logB[2][LOGN];                                    // [0] CRP volts, [1] AFR
+static int logW() { return vehBike() ? 2000 : 1000; }           // rpm per row (bikes rev higher)
+static int logBin(float rpm) { return min(LOGN - 1, (int)(rpm / logW())); }
 static const int TBN = 7, TBV[TBN] = {0, 5, 10, 20, 35, 50, 75};            // AFR map: throttle rows x 1000 rpm columns
 static uint32_t amN[TBN][LOGN]; static float amSum[TBN][LOGN];
 static int tpsRow(float t) { int r = 0; for (int i = 0; i < TBN; i++) if (t >= TBV[i]) r = i; return r; }
 static void logClear() { memset(amN, 0, sizeof amN); memset(amSum, 0, sizeof amSum); for (auto& s : logB) for (auto& b : s) { b.n = 0; b.sum = 0; b.mn = 1e9f; b.mx = -1e9f; } }
 static void logStep() {
   bool ok; float rpm = getVal(0x0C, ok); if (!ok || rpm < 400) return;
-  int b = min(LOGN - 1, (int)(rpm / 1000));
+  int b = logBin(rpm);
   { bool o1, o2; float t = getVal(0x11, o1), a = metricVal(M_AFR, o2); if (o1 && o2) { int r = tpsRow(t); amN[r][b]++; amSum[r][b] += a; } }
   for (int k = 0; k < 2; k++) { bool o; float v = metricVal(k ? M_AFR : M_CRP, o); if (!o) continue; LogBin& L = logB[k][b]; L.n++; L.sum += v; L.mn = fminf(L.mn, v); L.mx = fmaxf(L.mx, v); }
 }
 static void afrMap(bool rok, float rpm) {                         // petrol: average AFR for each throttle row and 1000 rpm column
   tile(9, 56, 302, 141);
   bool ot, oa; float tps = getVal(0x11, ot), afr = metricVal(M_AFR, oa);
-  int cc = rok && rpm >= 400 ? min(LOGN - 1, (int)(rpm / 1000)) : -1, cr = ot ? tpsRow(tps) : -1; char b[40];
+  int cc = rok && rpm >= 400 ? logBin(rpm) : -1, cr = ot ? tpsRow(tps) : -1; char b[40];
   if (rok) { char t[12]; fmtThou(t, sizeof t, (int)rpm); snprintf(b, sizeof b, "%s rpm   TPS ", t); } else strcpy(b, "-- rpm   TPS ");
   { char t[8]; if (ot) snprintf(t, sizeof t, "%d%%", (int)lroundf(tps)); else strcpy(t, "--"); strcat(b, t); }
   txt(F_US, b, 18, 70, T.text);
@@ -1682,13 +1714,13 @@ static void afrMap(bool rok, float rpm) {                         // petrol: ave
       if (cur) disc(x + 3, y + 3, 1.6f, T.good);
     }
   }
-  for (int c = 0; c < LOGN; c++) { snprintf(b, sizeof b, "%dK", c); txt(F_LS, b, 38 + c * 33 + 16, 183, T.dim, AL_C); }
+  for (int c = 0; c < LOGN; c++) { snprintf(b, sizeof b, "%dK", c * logW() / 1000); txt(F_LS, b, 38 + c * 33 + 16, 183, T.dim, AL_C); }
 }
 static void drawLog() {
-  bool dsl = vehDiesel(); const LogBin* L = logB[dsl ? 0 : 1]; int rows = dsl ? 6 : 8, dec = dsl ? 2 : 1; bool ok; float rpm = getVal(0x0C, ok);
-  int cur = ok && rpm >= 400 ? min(LOGN - 1, (int)(rpm / 1000)) : -1;
-  topBar(ok ? rpm : 0); modeChips(dataModes(), 3, 2); chipId(S_RESET, 257, 32, 54, 20, false);
-  if (!dsl) { afrMap(ok, rpm); tabBar(1); return; }
+  bool dsl = vehDiesel(); int k = logKind; const LogBin* L = logB[k]; int rows = dsl && !vehBike() ? 6 : 8, dec = k == 0 ? 2 : 1; bool ok; float rpm = getVal(0x0C, ok);
+  int cur = ok && rpm >= 400 ? logBin(rpm) : -1;
+  topBar(ok ? rpm : 0); modeChips(DATA_MODES, 4, 2 + k); chipId(S_RESET, 255, 32, 56, 20, false);
+  if (k == 1 && !dsl) { afrMap(ok, rpm); tabBar(1); return; }        // petrol AFR: map of throttle rows x rpm columns; diesel AFR and every CRP log: table per rpm row
   tile(9, 56, 302, 141);
   lab(S_RPM, LB_TILE, 18, tby(68), T.dim); lab(S_AVG, LB_TILE, 138, tby(68), T.dim, AL_R); lab(S_LOGMIN, LB_TILE, 200, tby(68), T.dim, AL_R); lab(S_GMAX, LB_TILE, 262, tby(68), T.dim, AL_R);
   hl(15, 73, 290, T.sep);
@@ -1696,7 +1728,7 @@ static void drawLog() {
   for (int i = 0; i < rows; i++) {
     int y = 75 + i * 15; uint32_t n = L[i].n; char b[16], lb[8];
     if (i == cur) rr(12, y, 296, 14, 5, T.panel2, T.acc);
-    if (i == LOGN - 1) strcpy(lb, "7K+"); else snprintf(lb, sizeof lb, "%d-%dK", i, i + 1);
+    if (i == LOGN - 1) snprintf(lb, sizeof lb, "%dK+", i * logW() / 1000); else snprintf(lb, sizeof lb, "%d-%dK", i * logW() / 1000, (i + 1) * logW() / 1000);
     txt(F_US, lb, 18, y + 11, i == cur ? T.accL : T.text);
     uint16_t col = n ? T.text : T.dim;
     if (n) fmtv(b, sizeof b, L[i].sum / n, dec); else strcpy(b, "--"); txt(F_US, b, 138, y + 11, col, AL_R);
@@ -1709,9 +1741,10 @@ static void drawLog() {
 static void tapLog(int x, int y, bool first) {
   if (!first) return;
   if (tabTap(x, y, PG_LOG)) return;
-  int m = modeTap(dataModes(), 3, x, y);
+  int m = modeTap(DATA_MODES, 4, x, y);
   if (m == 0) nav(PG_DATA); else if (m == 1) nav(PG_ALL);
-  else if (hit(x, y, 257, 32, 54, 20)) logClear();
+  else if (m == 2 || m == 3) logKind = (uint8_t)(m - 2);
+  else if (hit(x, y, 255, 32, 56, 20)) logClear();
 }
 
 // ---------- all PIDs ----------
@@ -2263,10 +2296,11 @@ static void tapCodes(int x, int y, bool first) {
 }
 
 // ---------- setup ----------
-static const int SU_Y0 = 64, SU_H = 28;
+static const int SU_Y0 = 64, SU_H = 36, SU_N = 3;
 static void rowLabel(int y, int h, StrId mainL, StrId sub, bool hasSub) {
   hl(9, y + h - 1, 302, T.sep);
-  if (hasSub) { lab(mainL, LB_ROW, 14, y + 11, T.text); lab(sub, LB_TILE, 14, y + h - (thai ? 3 : 5), T.dim); }
+  int o = (h - 28) / 2;                                              // rows taller than 28 px keep their text centred
+  if (hasSub) { lab(mainL, LB_ROW, 14, y + 11 + o, T.text); lab(sub, LB_TILE, 14, y + h - (thai ? 3 : 5) - o, T.dim); }
   else lab(mainL, LB_ROW, 14, y + (h >> 1) + (thai ? 5 : 4), T.text);
 }
 static void stepBtns(int y, int h, const char* val, const char* unit) {
@@ -2276,10 +2310,9 @@ static void stepBtns(int y, int h, const char* val, const char* unit) {
 static void setupRow(int i) {
   int y = SU_Y0 + i * SU_H; char b[16];
   switch (i) {
-    case 0: rowLabel(y, SU_H, S_SRC, S_COUNT, false); chipId(S_DEMO, 164, y + 4, 70, SU_H - 9, demoMode); chipS("OBD BT", 238, y + 4, 73, SU_H - 9, !demoMode); break;
-    case 1: rowLabel(y, SU_H, S_LANG, S_COUNT, false); chipS("EN", 164, y + 4, 70, SU_H - 9, !thai); chipId(S_THAI, 238, y + 4, 73, SU_H - 9, thai); break;
-    case 2: rowLabel(y, SU_H, S_SHIFT, S_SHIFTD, true); fmtThou(b, sizeof b, shiftRpm); stepBtns(y, SU_H, b, ""); break;
-    case 3: rowLabel(y, SU_H, S_COLORS, S_COLTIP, true); chipId(S_STD, 164, y + 4, 70, SU_H - 9, !invScreen); chipId(S_INV, 238, y + 4, 73, SU_H - 9, invScreen); break;
+    case 0: rowLabel(y, SU_H, S_LANG, S_COUNT, false); chipS("EN", 164, y + 4, 70, SU_H - 9, !thai); chipId(S_THAI, 238, y + 4, 73, SU_H - 9, thai); break;
+    case 1: rowLabel(y, SU_H, S_SHIFT, S_SHIFTD, true); fmtThou(b, sizeof b, shiftRpm); stepBtns(y, SU_H, b, ""); break;
+    case 2: rowLabel(y, SU_H, S_COLORS, S_COLTIP, true); chipId(S_STD, 164, y + 4, 70, SU_H - 9, !invScreen); chipId(S_INV, 238, y + 4, 73, SU_H - 9, invScreen); break;
   }
 }
 static void themeCard(int i) {
@@ -2293,24 +2326,15 @@ static void themeCard(int i) {
 static void drawSetup() {
   topBar(gv0(0x0C));
   themeCard(0); themeCard(1);
-  for (int i = 0; i < 4; i++) setupRow(i);
+  for (int i = 0; i < SU_N; i++) setupRow(i);
   chipId(S_BTNAME, 9, 177, 71, 20, false); chipId(S_VEHICLE, 86, 177, 71, 20, false); chipId(S_MORE, 163, 177, 71, 20, false); chipId(S_UPDTITLE, 240, 177, 71, 20, false);
   tabBar(5);
 }
 static void applyVehicle(int idx) {                 // idx = -1: automatic (from the VIN)
   vehModel = idx;
   if (idx >= 0) { tankL = MODELS[idx].tank; shiftRpm = max(3000, MODELS[idx].redline * 100 - 300); }
-  carBuf[0] = 0; slotsCustom = false; autoSlots();
+  carBuf[0] = 0; slotsCustom = false; autoSlots(); logClear();
   savePrefs(); nav(PG_SETUP);
-}
-static void setSource(bool demo) {
-  if (demo == demoMode) return;
-  demoMode = demo; carBuf[0] = 0; vinBuf[0] = 0; ecuName[0] = 0; calId[0] = 0;
-  ecuDieselKnown = false; ecuDiesel = false; ecuHybrid = false; mil = false; codeCount = 0; codeState = 0; monValid = false;
-  memset(psup, 0, sizeof psup); memset(page, 0, sizeof page); engineRan = false; rpmZeroAt = 0;
-  if (demo) { linkState = 0; simT = 0; if (!slotsCustom) autoSlots(); }
-  else { linkState = selAddr[0] ? 1 : 3; reconnectReq = true; if (!slotsCustom) autoSlots(); }
-  savePrefs(); updateWants();
 }
 static void stepVal(int& v, int lo, int hi, int dir, int st) { v = constrain(v + dir * st, lo, hi); }
 static void tapSetup(int x, int y, bool first) {
@@ -2322,19 +2346,16 @@ static void tapSetup(int x, int y, bool first) {
     if (hit(x, y, 163, 177, 71, 20)) { nav(PG_SETUP2); return; }
     if (hit(x, y, 240, 177, 71, 20)) { nav(PG_UPD); return; }
   }
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < SU_N; i++) {
     int ry = SU_Y0 + i * SU_H + 4, rh = SU_H - 9;
     if (y < ry || y >= ry + rh) continue;
     if (i == 0 && first) {
-      if (hit(x, y, 164, ry, 70, rh)) setSource(true);
-      else if (hit(x, y, 238, ry, 73, rh)) { setSource(false); if (!selAddr[0]) nav(PG_BT); }
-    } else if (i == 1 && first) {
       if (hit(x, y, 164, ry, 70, rh) && thai) { thai = false; savePrefs(); }
       else if (hit(x, y, 238, ry, 73, rh) && !thai) { thai = true; savePrefs(); }
-    } else if (i == 2) {
-      if (hit(x, y, 164, ry, 30, rh)) { stepVal(shiftRpm, 3000, 9000, -1, 100); saveSoon(); }
-      else if (hit(x, y, 281, ry, 30, rh)) { stepVal(shiftRpm, 3000, 9000, 1, 100); saveSoon(); }
-    } else if (i == 3 && first) {
+    } else if (i == 1) {
+      if (hit(x, y, 164, ry, 30, rh)) { stepVal(shiftRpm, 3000, shiftMax(), -1, 100); saveSoon(); }
+      else if (hit(x, y, 281, ry, 30, rh)) { stepVal(shiftRpm, 3000, shiftMax(), 1, 100); saveSoon(); }
+    } else if (i == 2 && first) {
       if (hit(x, y, 164, ry, 70, rh) && invScreen) { invScreen = false; applyInvert(); savePrefs(); }
       else if (hit(x, y, 238, ry, 73, rh) && !invScreen) { invScreen = true; applyInvert(); savePrefs(); }
     }
@@ -2403,7 +2424,7 @@ static void btSelRow() {
   rr(9, 32, 302, 26, 9, T.panel2, T.acc);
   if (selAddr[0]) {
     char t[32]; fitText(t, sizeof t, selName[0] ? selName : selAddr, F_UM, 190); txt(F_UM, t, 19, 49, T.text);
-    StrId s = demoMode ? S_DEMO : linkState == 2 ? S_CONNECTED : S_CONNECTING; uint16_t c = demoMode ? T.dim : linkState == 2 ? T.good : T.warn;
+    StrId s = linkState == 2 ? S_CONNECTED : S_CONNECTING; uint16_t c = linkState == 2 ? T.good : T.warn;
     lab(s, LB_TILE, 303, tby(48), c, AL_R);
   } else lab(S_NOSEL, LB_BTNM, 160, 49, T.dim, AL_C);
 }
@@ -2441,7 +2462,7 @@ static void btPick(int i) {                  // the user tapped a device: rememb
   selBle = d.ble; selAType = d.atype; bleTry = 0; selGen = selGen + 1;
   if (!same) { pinIdx = 0; pinOk = false; }
   portEXIT_CRITICAL(&btMux);
-  demoMode = false; carBuf[0] = 0; vinBuf[0] = 0; linkState = 1; memset(psup, 0, sizeof psup); engineRan = false;
+  carBuf[0] = 0; vinBuf[0] = 0; linkState = 1; memset(psup, 0, sizeof psup); engineRan = false;
   scanStop = true; reconnectReq = true;
   savePrefs(); updateWants();
 }
@@ -2455,46 +2476,69 @@ static void tapBt(int x, int y, bool first) {
 }
 
 // ---------- vehicle ----------
-static int vehStep = 0, vehBrandSel = 0;
+static int vehStep = 0, vehBrandSel = 0, vehPg = 0;
 static const int VBX[2] = {9, 161};
+static const int VPER = 12;                                          // models per page
+static int brandCount(int b) { int n = 0; for (int i = 0; i < NMODEL; i++) if (MODELS[i].brand == b) n++; return n; }
+static int brandPages(int b) { return max(1, (brandCount(b) + VPER - 1) / VPER); }
 static void drawVeh() {
   subHeader(S_VEHICLE, S_COUNT, false);
   if (vehStep == 0) {
-    for (int i = 0; i < 6; i++) {
-      int x = VBX[i & 1], y = 36 + (i >> 1) * 42; bool cur = vehModel >= 0 && MODELS[vehModel].brand == i;
-      if (cur) halo(x, y, 150, 38, 10, T.acc, 3);
-      if (cur) rr(x, y, 150, 38, 10, T.panel2, T.acc); else rrG(x, y, 150, 38, 10, TA.panel2, TA.panel, T.line);
-      txt(F_UL, BRANDS[i], x + 75, y + 25, cur ? T.text : T.accL, AL_C);
+    for (int i = 0; i < NBRAND; i++) {
+      int x = VBX[i & 1], y = 34 + (i >> 1) * 40; bool cur = vehModel >= 0 && MODELS[vehModel].brand == i;
+      if (cur) halo(x, y, 150, 36, 10, T.acc, 3);
+      if (cur) rr(x, y, 150, 36, 10, T.panel2, T.acc); else rrG(x, y, 150, 36, 10, TA.panel2, TA.panel, T.line);
+      if (i == 6) { txt(F_UL, BRANDS[i], x + 75, y + 17, cur ? T.text : T.accL, AL_C); lab(S_BIKENOTE, LB_TILE, x + 75, y + (thai ? 32 : 30), T.dim, AL_C); }   // motorcycles: OBD-II bikes only
+      else txt(F_UL, BRANDS[i], x + 75, y + 24, cur ? T.text : T.accL, AL_C);
     }
-    chipId(S_AUTOVIN, 9, 166, 302, 30, vehModel < 0);
+    chipId(S_AUTOVIN, VBX[1], 34 + 3 * 40, 150, 36, vehModel < 0);          // the 8th tile
     lab(S_PICKBRAND, LB_TILE, 160, tby(214), T.dim, AL_C);
   } else {
-    int r = 0;
-    for (int i = 0; i < NMODEL && r < 12; i++) {
+    int pages = brandPages(vehBrandSel); vehPg = constrain(vehPg, 0, pages - 1);
+    int r = 0, skip = vehPg * VPER;
+    for (int i = 0; i < NMODEL && r < VPER; i++) {
       if (MODELS[i].brand != vehBrandSel) continue;
+      if (skip > 0) { skip--; continue; }
       int x = VBX[r & 1], y = 31 + (r >> 1) * 29; bool cur = i == vehModel;
       chipBox(x, y, 150, 26, cur);
       char t[32]; fitText(t, sizeof t, MODELS[i].name, F_UM, 136); txt(F_UM, t, x + 75, y + 18, cur ? T.onacc : T.text, AL_C);
       r++;
     }
-    chipArrow(9, 210, 50, 22, -1, false); chipId(S_AUTOVIN, 65, 210, 246, 22, vehModel < 0);
+    if (pages == 1) { chipArrow(9, 210, 50, 22, -1, false); chipId(S_AUTOVIN, 65, 210, 246, 22, vehModel < 0); }
+    else {
+      char pg[12]; snprintf(pg, sizeof pg, "%d/%d", vehPg + 1, pages);
+      chipArrow(9, 210, 44, 22, -1, false); chipS("<", 57, 210, 34, 22, false); chipS(">", 95, 210, 34, 22, false);
+      txt(F_UM, pg, 159, 226, T.dim, AL_C); chipId(S_AUTOVIN, 189, 210, 122, 22, vehModel < 0);
+    }
   }
 }
-static int vehModelAt(int slot) {            // slot-th model of the chosen brand
-  int r = 0;
-  for (int i = 0; i < NMODEL; i++) { if (MODELS[i].brand != vehBrandSel) continue; if (r == slot) return i; r++; }
+static int vehModelAt(int slot) {            // slot-th model on the shown page of the chosen brand
+  int r = 0, want = vehPg * VPER + slot;
+  for (int i = 0; i < NMODEL; i++) { if (MODELS[i].brand != vehBrandSel) continue; if (r == want) return i; r++; }
   return -1;
 }
 static void tapVeh(int x, int y, bool first) {
   if (!first) return;
   if (hitBack(x, y)) { nav(PG_SETUP); return; }
   if (vehStep == 0) {
-    for (int i = 0; i < 6; i++) if (hit(x, y, VBX[i & 1], 36 + (i >> 1) * 42, 150, 38)) { vehBrandSel = i; vehStep = 1; return; }
-    if (hit(x, y, 9, 166, 302, 30)) applyVehicle(-1);
+    for (int i = 0; i < NBRAND; i++) if (hit(x, y, VBX[i & 1], 34 + (i >> 1) * 40, 150, 36)) {
+      vehBrandSel = i; vehStep = 1; vehPg = 0;
+      if (vehModel >= 0 && MODELS[vehModel].brand == i) { int r = 0; for (int k = 0; k < vehModel; k++) if (MODELS[k].brand == i) r++; vehPg = r / VPER; }   // open on the page of the current model
+      return;
+    }
+    if (hit(x, y, VBX[1], 34 + 3 * 40, 150, 36)) applyVehicle(-1);
   } else {
-    if (hit(x, y, 9, 210, 50, 22)) { vehStep = 0; return; }
-    if (hit(x, y, 65, 210, 246, 22)) { applyVehicle(-1); return; }
-    for (int r = 0; r < 12; r++) if (hit(x, y, VBX[r & 1], 31 + (r >> 1) * 29, 150, 26)) { int m = vehModelAt(r); if (m >= 0) applyVehicle(m); return; }
+    int pages = brandPages(vehBrandSel);
+    if (pages == 1) {
+      if (hit(x, y, 9, 210, 50, 22)) { vehStep = 0; return; }
+      if (hit(x, y, 65, 210, 246, 22)) { applyVehicle(-1); return; }
+    } else {
+      if (hit(x, y, 9, 210, 44, 22)) { vehStep = 0; return; }
+      if (hit(x, y, 57, 210, 34, 22)) { vehPg = (vehPg + pages - 1) % pages; return; }
+      if (hit(x, y, 95, 210, 34, 22)) { vehPg = (vehPg + 1) % pages; return; }
+      if (hit(x, y, 189, 210, 122, 22)) { applyVehicle(-1); return; }
+    }
+    for (int r = 0; r < VPER; r++) if (hit(x, y, VBX[r & 1], 31 + (r >> 1) * 29, 150, 26)) { int m = vehModelAt(r); if (m >= 0) applyVehicle(m); return; }
   }
 }
 
@@ -3299,7 +3343,7 @@ void loop() {
   static uint32_t tSim = 0, tUI = 0, tGraph = 0; static int lastLs = -1;
   if (now - tSim >= 100) {
     float dt = (now - tSim) / 1000.0f; tSim = now;
-    if (demoMode) simStep(dt); else crpV = crpV * 0.7f + readCrp() * 0.3f;
+    crpV = crpV * 0.7f + readCrp() * 0.3f;
     tripStep(dt); peaksStep(); logStep(); alertsStep(); parkStep(now);
     if (linkState != lastLs) { lastLs = linkState; if (linkState == 2 && !slotsCustom) autoSlots(); }
     if (scr == PG_SPLASH && now - splashAt > splashMs()) { if (firstRun) savePrefs(); nav(PG_DASH); }
