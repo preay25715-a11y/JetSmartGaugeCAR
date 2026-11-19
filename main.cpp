@@ -6,9 +6,37 @@
 #include <math.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <Preferences.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#ifdef UPD_BUILD
+// Updater image: Wi-Fi + TLS instead of Bluetooth (the flash is too small for both). Tiny stand-ins keep the shared UI code compiling;
+// nothing here is ever called, the linker drops it.
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "mbedtls/sha256.h"
+#include <map>
+typedef int esp_ble_addr_type_t;
+struct BTAddr { String toString() { return String(""); } };
+struct BTAdvertisedDevice { BTAddr getAddress() { return {}; } String getName() { return String(""); } int getRSSI() { return 0; } };
+struct BTScanResults { int getCount() { return 0; } BTAdvertisedDevice* getDevice(int) { return nullptr; } };
+struct BluetoothSerial { bool begin(const char*, bool) { return true; } void setPin(const char*) {} bool discoverAsync(void (*)(BTAdvertisedDevice*)) { return true; } void discoverAsyncStop() {}
+  BTScanResults* getScanResults() { return nullptr; } void end() {} int available() { return 0; } int read() { return -1; } void print(const char*) {} void print(char) {} bool connected() { return false; } void disconnect() {} bool connect(uint8_t*) { return false; } };
+struct BLEUUID { BLEUUID(uint16_t) {} String toString() { return String(""); } };
+struct BLEAddress { BLEAddress(uint8_t*) {} String toString() { return String(""); } };
+struct BLERemoteCharacteristic { bool canWrite() { return 0; } bool canWriteNoResponse() { return 0; } bool canNotify() { return 0; } bool canIndicate() { return 0; }
+  void registerForNotify(void (*)(BLERemoteCharacteristic*, uint8_t*, size_t, bool), bool) {} void writeValue(uint8_t*, size_t, bool) {} };
+struct BLERemoteService { BLEUUID getUUID() { return BLEUUID((uint16_t)0); } std::map<std::string, BLERemoteCharacteristic*>* getCharacteristics() { return nullptr; } };
+struct BLEClient { bool connect(BLEAddress, esp_ble_addr_type_t) { return false; } bool isConnected() { return false; } void disconnect() {} std::map<std::string, BLERemoteService*>* getServices() { return nullptr; } };
+struct BLEAdvertisedDevice { BLEAddress getAddress() { return BLEAddress(nullptr); } String getName() { return String(""); } int getRSSI() { return 0; } bool isAdvertisingService(BLEUUID) { return 0; } int getAddressType() { return 0; } };
+struct BLEScanResults { int getCount() { return 0; } BLEAdvertisedDevice getDevice(int) { return {}; } };
+struct BLEScan { void setActiveScan(bool) {} void setInterval(int) {} void setWindow(int) {} BLEScanResults start(int, bool) { return {}; } void clearResults() {} };
+struct BLEDevice { static void init(const char*) {} static BLEClient* createClient() { static BLEClient c; return &c; } static BLEScan* getScan() { static BLEScan s; return &s; } static void deinit(bool) {} };
+#else
 #include <BluetoothSerial.h>
 #include <BLEDevice.h>
-#include <Preferences.h>
+#endif
 #include <string>
 #include "ui_assets.h"
 
@@ -18,7 +46,7 @@
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "V4.0"
+#define FW_VERSION "v1.0.0"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -1403,7 +1431,7 @@ static void applyInvert() { tft.invertDisplay(invScreen); }
 // =====================================================================================
 //  Screens
 // =====================================================================================
-enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG };
+enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG, PG_UPD };
 static Page scr = PG_SPLASH;
 static bool redraw = true;
 static int gsel = 0, gmode = 0;                           // graph set (0 rpm, 1 temps, 2 afr, 3 batt) and time base (0 = 60 s, 1 = 15 min)
@@ -2260,7 +2288,7 @@ static void drawSetup() {
   topBar(gv0(0x0C));
   themeCard(0); themeCard(1);
   for (int i = 0; i < 4; i++) setupRow(i);
-  chipId(S_BTNAME, 9, 177, 96, 20, false); chipId(S_VEHICLE, 111, 177, 96, 20, false); chipId(S_MORE, 213, 177, 98, 20, false);
+  chipId(S_BTNAME, 9, 177, 71, 20, false); chipId(S_VEHICLE, 86, 177, 71, 20, false); chipId(S_MORE, 163, 177, 71, 20, false); chipId(S_UPDTITLE, 240, 177, 71, 20, false);
   tabBar(5);
 }
 static void applyVehicle(int idx) {                 // idx = -1: automatic (from the VIN)
@@ -2283,9 +2311,10 @@ static void tapSetup(int x, int y, bool first) {
   if (first) {
     if (tabTap(x, y, PG_SETUP)) return;
     for (int i = 0; i < NTHEME; i++) if (hit(x, y, 9 + i * 154, 32, 148, 28)) { if (theme != i) { applyTheme(i); savePrefs(); } return; }
-    if (hit(x, y, 9, 177, 96, 20)) { nav(PG_BT); return; }
-    if (hit(x, y, 111, 177, 96, 20)) { nav(PG_VEH); return; }
-    if (hit(x, y, 213, 177, 98, 20)) { nav(PG_SETUP2); return; }
+    if (hit(x, y, 9, 177, 71, 20)) { nav(PG_BT); return; }
+    if (hit(x, y, 86, 177, 71, 20)) { nav(PG_VEH); return; }
+    if (hit(x, y, 163, 177, 71, 20)) { nav(PG_SETUP2); return; }
+    if (hit(x, y, 240, 177, 71, 20)) { nav(PG_UPD); return; }
   }
   for (int i = 0; i < 4; i++) {
     int ry = SU_Y0 + i * SU_H + 4, rh = SU_H - 9;
@@ -2596,6 +2625,489 @@ static void drawPark() {
 }
 
 // =====================================================================================
+//  Update: Wi-Fi + GitHub release check + firmware install
+//
+//  The flash is 4 MB, too small for the Bluetooth stack AND Wi-Fi/TLS in one image, so the project is two images:
+//    ota_0  the gauge (this file built normally)  - PG_UPD is only an info page whose button restarts into the updater
+//    ota_1  the updater (-DUPD_BUILD)             - Wi-Fi list, password keyboard, release check, download -> ota_0
+//  The updater writes the new gauge into ota_0 and only then switches the boot partition, so an interrupted update
+//  never leaves the unit without a working updater (it simply boots into the updater again).
+// =====================================================================================
+#ifndef UPD_OWNER
+#define UPD_OWNER "preay25715-a11y"          // GitHub account / organisation that owns the firmware repository (must be PUBLIC)
+#endif
+#ifndef UPD_REPO
+#define UPD_REPO "JetSmartGaugeCAR"          // repository whose Releases hold firmware_<variant>.bin
+#endif
+#ifndef FW_VARIANT
+#ifdef ST7789_DRIVER
+#define FW_VARIANT "cyd_st7789"
+#else
+#define FW_VARIANT "cyd"
+#endif
+#endif
+
+static bool updLeaving = false; static uint32_t updLeaveAt = 0;                  // restart requested (a short delay lets the last frame draw)
+static uint8_t updErr = 0;
+enum UpdErr : uint8_t { UE_NONE, UE_WIFI, UE_NET, UE_NOFW, UE_DL, UE_SHA, UE_BIG, UE_NOUPD, UE_NOGAUGE };
+static const StrId UE_STR[] = {S_COUNT, S_ERRWIFI, S_ERRNET, S_ERRNOFW, S_ERRDL, S_ERRSHA, S_ERRBIG, S_ERRNOUPD, S_UPDNOGAUGE};
+
+static void updNoteVersion() {                                                   // the gauge tells the updater which version is installed
+  Preferences p;
+  if (p.begin("upd", false)) { if (p.getString("gv", "") != FW_VERSION) p.putString("gv", FW_VERSION); p.end(); }
+}
+#ifdef UPD_BUILD
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
+#define SHA_START(c) mbedtls_sha256_starts(c, 0)
+#define SHA_UPD(c, b, n) mbedtls_sha256_update(c, b, n)
+#define SHA_FIN(c, o) mbedtls_sha256_finish(c, o)
+#else
+#define SHA_START(c) mbedtls_sha256_starts_ret(c, 0)
+#define SHA_UPD(c, b, n) mbedtls_sha256_update_ret(c, b, n)
+#define SHA_FIN(c, o) mbedtls_sha256_finish_ret(c, o)
+#endif
+#endif
+static bool updBootTo(bool updater) {                                            // choose the partition the next restart boots
+  const esp_partition_t* p = esp_partition_find_first(ESP_PARTITION_TYPE_APP, updater ? ESP_PARTITION_SUBTYPE_APP_OTA_1 : ESP_PARTITION_SUBTYPE_APP_OTA_0, nullptr);
+  return p && esp_ota_set_boot_partition(p) == ESP_OK;
+}
+static void updLoop(uint32_t now) { if (updLeaving && now - updLeaveAt > 900) ESP.restart(); }
+static void updRestartSoon() { updLeaving = true; updLeaveAt = millis(); redraw = true; }
+
+// ---------- shared drawing ----------
+static void drawLogoSm(int x0, int y0) {                                         // the 200 x 200 artwork at half size (2 x 2 average); pure black = the transparent corners
+  int ys = max(y0, bandY0), ye = min(y0 + 100, bandY1);
+  for (int y = ys; y < ye; y++) {
+    uint16_t* d = rowPtr(y) + x0; const uint16_t* s0 = LOGO_PX + (y - y0) * 2 * LOGO_W;
+    for (int i = 0; i < 100; i++) {
+      uint16_t a = pgm_read_word(&s0[i * 2]), b = pgm_read_word(&s0[i * 2 + 1]), c = pgm_read_word(&s0[LOGO_W + i * 2]), e = pgm_read_word(&s0[LOGO_W + i * 2 + 1]);
+      if (!(a | b | c | e)) continue;
+      int r = ((a >> 11) + (b >> 11) + (c >> 11) + (e >> 11) + 2) >> 2;
+      int g = (((a >> 5) & 63) + ((b >> 5) & 63) + ((c >> 5) & 63) + ((e >> 5) & 63) + 2) >> 2;
+      int bl = ((a & 31) + (b & 31) + (c & 31) + (e & 31) + 2) >> 2;
+      uint16_t v = (uint16_t)((r << 11) | (g << 5) | bl);
+      if (v) d[i] = v;
+    }
+  }
+}
+static void wifiIcon(int cx, int cy, uint16_t col, int lit) {                    // three arcs and a dot; cx, cy = the dot
+  disc((float)cx, (float)cy, 1.7f, col);
+  static const float RAD[3] = {5.0f, 9.0f, 13.0f};
+  for (int k = 0; k < 3; k++) {
+    uint16_t c = k < lit ? col : T.dark;
+    for (int s = 0; s < 6; s++) {
+      float a0 = (-0.80f + 1.60f * s / 6.0f), a1 = (-0.80f + 1.60f * (s + 1) / 6.0f);
+      strokeSeg(cx + RAD[k] * sinf(a0), cy - RAD[k] * cosf(a0), cx + RAD[k] * sinf(a1), cy - RAD[k] * cosf(a1), 1.7f, c, true);
+    }
+  }
+}
+static void lockIcon(int x, int y, uint16_t col) {                               // 9 x 11 padlock
+  rr(x, y + 5, 9, 7, 2, col);
+  ln(x + 2, y + 5, x + 2, y + 3, col); ln(x + 2, y + 3, x + 4, y + 1, col); ln(x + 4, y + 1, x + 5, y + 1, col); ln(x + 5, y + 1, x + 7, y + 3, col); ln(x + 7, y + 3, x + 7, y + 5, col);
+}
+static void drawStatusLine(StrId id, uint16_t col, int by) { lab(id, LB_BTNM, 160, by, col, AL_C, 300); }
+
+#ifndef UPD_BUILD
+// =====================================================================================
+//  Gauge image: info page + "start update mode"
+// =====================================================================================
+static void drawUpd() {
+  subHeader(S_UPDTITLE, S_COUNT, false);
+  drawLogoSm(10, 34);
+  txt(F_UL, "Smart Gauge", 124, 52, T.text);
+  lab(S_UPDINST, LB_TILE, 124, tby(72), T.dim);
+  txt(F_UL, FW_VERSION, 311, 74, T.accL, AL_R);
+  hl(124, 80, 187, T.sep);
+  lab(S_UPDI1, LB_ROW, 124, 100, T.text); lab(S_UPDI2, LB_ROW, 124, 116, T.text); lab(S_UPDI3, LB_ROW, 124, 132, T.dim, AL_L, 187);
+  if (updLeaving) { chipBox(9, 160, 302, 30, true); lab(S_UPDRESTART, LB_BTNM, 160, chipBy(160, 30), T.onacc, AL_C); }
+  else { halo(9, 160, 302, 30, 8, T.acc, 3); chipId(S_UPDSTART, 9, 160, 302, 30, true); }
+  if (updErr) lab(UE_STR[updErr], LB_BTNM, 160, 214, T.hot, AL_C, 300);
+  else lab(S_UPDSRC, LB_TILE, 160, tby(214), T.dim, AL_C);
+  txt(F_LS, UPD_OWNER "/" UPD_REPO, 160, 230, T.dim, AL_C);
+}
+static void tapUpd(int x, int y, bool first) {
+  if (!first || updLeaving) return;
+  if (hitBack(x, y)) { nav(PG_SETUP); return; }
+  if (hit(x, y, 9, 160, 302, 30)) {
+    savePrefs();
+    if (updBootTo(true)) { updErr = UE_NONE; updRestartSoon(); } else { updErr = UE_NOUPD; redraw = true; }
+  }
+}
+
+#else
+// =====================================================================================
+//  Updater image
+// =====================================================================================
+enum UpdUi : uint8_t { UU_HOME, UU_WIFI, UU_KEY, UU_PROG };
+enum UpdCmd : uint8_t { UC_NONE, UC_SCAN, UC_CONNECT, UC_CHECK, UC_INSTALL };
+struct WfAp { char ssid[33]; int8_t rssi; bool lock; };
+static const int WF_MAX = 16;
+static uint8_t updUi = UU_HOME;
+static volatile uint8_t updCmd = UC_NONE, updPhase = 0;                          // phase: 0 idle, 1 scanning, 2 connecting, 3 checking, 4 installing, 5 done
+static char wfSsid[33] = "", wfPass[64] = "";                                    // saved network
+static WfAp wfList[WF_MAX]; static volatile int wfN = 0; static int wfOff = 0; static volatile bool wfScanned = false;
+static char updCur[20] = FW_VERSION, updLatest[20] = "", updUrl[256] = "", updSha[72] = "";
+static volatile uint32_t updTotal = 0, updGot = 0; static volatile bool updHave = false;
+// keyboard
+static char kbSsid[33] = "", kbPass[64] = ""; static int kbLen = 0; static uint8_t kbMode = 0; static bool kbShow = false, kbLock = true;   // mode: 0 abc, 1 ABC, 2 symbols
+
+static bool wifiUp() { return WiFi.status() == WL_CONNECTED; }
+static void verParse(const char* s, int* v) {                                    // "v1.2.3" -> 1,2,3
+  v[0] = v[1] = v[2] = 0; int k = 0;
+  for (; *s && k < 3; s++) { if (*s >= '0' && *s <= '9') v[k] = v[k] * 10 + (*s - '0'); else if (*s == '.') k++; else if (v[k] || k) break; }
+}
+static bool verNewer(const char* a, const char* b) { int x[3], y[3]; verParse(a, x); verParse(b, y); for (int i = 0; i < 3; i++) { if (x[i] != y[i]) return x[i] > y[i]; } return false; }
+static bool jsonStr(const String& s, int from, int lim, const char* key, String& out) {    // first "key":"value" in s[from, lim)
+  String k = String("\"") + key + "\":"; int p = s.indexOf(k, from); if (p < 0 || (lim >= 0 && p >= lim)) return false;
+  p += k.length(); while (p < (int)s.length() && s[p] == ' ') p++;
+  if (p >= (int)s.length() || s[p] != '"') return false;
+  int q = s.indexOf('"', p + 1); if (q < 0) return false;
+  out = s.substring(p + 1, q); return true;
+}
+static long jsonNum(const String& s, int from, int lim, const char* key) {
+  String k = String("\"") + key + "\":"; int p = s.indexOf(k, from); if (p < 0 || (lim >= 0 && p >= lim)) return -1;
+  p += k.length(); while (p < (int)s.length() && s[p] == ' ') p++;
+  return s.substring(p, p + 12).toInt();
+}
+static bool httpBegin(HTTPClient& http, WiFiClientSecure& cli, const char* url, bool api) {
+  cli.setInsecure();                                                              // no certificate store on the board: integrity rests on the SHA-256 check below
+  http.setUserAgent("SmartGauge-OTA");
+  http.setTimeout(12000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  if (!http.begin(cli, url)) return false;
+  if (api) http.addHeader("Accept", "application/vnd.github+json");
+  return true;
+}
+
+// ---- worker task: scan, connect, check, install (the UI task keeps drawing while these block) ----
+static void updDoScan() {
+  updPhase = 1; wfScanned = false;
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks(false, false);
+  static WfAp tmp[WF_MAX]; int m = 0;
+  for (int i = 0; i < n && n > 0; i++) {
+    String s = WiFi.SSID(i); if (!s.length() || s.length() > 32) continue;
+    int dup = -1; for (int j = 0; j < m; j++) if (!strcmp(tmp[j].ssid, s.c_str())) dup = j;
+    int8_t rs = (int8_t)WiFi.RSSI(i);
+    if (dup >= 0) { if (rs > tmp[dup].rssi) tmp[dup].rssi = rs; continue; }
+    if (m < WF_MAX) { strncpy(tmp[m].ssid, s.c_str(), 32); tmp[m].ssid[32] = 0; tmp[m].rssi = rs; tmp[m].lock = WiFi.encryptionType(i) != WIFI_AUTH_OPEN; m++; }
+  }
+  WiFi.scanDelete();
+  for (int i = 1; i < m; i++) { WfAp t = tmp[i]; int j = i - 1; while (j >= 0 && tmp[j].rssi < t.rssi) { tmp[j + 1] = tmp[j]; j--; } tmp[j + 1] = t; }
+  memcpy(wfList, tmp, sizeof(WfAp) * m); wfN = m; wfOff = 0; wfScanned = true;
+  updPhase = 0;
+}
+static bool updDoConnect() {
+  updPhase = 2; updErr = UE_NONE;
+  WiFi.mode(WIFI_STA); WiFi.disconnect(false); vTaskDelay(100);
+  WiFi.begin(wfSsid, wfPass[0] ? wfPass : nullptr);
+  uint32_t t0 = millis();
+  while (!wifiUp() && millis() - t0 < 16000) vTaskDelay(100);
+  bool ok = wifiUp();
+  if (ok) { Preferences p; if (p.begin("upd", false)) { p.putString("ssid", wfSsid); p.putString("pass", wfPass); p.end(); } }
+  else { updErr = UE_WIFI; WiFi.disconnect(false); }
+  updPhase = 0; return ok;
+}
+static bool updDoCheck() {
+  updPhase = 3; updErr = UE_NONE; updHave = false;
+  if (!wifiUp()) { updErr = UE_WIFI; updPhase = 0; return false; }
+  WiFiClientSecure cli; HTTPClient http;
+  char url[160]; snprintf(url, sizeof url, "https://api.github.com/repos/%s/%s/releases/latest", UPD_OWNER, UPD_REPO);
+  String body; int code = -1;
+  if (httpBegin(http, cli, url, true)) {
+    code = http.GET();
+    if (code == 200 && http.getSize() < 98304) body = http.getString();
+    http.end();
+  }
+  if (code != 200 || !body.length()) { updErr = UE_NET; updPhase = 0; return false; }
+  String tag; if (!jsonStr(body, 0, -1, "tag_name", tag)) { updErr = UE_NOFW; updPhase = 0; return false; }
+  String want = String("\"name\":\"firmware_") + FW_VARIANT + ".bin\"";
+  int p = body.indexOf(want);
+  if (p < 0) { updErr = UE_NOFW; updPhase = 0; return false; }
+  int lim = body.indexOf("/releases/assets/", p + 10); if (lim < 0) lim = body.length();     // the next asset starts here
+  String dl, dg; long sz = jsonNum(body, p, lim, "size");
+  if (!jsonStr(body, p, lim, "browser_download_url", dl)) { updErr = UE_NOFW; updPhase = 0; return false; }
+  if (jsonStr(body, p, lim, "digest", dg) && dg.startsWith("sha256:")) strncpy(updSha, dg.c_str() + 7, sizeof updSha - 1); else updSha[0] = 0;
+  strncpy(updLatest, tag.c_str(), sizeof updLatest - 1); strncpy(updUrl, dl.c_str(), sizeof updUrl - 1);
+  updTotal = sz > 0 ? (uint32_t)sz : 0; updHave = true;
+  updPhase = 0; return true;
+}
+static void updDoInstall() {
+  updPhase = 4; updErr = UE_NONE; updGot = 0;
+  const esp_partition_t* tgt = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, nullptr);
+  if (!tgt || !updHave || !wifiUp()) { updErr = tgt ? UE_NET : UE_NOGAUGE; updPhase = 0; return; }
+  WiFiClientSecure cli; HTTPClient http;
+  if (!httpBegin(http, cli, updUrl, false)) { updErr = UE_NET; updPhase = 0; return; }
+  int code = http.GET();
+  if (code != 200) { http.end(); updErr = UE_DL; updPhase = 0; return; }
+  uint32_t total = http.getSize() > 0 ? (uint32_t)http.getSize() : updTotal;
+  if (total < 100000) { http.end(); updErr = UE_DL; updPhase = 0; return; }
+  if (total > tgt->size) { http.end(); updErr = UE_BIG; updPhase = 0; return; }
+  updTotal = total;
+  esp_ota_handle_t h = 0;
+  if (esp_ota_begin(tgt, total, &h) != ESP_OK) { http.end(); updErr = UE_DL; updPhase = 0; return; }
+  mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); SHA_START(&sha);
+  static uint8_t buf[2048];
+  WiFiClient* s = http.getStreamPtr(); uint32_t got = 0, last = millis(); bool fail = false;
+  while (got < total && !fail) {
+    int av = s->available();
+    if (av > 0) {
+      int n = s->readBytes(buf, (size_t)min<int>(av, (int)sizeof buf));
+      if (n <= 0) continue;
+      if (esp_ota_write(h, buf, n) != ESP_OK) { fail = true; break; }
+      SHA_UPD(&sha, buf, n);
+      got += n; updGot = got; last = millis();
+    } else {
+      if (!s->connected() || millis() - last > 15000) fail = true;
+      vTaskDelay(2);
+    }
+  }
+  http.end();
+  uint8_t dig[32]; SHA_FIN(&sha, dig); mbedtls_sha256_free(&sha);
+  if (fail || got != total) { esp_ota_abort(h); updErr = UE_DL; updPhase = 0; return; }
+  if (updSha[0]) {
+    char hex[65]; for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", dig[i]);
+    if (strncasecmp(hex, updSha, 64) != 0) { esp_ota_abort(h); updErr = UE_SHA; updPhase = 0; return; }
+  }
+  if (esp_ota_end(h) != ESP_OK || esp_ota_set_boot_partition(tgt) != ESP_OK) { updErr = UE_DL; updPhase = 0; return; }   // esp_ota_end also validates the image
+  { Preferences p; if (p.begin("upd", false)) { p.putString("gv", updLatest); p.end(); } }
+  updPhase = 5;
+}
+static void updTask(void*) {
+  for (;;) {
+    uint8_t c = updCmd;
+    if (c == UC_NONE) { vTaskDelay(40); continue; }
+    uint8_t next = UC_NONE;
+    switch (c) {
+      case UC_SCAN: updDoScan(); break;
+      case UC_CONNECT: if (updDoConnect()) next = UC_CHECK; break;
+      case UC_CHECK: updDoCheck(); break;
+      case UC_INSTALL: updDoInstall(); break;
+    }
+    updCmd = next;
+    if (updPhase == 5) updRestartSoon();
+  }
+}
+static void updBegin() {
+  Preferences p;
+  if (p.begin("upd", true)) {
+    String gv = p.getString("gv", ""), ss = p.getString("ssid", ""), pw = p.getString("pass", "");
+    p.end();
+    if (gv.length() && gv.length() < sizeof updCur) strncpy(updCur, gv.c_str(), sizeof updCur - 1);
+    if (ss.length() && ss.length() < sizeof wfSsid) { strncpy(wfSsid, ss.c_str(), sizeof wfSsid - 1); strncpy(wfPass, pw.c_str(), sizeof wfPass - 1); }
+  }
+  WiFi.persistent(false); WiFi.mode(WIFI_STA);
+  xTaskCreatePinnedToCore(updTask, "upd", 16384, nullptr, 1, nullptr, 0);
+  if (wfSsid[0]) updCmd = UC_CONNECT;                                            // saved network: connect and look for a new version straight away
+}
+static bool updBusy() { return updPhase != 0; }
+static void updExit() {                                                          // back to the gauge
+  if (updBootTo(false)) { updErr = UE_NONE; updRestartSoon(); } else { updErr = UE_NOGAUGE; redraw = true; }
+}
+static bool updNewer() { return updHave && verNewer(updLatest, updCur); }
+
+// ---------- home ----------
+static void signalBars(int x, int y, int rssi) {
+  int lv = !rssi ? 0 : rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -78 ? 2 : 1;
+  for (int k = 0; k < 4; k++) { int h = 4 + k * 3; rr(x + k * 8, y + 16 - h, 5, h, 1, k < lv ? T.accL : T.dark); }
+}
+static void drawUpdHome() {
+  subHeader(S_UPDTITLE, S_COUNT, false);
+  drawLogoSm(10, 34);
+  txt(F_UL, "Smart Gauge", 124, 52, T.text);
+  lab(S_UPDINST, LB_TILE, 124, tby(72), T.dim); txt(F_UL, updCur, 311, 74, T.text, AL_R); hl(124, 80, 187, T.sep);
+  bool nw = updNewer();
+  lab(S_UPDLATEST, LB_TILE, 124, tby(94), T.dim); txt(F_UL, updHave ? updLatest : "--", 311, 96, nw ? T.accL : T.text, AL_R); hl(124, 102, 187, T.sep);
+  lab(S_UPDSRC, LB_TILE, 124, tby(118), T.dim);
+  // Wi-Fi row
+  bool up = wifiUp();
+  rrG(9, 140, 302, 26, 8, TA.panel2, TA.panel, T.line);
+  wifiIcon(25, 158, up ? T.accL : T.dim, up ? 3 : 0);
+  if (wfSsid[0]) { char t[40]; fitText(t, sizeof t, wfSsid, F_UM, 150); txt(F_UM, t, 46, 157, T.text); } else lab(S_NOSEL, LB_BTNM, 46, 157, T.dim);
+  lab(up ? S_CONNECTED : S_UPDNOCONN, LB_TILE, 303, tby(156), up ? T.good : T.warn, AL_R);
+  // status line
+  uint8_t ph = updPhase;
+  if (updLeaving) drawStatusLine(S_UPDRESTART, T.good, 186);
+  else if (ph == 1) drawStatusLine(S_UPDSCANNING, T.dim, 186);
+  else if (ph == 2) drawStatusLine(S_CONNECTING, T.dim, 186);
+  else if (ph == 3) drawStatusLine(S_UPDCHECKING, T.dim, 186);
+  else if (updErr) drawStatusLine(UE_STR[updErr], T.hot, 186);
+  else if (!up) drawStatusLine(S_UPDNOCONN, T.warn, 186);
+  else if (nw) drawStatusLine(S_UPDNEW, T.accL, 186);
+  else if (updHave) drawStatusLine(S_UPDUPTODATE, T.good, 186);
+  else drawStatusLine(S_CONNECTED, T.dim, 186);
+  // buttons
+  bool busy = ph != 0 || updLeaving;
+  chipId(S_WIFI, 9, 200, 146, 26, false);
+  if (nw && !busy) { halo(165, 200, 146, 26, 8, T.acc, 3); chipId(S_UPDINSTALL, 165, 200, 146, 26, true); }
+  else chipId(S_UPDCHECK, 165, 200, 146, 26, false);
+}
+static void tapUpdHome(int x, int y, bool first) {
+  if (!first) return;
+  if (hitBack(x, y)) { if (updPhase != 4) updExit(); return; }
+  if (updBusy() || updLeaving) return;
+  if (hit(x, y, 9, 140, 302, 26) || hit(x, y, 9, 200, 146, 26)) { updUi = UU_WIFI; wfOff = 0; updErr = UE_NONE; updCmd = UC_SCAN; return; }
+  if (hit(x, y, 165, 200, 146, 26)) {
+    updErr = UE_NONE;
+    if (updNewer()) { updUi = UU_PROG; updCmd = UC_INSTALL; }
+    else if (wifiUp()) updCmd = UC_CHECK;
+    else if (wfSsid[0]) updCmd = UC_CONNECT;
+    else { updUi = UU_WIFI; wfOff = 0; updCmd = UC_SCAN; }
+  }
+}
+
+// ---------- Wi-Fi list ----------
+static void drawUpdWifi() {
+  subHeader(S_WIFI, S_SCAN, true);
+  int n = wfN; bool up = wifiUp(); char cur[40]; strncpy(cur, WiFi.SSID().c_str(), sizeof cur - 1); cur[sizeof cur - 1] = 0;
+  for (int r = 0; r < 5 && updPhase != 1; r++) {
+    int i = wfOff + r, y = 32 + r * 28; if (i >= n) break;
+    const WfAp& a = wfList[i]; bool sel = up && !strcmp(a.ssid, cur);
+    if (sel) rr(9, y, 302, 26, 8, T.panel2, T.acc); else rrG(9, y, 302, 26, 8, TA.panel2, TA.panel, T.line);
+    int x = 19; if (a.lock) { lockIcon(18, y + 7, sel ? T.accL : T.dim); x = 36; }
+    char t[40]; fitText(t, sizeof t, a.ssid, F_UM, 200 - x); txt(F_UM, t, x, y + 18, sel ? T.text : T.accL);
+    if (sel) { ln(228, y + 13, 232, y + 17, T.good); ln(229, y + 13, 233, y + 17, T.good); ln(233, y + 17, 241, y + 7, T.good); ln(234, y + 17, 242, y + 7, T.good); }
+    else if (!strcmp(a.ssid, wfSsid)) lab(S_UPDSAVED, LB_TILE, 252, tby(17), T.dim, AL_R);
+    signalBars(268, y + 3, a.rssi);
+  }
+  chipArrow(9, 178, 70, 22, -1, false); chipArrow(85, 178, 70, 22, 1, false);
+  if (updPhase == 1) lab(S_UPDSCANNING, LB_BTNM, 311, chipBy(178, 22), T.dim, AL_R);
+  else if (updPhase == 2) lab(S_CONNECTING, LB_BTNM, 311, chipBy(178, 22), T.dim, AL_R);
+  else if (!n && wfScanned) lab(S_NONET, LB_BTNM, 311, chipBy(178, 22), T.dim, AL_R);
+  else if (updErr) lab(UE_STR[updErr], LB_TILE, 311, tby(212), T.hot, AL_R, 302);
+}
+static void kbOpen(const char* ssid, bool lock) {
+  strncpy(kbSsid, ssid, sizeof kbSsid - 1); kbSsid[sizeof kbSsid - 1] = 0; kbLock = lock; kbMode = 0; kbShow = false;
+  if (!strcmp(ssid, wfSsid)) { strncpy(kbPass, wfPass, sizeof kbPass - 1); kbPass[sizeof kbPass - 1] = 0; } else kbPass[0] = 0;
+  kbLen = (int)strlen(kbPass); updUi = UU_KEY; updErr = UE_NONE;
+}
+static void tapUpdWifi(int x, int y, bool first) {
+  if (first && hitBack(x, y)) { updUi = UU_HOME; return; }
+  if (first && hit(x, y, 247, 4, 64, 20)) { if (!updBusy()) updCmd = UC_SCAN; return; }
+  if (updBusy()) return;
+  if (hit(x, y, 9, 178, 70, 22)) { if (wfOff > 0) wfOff--; return; }
+  if (hit(x, y, 85, 178, 70, 22)) { if (wfOff < wfN - 5) wfOff++; return; }
+  if (!first) return;
+  for (int r = 0; r < 5; r++) if (hit(x, y, 9, 32 + r * 28, 302, 26)) {
+    int i = wfOff + r; if (i >= wfN) return;
+    const WfAp& a = wfList[i];
+    if (a.lock) kbOpen(a.ssid, true);
+    else { strncpy(wfSsid, a.ssid, 32); wfSsid[32] = 0; wfPass[0] = 0; updUi = UU_HOME; updCmd = UC_CONNECT; }
+    return;
+  }
+}
+
+// ---------- password keyboard ----------
+struct KbKey { int16_t x, y, w; char c; uint8_t kind; };                          // kind: 0 character, 1 shift, 2 backspace, 3 symbols/letters, 4 space, 5 connect
+static int kbBuild(KbKey* k) {
+  const char* r1 = "1234567890";
+  const char* r2 = kbMode == 2 ? "@#$%&*-+=_" : "qwertyuiop";
+  const char* r3 = kbMode == 2 ? "!?:;()\"'~" : "asdfghjkl";
+  const char* r4 = kbMode == 2 ? "/\\|[]{}" : "zxcvbnm";
+  int n = 0;
+  auto ch = [&](char c) { return (kbMode == 1 && c >= 'a' && c <= 'z') ? (char)(c - 32) : c; };
+  for (int c = 0; c < 10; c++) k[n++] = {(int16_t)(6 + c * 31), 60, 29, r1[c], 0};
+  for (int c = 0; c < 10; c++) k[n++] = {(int16_t)(6 + c * 31), 90, 29, ch(r2[c]), 0};
+  for (int c = 0; c < 9; c++) k[n++] = {(int16_t)(21 + c * 31), 120, 29, ch(r3[c]), 0};
+  k[n++] = {6, 150, 44, 0, 1};
+  for (int c = 0; c < 7; c++) k[n++] = {(int16_t)(52 + c * 31), 150, 29, ch(r4[c]), 0};
+  k[n++] = {270, 150, 44, 0, 2};
+  k[n++] = {6, 180, 46, 0, 3}; k[n++] = {56, 180, 29, ',', 0}; k[n++] = {88, 180, 118, ' ', 4}; k[n++] = {209, 180, 29, '.', 0}; k[n++] = {242, 180, 72, 0, 5};
+  return n;
+}
+static void drawUpdKey() {
+  chipBox(9, 4, 64, 20, false); chevron(22, 14, -1, T.text); lab(S_BACK, LB_BTNM, 46, chipBy(4, 20), T.text, AL_C, 44);
+  { char t[40]; fitText(t, sizeof t, kbSsid, F_UM, 160); txt(F_UM, t, 160, 18, T.text, AL_C); }
+  chipId(kbShow ? S_HIDEPW : S_SHOWPW, 247, 4, 64, 20, kbShow);
+  // password field: the tail of the text, masked unless "Show" is on
+  rr(9, 30, 302, 24, 8, T.panel2, T.acc);
+  if (!kbLen) lab(S_PWD, LB_BTNM, 19, chipBy(30, 24), T.dim);
+  else {
+    char shown[70]; int st = 0;
+    for (;;) {
+      int m = 0; for (int i = st; i < kbLen && m < 68; i++) shown[m++] = kbShow ? kbPass[i] : '*'; shown[m] = 0;
+      if (textW(F_UM, shown) <= 276 || st >= kbLen - 1) break; st++;
+    }
+    txt(F_UM, shown, 19, 47, T.text);
+  }
+  KbKey k[48]; int n = kbBuild(k);
+  for (int i = 0; i < n; i++) {
+    const KbKey& q = k[i]; bool acc = (q.kind == 1 && kbMode == 1) || q.kind == 5;
+    rr(q.x, q.y, q.w, 27, 6, acc ? T.acc : T.panel, acc ? T.acc : T.line);
+    int cx = q.x + (q.w >> 1), cy = q.y + 13; uint16_t fg = acc ? T.onacc : T.text;
+    switch (q.kind) {
+      case 0: { char s[2] = {q.c, 0}; txt(F_UM, s, cx, q.y + 18, fg, AL_C); break; }
+      case 1: ln(cx, cy - 6, cx - 5, cy, fg); ln(cx, cy - 6, cx + 5, cy, fg); ln(cx, cy - 6, cx, cy + 6, fg); ln(cx - 5, cy, cx - 2, cy, fg); ln(cx + 5, cy, cx + 2, cy, fg); break;
+      case 2: ln(cx - 7, cy, cx + 6, cy, fg); ln(cx - 7, cy, cx - 3, cy - 4, fg); ln(cx - 7, cy, cx - 3, cy + 4, fg); break;
+      case 3: txt(F_UM, kbMode == 2 ? "abc" : "?123", cx, q.y + 18, fg, AL_C); break;
+      case 5: lab(S_CONNECTBTN, LB_BTNM, cx, chipBy(q.y, 27), fg, AL_C, q.w - 6); break;
+    }
+  }
+  if (updPhase == 2) lab(S_CONNECTING, LB_BTNM, 160, 228, T.dim, AL_C);
+  else if (updErr) lab(UE_STR[updErr], LB_BTNM, 160, 228, T.hot, AL_C, 300);
+}
+static void tapUpdKey(int x, int y, bool first) {
+  if (first && hitBack(x, y)) { kbPass[0] = 0; kbLen = 0; updUi = UU_WIFI; return; }
+  if (first && (hit(x, y, 247, 4, 64, 20) || hit(x, y, 9, 30, 302, 24))) { kbShow = !kbShow; return; }
+  KbKey k[48]; int n = kbBuild(k);
+  for (int i = 0; i < n; i++) {
+    const KbKey& q = k[i];
+    if (!hit(x, y, q.x - 1, q.y - 1, q.w + 2, 29)) continue;
+    if (q.kind == 2) { if (kbLen > 0) kbPass[--kbLen] = 0; return; }                // backspace repeats while held
+    if (!first) return;
+    switch (q.kind) {
+      case 0: case 4: if (kbLen < 63) { kbPass[kbLen++] = q.c; kbPass[kbLen] = 0; } if (kbMode == 1) kbMode = 0; break;
+      case 1: kbMode = kbMode == 1 ? 0 : 1; break;
+      case 3: kbMode = kbMode == 2 ? 0 : 2; break;
+      case 5:
+        if (kbLen >= 8 || !kbLock) { strncpy(wfSsid, kbSsid, 32); wfSsid[32] = 0; strncpy(wfPass, kbPass, 63); wfPass[63] = 0; updUi = UU_HOME; updCmd = UC_CONNECT; }
+        break;
+    }
+    return;
+  }
+}
+
+// ---------- install progress ----------
+static void drawUpdProg() {
+  drawLogoSm(110, 14);
+  uint32_t tot = updTotal, got = updGot; int pct = tot ? (int)(got * 100ull / tot) : 0; if (pct > 100) pct = 100;
+  bool done = updPhase == 5 || updLeaving, err = updErr != UE_NONE && updPhase == 0 && !updLeaving;
+  { int w1 = labW(done ? S_UPDDONE : S_UPDBUSY, LB_BTNM), w2 = done ? 0 : textW(F_UL, updLatest) + 8, x0 = 160 - (w1 + w2) / 2;
+    if (!err) { lab(done ? S_UPDDONE : S_UPDBUSY, LB_BTNM, x0, 142, done ? T.good : T.text); if (!done) txt(F_UL, updLatest, x0 + w1 + 8, 142, T.accL); } }
+  rr(40, 154, 240, 10, 5, T.dark);
+  int bw = done ? 240 : max(0, pct * 240 / 100); if (bw >= 10) { halo(40, 154, bw, 10, 5, err ? T.hot : T.acc, 2); rr(40, 154, bw, 10, 5, err ? T.hot : T.acc); }
+  char t[48]; snprintf(t, sizeof t, "%d%%   %lu / %lu KB", pct, (unsigned long)(got / 1024), (unsigned long)(tot / 1024));
+  if (!err) txt(F_UM, t, 160, 186, T.text, AL_C);
+  if (err) {
+    lab(UE_STR[updErr], LB_BTNM, 160, 186, T.hot, AL_C, 300);
+    chipId(S_UPDRETRY, 9, 204, 146, 26, false); chipId(S_BACK, 165, 204, 146, 26, false);
+  } else if (!done) lab(S_UPDNOOFF, LB_BTNM, 160, 218, T.warn, AL_C, 300);
+}
+static void tapUpdProg(int x, int y, bool first) {
+  if (!first || updBusy() || updLeaving || !updErr) return;
+  if (hit(x, y, 9, 204, 146, 26)) { updErr = UE_NONE; if (updHave && wifiUp()) updCmd = UC_INSTALL; else updUi = UU_HOME; }
+  else if (hit(x, y, 165, 204, 146, 26)) { updUi = UU_HOME; }
+}
+
+static void drawUpd() {
+  switch (updUi) {
+    case UU_WIFI: drawUpdWifi(); break;
+    case UU_KEY: drawUpdKey(); break;
+    case UU_PROG: drawUpdProg(); break;
+    default: drawUpdHome(); break;
+  }
+}
+static void tapUpd(int x, int y, bool first) {
+  switch (updUi) {
+    case UU_WIFI: tapUpdWifi(x, y, first); break;
+    case UU_KEY: tapUpdKey(x, y, first); break;
+    case UU_PROG: tapUpdProg(x, y, first); break;
+    default: tapUpdHome(x, y, first); break;
+  }
+}
+#endif
+
+// =====================================================================================
 //  Navigation, frame composition, touch, main loop
 // =====================================================================================
 static bool prefsDirty = false; static uint32_t prefsAt = 0;
@@ -2612,11 +3124,15 @@ static void nav(Page p) {
     case PG_VEH: vehStep = 0; break;
     case PG_BT: btOff = 0; if (!selAddr[0] && scanState != 1 && !demoMode) btStartScan(); break;
     case PG_PARK: parkAt = millis(); break;
+    case PG_UPD: updErr = UE_NONE; break;
     default: break;
   }
 }
 
 static void drawScene() {
+#ifdef UPD_BUILD
+  drawUpd();
+#else
   if (alertOn != AK_NONE) { drawAlert(); return; }
   switch (scr) {
     case PG_SPLASH: drawSplash(); break;
@@ -2636,25 +3152,38 @@ static void drawScene() {
     case PG_BT: drawBt(); break;
     case PG_VEH: drawVeh(); break;
     case PG_PARK: drawPark(); break;
+    case PG_UPD: drawUpd(); break;
   }
+#endif
 }
 static void renderFrame() {
   uiNow = snapNow = millis();                                   // one consistent snapshot of the car data for all bands
   memcpy(pvS, pv, sizeof pv); memcpy(psupS, psup, sizeof psup); memcpy(pageS, page, sizeof page);
   snapOn = true;
+#ifndef UPD_BUILD
   if (scr == PG_ALL) allBuild();
   if (scr == PG_BT) btBuildView();
+#endif
   for (int b = 0; b < NBAND; b++) {
     bandY0 = b * BAND_H; bandY1 = bandY0 + BAND_H;
+#ifdef UPD_BUILD
+    fillBand(T.bg);
+#else
     fillBand(alertOn != AK_NONE ? ALBG : (scr == PG_SPLASH ? C(0, 0, 0) : T.bg));
+#endif
     drawScene();
     presentBand(b);
   }
   snapOn = false;
 }
 
+#ifndef UPD_BUILD
 static void tapStatus(int x, int y, bool first) { if (first) codeTouch(x, y, scr); }
+#endif
 static void handleTouch(int x, int y, bool first) {
+#ifdef UPD_BUILD
+  tapUpd(x, y, first);
+#else
   if (alertOn != AK_NONE) { tapAlert(x, y, first); return; }
   switch (scr) {
     case PG_SPLASH:
@@ -2676,9 +3205,49 @@ static void handleTouch(int x, int y, bool first) {
     case PG_BT: tapBt(x, y, first); return;
     case PG_VEH: tapVeh(x, y, first); return;
     case PG_PARK: if (first) nav(PG_DASH); return;
+    case PG_UPD: tapUpd(x, y, first); return;
   }
+#endif
 }
 
+// ---------- touch (shared by the gauge and the updater) ----------
+static void pollTouch(uint32_t now) {
+  static bool wasTouched = false; static uint32_t repAt = 0;
+  bool t = ts.tirqTouched() && ts.touched();
+  if (t) {
+    TS_Point p = ts.getPoint();
+    int x = constrain(map(p.x, 200, 3700, 1, 320), 0, 319), y = constrain(map(p.y, 240, 3800, 1, 240), 0, 239);
+    if (!wasTouched) {
+      repAt = now + 450;
+      if (screenOff) { screenOff = false; applyBright(); } else handleTouch(x, y, true);
+    } else if ((int32_t)(now - repAt) >= 0) { repAt = now + 110; if (!screenOff) handleTouch(x, y, false); }
+  }
+  wasTouched = t;
+}
+static void initPanel() {
+  tft.init(); tft.setRotation(1); tft.setSwapBytes(true); applyInvert(); tft.fillScreen(0);
+  ledcSetup(0, 5000, 8); ledcAttachPin(21, 0); applyBright();
+  tsSPI.begin(25, 39, 32, 33); ts.begin(tsSPI); ts.setRotation(1);
+}
+
+#ifdef UPD_BUILD
+// ---------- updater image: no Bluetooth and no OBD task, only the update pages ----------
+void setup() {
+  Serial.begin(115200);
+  pinMode(4, OUTPUT); pinMode(16, OUTPUT); pinMode(17, OUTPUT);
+  digitalWrite(4, HIGH); digitalWrite(16, HIGH); digitalWrite(17, HIGH);
+  loadPrefs(); initPanel();
+  scr = PG_UPD; redraw = true;
+  updBegin();
+}
+void loop() {
+  uint32_t now = millis(); static uint32_t tUI = 0;
+  pollTouch(now);
+  updLoop(now);
+  if (redraw || now - tUI >= 80) { tUI = now; redraw = false; renderFrame(); }
+  delay(5);
+}
+#else
 // ---------- engine stop -> park screen ----------
 static void parkStep(uint32_t now) {
   bool ok; float rpm = getVal(0x0C, ok); if (!ok) rpm = 0;
@@ -2699,10 +3268,8 @@ void setup() {
   Serial.begin(115200);
   pinMode(4, OUTPUT); pinMode(16, OUTPUT); pinMode(17, OUTPUT);              // CYD RGB LED off (active low)
   digitalWrite(4, HIGH); digitalWrite(16, HIGH); digitalWrite(17, HIGH);
-  loadPrefs();
-  tft.init(); tft.setRotation(1); tft.setSwapBytes(true); applyInvert(); tft.fillScreen(0);
-  ledcSetup(0, 5000, 8); ledcAttachPin(21, 0); applyBright();
-  tsSPI.begin(25, 39, 32, 33); ts.begin(tsSPI); ts.setRotation(1);
+  loadPrefs(); updNoteVersion();
+  initPanel();
   analogSetPinAttenuation(CRP_PIN, ADC_11db);
   linkState = demoMode ? 0 : (selAddr[0] ? 1 : 3);
   if (demoMode && !slotsCustom) autoSlots();
@@ -2713,22 +3280,13 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
-  static bool wasTouched = false; static uint32_t repAt = 0;
-  bool t = ts.tirqTouched() && ts.touched();
-  if (t) {
-    TS_Point p = ts.getPoint();
-    int x = constrain(map(p.x, 200, 3700, 1, 320), 0, 319), y = constrain(map(p.y, 240, 3800, 1, 240), 0, 239);
-    if (!wasTouched) {
-      repAt = now + 450;
-      if (screenOff) { screenOff = false; applyBright(); } else handleTouch(x, y, true);
-    } else if ((int32_t)(now - repAt) >= 0) { repAt = now + 110; if (!screenOff) handleTouch(x, y, false); }
-  }
-  wasTouched = t;
+  pollTouch(now);
 
   if (pinDirty || protoDirty) { pinDirty = false; protoDirty = false; savePrefs(); }
   if (prefsDirty && now - prefsAt > 1500) { prefsDirty = false; savePrefs(); }
   if (pkDirty && now - pkSaved > 60000u) { pkDirty = false; pkSaved = now; savePrefs(); }
   if (uprotoAt && now - uprotoAt > 1500) { uprotoAt = 0; if (!demoMode) reconnectReq = true; }
+  updLoop(now);
 
   static uint32_t tSim = 0, tUI = 0, tGraph = 0; static int lastLs = -1;
   if (now - tSim >= 100) {
@@ -2742,3 +3300,4 @@ void loop() {
   if (!screenOff && (redraw || now - tUI >= 80)) { tUI = now; redraw = false; renderFrame(); }
   delay(5);
 }
+#endif

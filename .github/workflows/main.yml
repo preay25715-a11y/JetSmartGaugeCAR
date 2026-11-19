@@ -1,28 +1,66 @@
 name: Build firmware
 on:
   push:
+    tags: ["v*"]
+    branches: ["**"]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        env: [cyd, cyd_st7789]
+        variant: [cyd, cyd_st7789]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install platformio "esptool<5"
-      - run: pio run -e ${{ matrix.env }}
-      - name: Merge into one flashable .bin
+      - name: Build the gauge and the Wi-Fi updater
         run: |
-          B=.pio/build/${{ matrix.env }}
+          pio run -e ${{ matrix.variant }}
+          pio run -e ${{ matrix.variant }}_upd
+      - name: Check sizes and version
+        run: |
+          G=.pio/build/${{ matrix.variant }}/firmware.bin
+          U=.pio/build/${{ matrix.variant }}_upd/firmware.bin
+          gs=$(stat -c%s $G); us=$(stat -c%s $U)
+          echo "gauge   $gs bytes (slot 2228224)"
+          echo "updater $us bytes (slot 1900544)"
+          [ $gs -le 2228224 ] || { echo "::error::The gauge image is too big for its OTA slot"; exit 1; }
+          [ $us -le 1900544 ] || { echo "::error::The updater image is too big for its OTA slot"; exit 1; }
+          VER=$(grep -oP '#define FW_VERSION "\K[^"]+' main.cpp)
+          echo "FW_VERSION = $VER"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "$VER" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match FW_VERSION $VER in main.cpp"; exit 1
+          fi
+      - name: Make the release files
+        run: |
+          V=${{ matrix.variant }}
+          B=.pio/build/$V
           BOOT=$(find ~/.platformio -name boot_app0.bin | head -1)
-          python -m esptool --chip esp32 merge_bin -o mazda2-gauge-${{ matrix.env }}.bin \
+          mkdir out
+          cp $B/firmware.bin out/firmware_$V.bin
+          python -m esptool --chip esp32 merge_bin -o out/smart-gauge-$V-full.bin \
             --flash_mode dio --flash_freq 40m --flash_size 4MB \
-            0x1000 $B/bootloader.bin 0x8000 $B/partitions.bin 0xe000 $BOOT 0x10000 $B/firmware.bin
+            0x1000 $B/bootloader.bin 0x8000 $B/partitions.bin 0xe000 $BOOT 0x10000 $B/firmware.bin 0x230000 .pio/build/${V}_upd/firmware.bin
       - uses: actions/upload-artifact@v4
         with:
-          name: mazda2-gauge-${{ matrix.env }}
-          path: mazda2-gauge-${{ matrix.env }}.bin
+          name: bin-${{ matrix.variant }}
+          path: out/*
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

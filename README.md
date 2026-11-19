@@ -1,33 +1,66 @@
-# Mazda 2 Smart Gauge for ESP32 CYD (320x240)
+# เปรี้ยว จูนเนอร์ Smart Gauge v1.0.0 — ESP32 CYD + OBD-II
 
-Blue-black OBD-II gauge: Dash (6 tap-to-change values + CRP voltage), Data (12 values + all supported PIDs),
-Graph, Trip, Fault codes (read/clear), Setup (Thai/English, demo/OBD, shift light, warnings, brightness).
+มาตรวัดอัจฉริยะบนจอ ESP32-2432S028R (320x240) อ่านค่าจากรถผ่านอะแดปเตอร์ OBD-II Bluetooth (KONNWEI KW90x / ELM327)
 
-## Get the .bin (no software to install)
-1. Create a GitHub repository and upload these files at the top level: main.cpp, ui_strings.h, platformio.ini, README.md, plus the workflow in .github/workflows/.
-2. Open the **Actions** tab, wait for "Build firmware" to finish (about 5 minutes).
-3. Download the artifact: `mazda2-gauge-cyd` (one USB port, ILI9341) or `mazda2-gauge-cyd_st7789` (two USB ports).
-4. Flash at address **0x0**: open https://espressif.github.io/esptool-js/ in Chrome, connect, add the file at 0x0, Program.
-   (or: `python -m esptool --chip esp32 write_flash 0x0 mazda2-gauge-cyd.bin`)
+## ของใหม่ในเวอร์ชันนี้ (v1.0.0)
+- **อัปเดตเฟิร์มแวร์ผ่าน Wi-Fi** (SETUP → ปุ่ม **UPDATE**): เครื่องเช็คเวอร์ชันล่าสุดจาก GitHub Releases แล้วโหลด+ติดตั้งเอง ไม่ต้องต่อสาย USB — หน้าอัปเดตมีโลโก้ เปรี้ยว จูนเนอร์ มีแป้นพิมพ์บนจอสำหรับรหัส Wi-Fi และจำเครือข่ายไว้
+- เลขเวอร์ชันเริ่มนับที่ **v1.0.0** (แสดงที่หน้าโลโก้, SETUP → MORE และหน้า UPDATE)
+- **รองรับรถไทย 6 ยี่ห้อ**: Toyota, Honda, Isuzu, Mitsubishi, Nissan, Mazda — ตรวจยี่ห้อจากเลขตัวถัง (VIN) อัตโนมัติ, เลือกรุ่นเองได้ 62 รุ่น (SETUP → VEHICLE), รองรับโปรโตคอลทั้ง 9 แบบของ ELM327 (CAN, KWP, ISO 9141, J1850), ตรวจดีเซล/ไฮบริดเอง
+- **โลโก้ เปรี้ยว จูนเนอร์** ขึ้นก่อนเข้าหน้าหลัก
+- **พื้นหลังสีดำ** (จอบางรุ่นสีกลับ มีตัวสลับสีจอในตัว)
+- **หน้าตาใหม่ V4**: กล่องมุมโค้งเรืองแสงโทนดำ-น้ำเงิน มาตรวัดโค้งเรียบ ตัวอักษร Poppins แถบเมนูล่าง 6 แท็บ ตรงกับพรีวิวทุกตำแหน่ง + ธีมดำ-แดง (SETUP → เลือกธีม) — ฟังก์ชันทั้งหมดเหมือนเดิม
 
-## Build yourself
-`pio run -e cyd -t upload` (PlatformIO).
+## ติดตั้งครั้งแรก (ต้องแฟลชไฟล์เต็มผ่าน USB 1 ครั้ง)
+เวอร์ชันนี้เปลี่ยนตารางพาร์ทิชันของแฟลช (แบ่งเป็น 2 ส่วน: ตัวมาตรวัด + ตัวอัปเดต Wi-Fi) จึงต้องแฟลชไฟล์เต็ม `smart-gauge-<บอร์ด>-full.bin` ที่ **0x0** ครั้งเดียว หลังจากนั้นอัปเดตผ่าน Wi-Fi ได้ตลอด
+1. อัปโหลดไฟล์ทั้ง **5 ไฟล์** พร้อมกันขึ้น repo (Add file → Upload files → Commit changes):
+   - `main.cpp`
+   - `ui_assets.h`  (ไฟล์ใหญ่ ~1.1 MB รออัปโหลดจนเสร็จ)
+   - `platformio.ini`
+   - `partitions.csv`  (ไฟล์ใหม่)
+   - `build.yml` → วางที่ `.github/workflows/` ทับไฟล์เดิม (ในโฟลเดอร์นั้นของเดิมชื่อ `main.yml` ให้เปลี่ยนเนื้อหาเป็นของใหม่ หรือใช้ชื่อ `main.yml` ตอนอัปโหลด)
+   (`ui_strings.h` ไม่ใช้แล้ว ปล่อยไว้หรือลบก็ได้)
+2. แท็บ **Actions** → รอจนขึ้น ✅ (ประมาณ 5–8 นาที เพราะบิลด์ 2 ตัวต่อบอร์ด) → คลิกรอบล่าสุด → **Artifacts**
+   - `bin-cyd` สำหรับบอร์ด 1 USB
+   - `bin-cyd_st7789` สำหรับบอร์ด 2 USB
+   แตกซิปแล้วใช้ไฟล์ `smart-gauge-…-full.bin`
+3. แฟลชที่ https://espressif.github.io/esptool-js/ → Connect → Flash Address `0x0` → เลือกไฟล์ `smart-gauge-…-full.bin` → Program
 
-## Using it
-* Starts in **Demo** mode. Setup -> Data source -> OBD BT to connect to an ELM327 **Bluetooth Classic** adapter
-  (names tried: OBDII, V-LINK, OBD2, Vgate, VEEPEAK, OBDLink, ELM327, iCar; PIN 1234). BLE-only adapters are not supported.
-* Tap any of the 6 dash tiles to cycle through 16 values. Choices are remembered.
-* Car name comes from the VIN (Mode 09). Mazda 2 is recognised from VIN chars 4-5 (DJ/DE/DW) - best effort.
-* ATF temperature and oil temperature are not standard on most cars; they show "--" unless the car answers those PIDs.
-  ATF needs a Mazda-specific Mode 22 PID that is not included.
+## ออกเวอร์ชันใหม่ให้ลูกค้า (สำหรับเจ้าของ)
+1. แก้เลขเวอร์ชันใน `main.cpp` บรรทัด `#define FW_VERSION "v1.0.0"` (เช่น `v1.0.1`) พร้อมแก้โค้ดที่ต้องการ แล้ว Commit
+2. GitHub → **Releases → Draft a new release** → ช่อง *Choose a tag* พิมพ์ `v1.0.1` (ต้องตรงกับ FW_VERSION เป๊ะ) → **Create new tag** → **Publish release**
+3. ระบบ Actions บิลด์แล้วแนบไฟล์เข้า Release ให้เอง: `firmware_cyd.bin`, `firmware_cyd_st7789.bin` (ใช้อัปเดตผ่าน Wi-Fi) และ `smart-gauge-…-full.bin` (ใช้แฟลชผ่าน USB) — รอจนขึ้นครบ (ประมาณ 5–8 นาที)
+4. ลูกค้าเปิดเครื่อง → SETUP → UPDATE ก็จะเห็น "New version available"
+- **repo ที่เก็บ Release ต้องเป็น Public** เครื่องลูกค้าไม่มี token จึงอ่าน repo ส่วนตัวไม่ได้ (ตั้งชื่อ repo/เจ้าของที่ `UPD_OWNER` / `UPD_REPO` ใน `platformio.ini`, ค่าเริ่มต้น `preay25715-a11y/JetSmartGaugeCAR`)
+- อย่าลบไฟล์ใน Release ที่เป็นรุ่นล่าสุด และอย่าติ๊ก Pre-release (เครื่องอ่านเฉพาะรุ่นล่าสุดที่ไม่ใช่ pre-release)
 
-## CRP voltage (crankshaft position signal)
-OBD-II cannot give this. It is measured on GPIO35 (CYD P3 connector). The ESP32 ADC accepts 0-3.3 V only:
-use a resistor divider (set `CRP_RATIO` in platformio.ini = (Rtop+Rbottom)/Rbottom). A variable-reluctance (AC) sensor
-needs a conditioning circuit first. The value is an averaged level, not the waveform. Unconnected pin = noise.
+## วิธีอัปเดตของลูกค้า (ผ่าน Wi-Fi)
+1. จอดรถ ดับเครื่อง → SETUP → **UPDATE** → **Start update mode** (เครื่องรีสตาร์ท ปิดบลูทูธ เข้าโหมดอัปเดต)
+2. ครั้งแรก: **Wi-Fi** → เลือกเครือข่าย (ฮอตสปอตมือถือใช้ได้) → พิมพ์รหัสผ่าน → **Connect** (เครื่องจำเครือข่ายไว้ ครั้งต่อไปต่อเอง)
+3. เครื่องเช็คเวอร์ชันเอง ถ้าขึ้น **New version available** กด **Install update** → รอประมาณ 1–2 นาที **ห้ามปิดไฟ** → เสร็จแล้วรีสตาร์ทกลับเข้ามาตรวัดเอง
+4. อยากออกโดยไม่อัปเดต กด **Back** (รีสตาร์ทกลับมาตรวัด)
+- ถ้าอัปเดตไม่สำเร็จ (ไฟดับ/สัญญาณหลุด) ตัวอัปเดตยังอยู่ครบ เปิดเครื่องแล้วจะเข้าโหมดอัปเดตให้ลองใหม่ได้ ไม่ต้องแฟลชสาย
+- ตัวอัปเดตเอง (ส่วนที่ 2 ของแฟลช) ไม่ถูกอัปเดตผ่าน Wi-Fi ถ้าวันหน้าต้องแก้ จะออกไฟล์ `smart-gauge-…-full.bin` ให้แฟลชผ่าน USB
 
-## Troubleshooting
-* Red/blue swapped or inverted colours: add `-DCYD_INVERT=1` or `-DTFT_RGB_ORDER=TFT_BGR` to build_flags.
-* Touch offset: adjust the `map(p.x, 200, 3700 ...)` calibration in `loop()`.
-* Thai text is pre-rendered bitmaps (ui_strings.h). To change wording edit gen_strings.py (in the full zip) and run it
-  (needs `pip install pillow` with libraqm and a Thai font). PID names and fault-code descriptions stay English.
+## เปิดเครื่องครั้งแรก
+- จะขึ้นโลโก้ 7 วินาที **ถ้าพื้นหลังเป็นสีขาว ให้แตะจอ 1 ครั้ง** จะกลับเป็นสีดำและจำค่าไว้ (เปลี่ยนทีหลังได้ที่ SETUP → COLORS STD/INV)
+- ถ้าสีเพี้ยน (น้ำเงินกลายเป็นส้ม/แดง) ให้แฟลชไฟล์ของบอร์ดอีกแบบแทน (cyd ↔ cyd_st7789)
+- ค่าเริ่มต้นเป็นโหมด DEMO (ตัวเลขจำลอง) ลองกดดูทุกหน้าได้ก่อนต่อรถ
+
+## ต่อกับรถ
+1. SETUP → DATA SOURCE เลือก **OBD BT** → ปุ่ม **BLUETOOTH** → ค้นหา → แตะชื่ออะแดปเตอร์ของคุณ (เช่น KW902 / OBDII)
+2. เสียบอะแดปเตอร์ที่รถ เปิดสวิตช์ (ON หรือสตาร์ท) รอสถานะ CONNECTED — จำอะแดปเตอร์ไว้ ครั้งต่อไปต่อเอง; PIN ลองให้เองตามลำดับ 1234 / 0000 / 6789 / 1111
+3. ชื่อยี่ห้อ/รุ่นบนแถบหัวของหน้าหลักขึ้นเองจาก VIN (Mazda ขึ้นชื่อรุ่นเอง, ยี่ห้ออื่นขึ้นชื่อยี่ห้อ) ถ้าอยากให้ตรงรุ่นให้เลือกที่ SETUP → VEHICLE (ตั้งขนาดถังและรอบเตือนให้ตรงรุ่นด้วย)
+4. ถ้าต่อไม่ติด: SETUP → MORE → **PROTOCOL** ลองเลข 6 (CAN รถรุ่นใหม่) หรือ 3 / 4 / 5 (รถเก่า) แล้วรอ 2 วินาที จะต่อใหม่เอง; AUTO คือให้อัตโนมัติ
+
+## การใช้งานหลัก
+- หน้าหลัก: แตะช่องค่าทั้ง 6 ช่องเพื่อเปลี่ยนค่าที่แสดง (จำไว้), แตะกลางมาตรเพื่อสลับ ความเร็ว ↔ ค่า CRP (โวลต์)
+- DATA → ปุ่ม **CRP log** (รถดีเซล) / **AFR log** (รถเบนซิน). CRP log เป็นตารางค่าเฉลี่ย/ต่ำสุด/สูงสุดตามรอบเครื่องทีละ 1,000 รอบ; AFR log เป็นตารางแผนที่ AFR เฉลี่ย แกนนอน = รอบเครื่อง (0K–7K) แกนตั้ง = คันเร่ง TPS (0–75%) ช่องปัจจุบันมีกรอบเขียว ช่อง AFR 13.8–15.2 สีเขียว; ปุ่ม Reset ล้างตาราง (เก็บในหน่วยความจำ หายเมื่อปิดเครื่อง)
+- DATA / ALL PIDS ดูค่าทั้งหมดที่รถตอบ, GRAPH กราฟย้อนหลัง, TRIP ระยะทาง-อัตราสิ้นเปลือง-PEAKS, CODES อ่าน/ลบรหัสเสีย (ลบต้องกด 2 ครั้ง), STATUS = มอนิเตอร์/Freeze frame/ข้อมูล ECU
+- ดับเครื่องแล้วจะขึ้นหน้าจอจอดรถ (ปิดได้ที่ SETUP → MORE), มีเตือนน้ำร้อน/น้ำมันเครื่องร้อน/แบตต่ำ/ไฟ Check Engine
+
+## ข้อจำกัดที่ควรรู้
+- ระบบอัปเดต Wi-Fi ยังไม่ได้ทดสอบบนบอร์ดจริง/GitHub จริง (ทดสอบตรรกะและหน้าจอบนคอมพิวเตอร์เท่านั้น) และไฟล์เฟิร์มแวร์อาจใหญ่เกินช่องในแฟลช 4 MB — ขั้นตอน Actions จะแจ้ง error ขนาดไฟล์ให้ชัดเจนถ้าเกิดขึ้น
+- ตอนโหลดอัปเดตเครื่องตรวจความถูกต้องด้วย SHA-256 ของไฟล์ที่ GitHub แจ้ง แต่ไม่ได้ตรวจใบรับรอง TLS ของเซิร์ฟเวอร์ (บอร์ดไม่มีที่เก็บใบรับรอง)
+- ยังไม่ได้ลองกับบอร์ดจริงและรถจริง: คอมไพล์และวาดภาพหน้าจอทุกหน้าบนคอมพิวเตอร์เทียบกับพรีวิวแล้ว แต่ไม่ได้รันบนชิป ESP32 จริง (อาจมี error ตอนบิลด์จริงบน GitHub ให้ส่งข้อความ error มาได้) ถ้าเจออะไรผิดปกติบอกได้เลย
+- ค่าที่รถไม่รองรับจะแสดง `--` (บางรุ่นไม่มีอุณหภูมิน้ำมันเครื่อง, บูสต์, AFR ฯลฯ) ค่าเฉพาะยี่ห้อ (เช่น อุณหภูมิน้ำมันเกียร์) ยังไม่รวม ใช้ค่ามาตรฐาน OBD-II เท่านั้น
+- คำอธิบายรหัสเสียเป็นภาษาอังกฤษ; ข้อความภาษาไทยบางจุดอาจชิดกันเล็กน้อย; รหัสตัวอย่างมีเฉพาะโหมด DEMO
