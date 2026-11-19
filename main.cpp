@@ -47,7 +47,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "v1.0.2"
+#define FW_VERSION "v1.0.3"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -516,7 +516,7 @@ static float getVal(uint8_t pid, bool& ok) {
   uint32_t now = snapOn ? snapNow : millis();
   if (pid == 0x05 && now < testUntil) { ok = true; return 108; }
   if (demoMode) { ok = true; return snapOn ? pvS[pid] : pv[pid]; }
-  ok = (linkState == 2) && (snapOn ? psupS[pid] : psup[pid]) && (now - (snapOn ? pageS[pid] : page[pid]) < 8000);
+  ok = (linkState == 2) && (snapOn ? psupS[pid] : psup[pid]) && (now - (snapOn ? pageS[pid] : page[pid]) < ((pid == 0x0C || pid == 0x0D) ? 3000u : 8000u));
   return snapOn ? pvS[pid] : pv[pid];
 }
 
@@ -526,11 +526,12 @@ static bool abortWait() { return scanReq || reconnectReq || demoMode || !linkIsU
 static String elmQuery(const char* cmd, uint32_t tmo = 1500) {
   while (linkAvail()) linkRead();
   linkSend(cmd);
-  String r; uint32_t t0 = millis();
+  String r; r.reserve(96); uint32_t t0 = millis();
   while (millis() - t0 < tmo) {
-    while (linkAvail()) { char c = (char)linkRead(); if (c == '>') return r; r += c; }
+    bool got = false;
+    while (linkAvail()) { char c = (char)linkRead(); got = true; if (c == '>') return r; r += c; }
     if (abortWait()) break;
-    vTaskDelay(1);
+    if (!got) vTaskDelay(1);
   }
   return r;
 }
@@ -570,10 +571,23 @@ static int parseMsgs(const String& raw, Msg* out, int maxm) {
 static const int MAXM = 8;
 static Msg msgs[MAXM];                                  // used by the OBD task only
 
+// ---- poll speed (v1.0.3) ----
+static bool cntOk = true;                                   // the adapter takes the "number of replies" digit (010C1): it stops waiting as soon as the first answer is in
+static bool multiOk = false;                                // several PIDs in one request (CAN only); switched off by itself when the car does not answer them
+static uint8_t multiBad = 0, multiShort = 0;
+static uint8_t pfail[256]; static uint32_t pskip[256];      // a PID that keeps answering nothing is skipped for a while, so it cannot slow the others down
+static uint32_t iterNow = 0;                                // poll round counter
+static bool vinPending = false;                             // the VIN is read a few rounds after the link came up, so the first values show at once
+static volatile uint16_t obdRpmMs = 0;                      // measured time between two RPM updates (shown on the ECU page)
+static void resetPollState() { memset(pfail, 0, sizeof pfail); memset(pskip, 0, sizeof pskip); multiBad = 0; multiShort = 0; }
+static uint32_t pollTmo() { return protoNum >= 6 ? 800 : 1500; }   // CAN answers in milliseconds: a silent adapter is noticed quickly
 static bool queryPid(uint8_t pid, uint8_t* b, int& n, uint32_t tmo = 1200, int mode = 1, int frame = -1) {
   char cmd[12];
-  if (mode == 2) snprintf(cmd, sizeof cmd, "02%02X%02X", pid, frame < 0 ? 0 : frame); else snprintf(cmd, sizeof cmd, "%02X%02X", mode, pid);
-  int nm = parseMsgs(elmQuery(cmd, tmo), msgs, MAXM);
+  bool dig = mode == 1 && cntOk;
+  if (mode == 2) snprintf(cmd, sizeof cmd, "02%02X%02X", pid, frame < 0 ? 0 : frame); else snprintf(cmd, sizeof cmd, "%02X%02X%s", mode, pid, dig ? "1" : "");
+  String raw = elmQuery(cmd, tmo);
+  if (dig && raw.indexOf('?') >= 0) { cntOk = false; snprintf(cmd, sizeof cmd, "%02X%02X", mode, pid); raw = elmQuery(cmd, tmo); }   // this adapter does not know the digit
+  int nm = parseMsgs(raw, msgs, MAXM);
   for (int i = 0; i < nm; i++) {
     const Msg& m = msgs[i];
     int off = mode == 2 ? 3 : 2;
@@ -642,6 +656,7 @@ static bool elmInit() {
   int p = 0;
   for (unsigned i = 0; i < d.length(); i++) { char c = d[i]; if (c >= '1' && c <= '9') { p = c - '0'; break; } }
   protoNum = p;
+  cntOk = true; multiOk = p >= 6; resetPollState(); obdRpmMs = 0;       // CAN: combined requests are tried first and dropped by themselves if the car does not take them
   if (p >= 3 && p <= 5) elmQuery("ATST64", 1000);            // slow K-line ECUs: allow 400 ms for an answer
   if (p && p != lastProto) { lastProto = p; protoDirty = true; }
   return true;
@@ -730,17 +745,84 @@ static void doFreeze() {
   frzState = 2; frzVer = frzVer + 1;
 }
 
-static void pollPid(uint8_t pid, int& fails) {
+static bool pollPid(uint8_t pid, int& fails);
+static uint8_t pidLen(uint8_t id) {                                  // data bytes (SAE J1979) of the PIDs that may be asked together; 0 = ask alone
+  switch (id) {
+    case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0D: case 0x0E: case 0x0F: case 0x11:
+    case 0x2C: case 0x2D: case 0x2E: case 0x2F: case 0x30: case 0x33: case 0x45: case 0x46: case 0x47: case 0x49: case 0x4A: case 0x4C:
+    case 0x51: case 0x52: case 0x5A: case 0x5B: case 0x5C: case 0x61: case 0x62: return 1;
+    case 0x0C: case 0x10: case 0x14: case 0x15: case 0x1F: case 0x21: case 0x22: case 0x23: case 0x31: case 0x32: case 0x3C: case 0x3E:
+    case 0x42: case 0x43: case 0x44: case 0x4D: case 0x4E: case 0x59: case 0x5D: case 0x5E: case 0x63: return 2;
+    case 0x24: case 0x34: return 4;
+  }
+  return 0;
+}
+static void notePidFail(uint8_t pid) { if (++pfail[pid] >= 3) { pfail[pid] = 3; pskip[pid] = iterNow + 30; } }   // 3 misses in a row: leave it alone for 30 rounds
+static void noteRpm() {
+  static uint32_t last = 0; uint32_t t = millis();
+  if (last && t - last < 3000) obdRpmMs = obdRpmMs ? (uint16_t)((obdRpmMs * 3 + (t - last)) / 4) : (uint16_t)(t - last);
+  last = t;
+}
+static bool plausible(uint8_t pid, float v) {                        // "not available" answers (0xFF..) must never reach the screen as numbers
+  switch (pid) {
+    case 0x0C: return v < 16000; case 0x10: return v < 650; case 0x42: return v < 40; case 0x5E: return v < 3000;
+    case 0x24: case 0x44: return v < 1.9999f;
+  }
+  return true;
+}
+static void storePid(uint8_t pid, const uint8_t* b, int n, uint32_t t) { float v = decodePid(pid, b, n); if (plausible(pid, v)) { pv[pid] = v; page[pid] = t; } }
+static int queryMulti(const uint8_t* ids, int cnt, uint8_t* got) {  // one request for several PIDs; got[i] = 1 when ids[i] was decoded; returns how many
+  char cmd[24]; int k = snprintf(cmd, sizeof cmd, "01");
+  for (int i = 0; i < cnt; i++) k += snprintf(cmd + k, sizeof cmd - k, "%02X", ids[i]);
+  String r;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    char c2[24]; snprintf(c2, sizeof c2, "%s%s", cmd, cntOk ? "1" : "");
+    r = elmQuery(c2, pollTmo());
+    if (!cntOk || r.indexOf('?') < 0) break;
+    cntOk = false;                                                   // the adapter does not know the digit: ask again without it
+  }
+  int nm = parseMsgs(r, msgs, MAXM), ok = 0; uint32_t t = millis();
+  for (int i = 0; i < nm; i++) {
+    const Msg& m = msgs[i];
+    if (m.n < 3 || m.b[0] != 0x41) continue;
+    int j = 1;
+    while (j < m.n) {
+      uint8_t pid = m.b[j]; int len = pidLen(pid);
+      if (!len || j + 1 + len > m.n) break;
+      for (int q = 0; q < cnt; q++) if (ids[q] == pid && !got[q]) { storePid(pid, m.b + j + 1, len, t); got[q] = 1; ok++; }
+      j += 1 + len;
+    }
+  }
+  return ok;
+}
+static void pollGroup(const uint8_t* ids, int cnt, int& fails) {
+  uint8_t got[6] = {0, 0, 0, 0, 0, 0};
+  int ok = queryMulti(ids, cnt, got);
+  if (ok == 0) {                                                     // nothing decoded: the car is silent, or it does not take combined requests - one plain RPM query tells which
+    int f2 = 0;
+    if (pollPid(0x0C, f2)) { fails = 0; if (++multiBad >= 2) { multiOk = false; resetPollState(); } }
+    else fails++;
+    return;
+  }
+  fails = 0; multiBad = 0;
+  if (got[0]) noteRpm();
+  bool all = true;
+  for (int q = 0; q < cnt; q++) { if (got[q]) { pfail[ids[q]] = 0; pskip[ids[q]] = 0; } else { all = false; notePidFail(ids[q]); } }
+  if (all) multiShort = 0; else if (++multiShort >= 6) { multiOk = false; resetPollState(); }   // the car only answers part of a combined request: back to single requests
+}
+static bool pollPid(uint8_t pid, int& fails) {
   uint8_t b[9]; int n = 0;
-  if (queryPid(pid, b, n)) {
-    pv[pid] = decodePid(pid, b, n); page[pid] = millis(); fails = 0;
+  if (queryPid(pid, b, n, pollTmo())) {
+    storePid(pid, b, n, millis()); fails = 0; pfail[pid] = 0; pskip[pid] = 0;
+    if (pid == 0x0C) noteRpm();
     if (pid == 0x01 && n >= 4) {
       mil = (b[0] & 0x80) != 0; dtcCount = b[0] & 0x7F;
       monRaw = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3]; monValid = true; monVer = monVer + 1;
       ecuDiesel = (b[1] & 0x08) != 0; ecuDieselKnown = true;            // SAE J1979: PID 01 byte B bit 3 = compression ignition
     }
     if (pid == 0x51) { int f = b[0]; if (f >= 0x10 && f <= 0x15) ecuHybrid = true; if (f == 4 || f == 0x12) { ecuDiesel = true; ecuDieselKnown = true; } }
-  } else fails++;
+  } else { fails++; notePidFail(pid); return false; }
+  return true;
 }
 
 static void detectVehicle() {
@@ -749,13 +831,13 @@ static void detectVehicle() {
   int f = 0;
   pollPid(0x01, f);
   if (psup[0x51]) pollPid(0x51, f);
-  readVin();
+  vinPending = true;                                   // the VIN follows a few rounds later (obdTask), after the first values are on the screen
 }
 
 static int nextWanted(int& rr, int tier) {
   for (int i = 0; i < 255; i++) {
     rr = (rr % 255) + 1;
-    if (psup[rr] && want[rr] == tier && rr != 0x0C && rr != 0x0D && rr != 0x01) return rr;
+    if (psup[rr] && want[rr] == tier && rr != 0x0C && rr != 0x0D && rr != 0x01 && (int32_t)(iterNow - pskip[rr]) >= 0) return rr;
   }
   return -1;
 }
@@ -776,7 +858,7 @@ void obdTask(void*) {
       bool ok = linkConnect(sa, sb, st);
       if (!ok) {
         if (!sb && !pinOk && gen == selGen) pinIdx = (pinIdx + 1) % NPINS;   // wrong PIN? the next common one is tried on the next attempt
-        if (!scanReq && !reconnectReq) vTaskDelay(3000);
+        if (!scanReq && !reconnectReq) vTaskDelay(1500);
         continue;
       }
       if (demoMode || scanReq || reconnectReq) continue;
@@ -786,27 +868,45 @@ void obdTask(void*) {
         continue;
       }
       if (!sb && gen == selGen && (!pinOk || pinIdx != pinSaved)) { pinOk = true; pinDirty = true; }   // this PIN works: remember it
-      discoverPids(); detectVehicle(); fails = 0; linkState = 2; lastMil = millis();
+      discoverPids(); detectVehicle(); fails = 0; iter = 0; linkState = 2; lastMil = millis();
     }
     while (!demoMode && linkIsUp() && fails < 8 && !scanReq && !reconnectReq) {
       if (req == 1) { req = 0; doReadCodes(); }
       else if (req == 2) { req = 0; doClearCodes(); }
       else if (req == 3) { req = 0; doFreeze(); }
       else if (req == 4) { req = 0; doEcuInfo(); }
-      pollPid(0x0C, fails); pollPid(0x0D, fails);
-      int others = protoNum >= 6 || protoNum == 0 ? 3 : 2;               // K-line answers are slower: fewer other PIDs per round keeps rpm/speed lively
-      for (int k = 0; k < others; k++) {
-        bool bg = (iter % 4 == 3 && k == 0);                              // PIDs that are on screen are polled 3 rounds out of 4, background ones (alerts, trip, graphs) in between
-        int p = nextWanted(bg ? rrBg : rrFg, bg ? 1 : 2);
-        if (p < 0) p = nextWanted(bg ? rrFg : rrBg, bg ? 2 : 1);
-        if (p >= 0) pollPid((uint8_t)p, fails);
+      iter++; iterNow = (uint32_t)iter;
+      if (vinPending && iter >= 6) { vinPending = false; readVin(); }
+      if (multiOk && protoNum >= 6) {
+        // CAN: RPM, speed and up to 4 more PIDs travel in ONE request (the last place rotates the background PIDs: alerts, trip, graphs)
+        uint8_t ids[6]; int cnt = 0, single = -1;
+        ids[cnt++] = 0x0C; ids[cnt++] = 0x0D;
+        for (int k = 0; k < 4; k++) {
+          bool bg = (k == 3);
+          int p = nextWanted(bg ? rrBg : rrFg, bg ? 1 : 2);
+          if (p < 0) p = nextWanted(bg ? rrFg : rrBg, bg ? 2 : 1);
+          if (p < 0) continue;
+          bool dup = false; for (int q = 0; q < cnt; q++) if (ids[q] == p) dup = true;
+          if (dup) continue;
+          if (pidLen((uint8_t)p)) ids[cnt++] = (uint8_t)p; else if (single < 0) single = p;
+        }
+        pollGroup(ids, cnt, fails);
+        if (single >= 0 && multiOk) pollPid((uint8_t)single, fails);
+      } else {
+        pollPid(0x0C, fails); pollPid(0x0D, fails);
+        int others = protoNum >= 6 || protoNum == 0 ? 3 : 2;               // K-line answers are slower: fewer other PIDs per round keeps rpm/speed lively
+        for (int k = 0; k < others; k++) {
+          bool bg = (iter % 4 == 3 && k == 0);                              // PIDs that are on screen are polled 3 rounds out of 4, background ones (alerts, trip, graphs) in between
+          int p = nextWanted(bg ? rrBg : rrFg, bg ? 1 : 2);
+          if (p < 0) p = nextWanted(bg ? rrFg : rrBg, bg ? 2 : 1);
+          if (p >= 0) pollPid((uint8_t)p, fails);
+        }
       }
-      iter++;
-      if (millis() - lastMil > 5000) { pollPid(0x01, fails); lastMil = millis(); }
+      if (millis() - lastMil > 2000) { pollPid(0x01, fails); lastMil = millis(); }          // warning lamp / readiness bits
       vTaskDelay(1);
     }
     linkDown();
-    linkState = 1; if (!scanReq && !reconnectReq) vTaskDelay(1000);
+    linkState = 1; if (!scanReq && !reconnectReq) vTaskDelay(300);
   }
 }
 
@@ -1473,14 +1573,20 @@ static void markSrc(int s, int tier) {
     case M_FUELRATE: markWant(0x5E, tier); markWant(0x10, tier); markWant(0x0B, tier); markWant(0x0F, tier); markWant(0x62, tier); markWant(0x63, tier); break;
   }
 }
+static const int ALL_ROWS = 5;
+static uint8_t allIdx[NPID]; static int allN = 0, allPg = 0;
 static void updateWants() {
   memset(want, 0, sizeof want);
   static const uint8_t BG[] = {0x05, 0x42, 0x5C, 0x5E, 0x10, 0x0B, 0x0F, 0x2F, 0x44, 0x24, 0x33, 0x04, 0x06, 0x62, 0x63};
   for (unsigned i = 0; i < sizeof BG; i++) markWant(BG[i], 1);
   markWant(0x0C, 2); markWant(0x0D, 2);
+  markWant(0x5E, 2); markWant(0x10, 2); markWant(0x24, 2); markWant(0x44, 2);      // fuel rate / air flow / lambda feed the trip and consumption figures all the time
   if (scr == PG_DASH) for (int i = 0; i < 6; i++) markSrc(MET[slots[i]].src, 2);
   else if (scr == PG_DATA) { for (int i = 0; i < 16; i++) { DTile t; dtileOf(i, t); markSrc(t.src, 2); } }
-  else if (scr == PG_ALL) { for (int i = 0; i < NPID; i++) markWant(PIDS[i].id, 2); }
+  else if (scr == PG_ALL) {
+    for (int i = 0; i < NPID; i++) markWant(PIDS[i].id, 1);
+    for (int r = 0; r < ALL_ROWS; r++) { int k = allPg * ALL_ROWS + r; if (k < allN) markWant(PIDS[allIdx[k]].id, 2); }      // the rows that are on screen
+  }
   else if (scr == PG_GRAPH) {
     static const int GS[4][3] = {{0x0C, 0x0D, 0}, {0x05, 0x5C, 0x0F}, {M_AFR, 0x06, 0x07}, {0x42, 0, 0}};
     for (int k = 0; k < 3; k++) if (GS[gsel][k]) markSrc(GS[gsel][k], 2);
@@ -1748,8 +1854,6 @@ static void tapLog(int x, int y, bool first) {
 }
 
 // ---------- all PIDs ----------
-static const int ALL_ROWS = 5;
-static uint8_t allIdx[NPID]; static int allN = 0, allPg = 0;
 static void allBuild() { allN = 0; for (int i = 0; i < NPID; i++) if (allMode || demoMode || psup[PIDS[i].id]) allIdx[allN++] = (uint8_t)i; }
 static int allPages() { return max(1, (allN + ALL_ROWS - 1) / ALL_ROWS); }
 static void drawAll() {
@@ -2272,7 +2376,8 @@ static void drawEcu() {
   ecuBox(56, S_VIN, vinBuf); ecuBox(96, S_ECUNAME, ecuName); ecuBox(136, S_CALID, calId);
   tile(9, 175, 302, 22, 8);
   lab(S_PROTO, LB_TILE, 18, tby(189), T.dim);
-  txt(F_UM, demoMode ? "--" : (protoNum ? protoName(protoNum) : "--"), 303, thai ? 192 : 189, T.text, AL_R);
+  char pn[32]; if (!protoNum) strcpy(pn, "--"); else if (obdRpmMs && linkState == 2) snprintf(pn, sizeof pn, "%s  %u ms", protoName(protoNum), (unsigned)obdRpmMs); else snprintf(pn, sizeof pn, "%s", protoName(protoNum));
+  txt(F_UM, pn, 303, thai ? 192 : 189, T.text, AL_R);
   tabBar(4);
 }
 // the four code pages share one row of chips (and its Read chip); returns true when the touch was handled
@@ -3213,7 +3318,7 @@ static void renderFrame() {
   memcpy(pvS, pv, sizeof pv); memcpy(psupS, psup, sizeof psup); memcpy(pageS, page, sizeof page);
   snapOn = true;
 #ifndef UPD_BUILD
-  if (scr == PG_ALL) allBuild();
+  if (scr == PG_ALL) { int oN = allN, oP = allPg; allBuild(); if (allN != oN || allPg != oP) updateWants(); }
   if (scr == PG_BT) btBuildView();
 #endif
   for (int b = 0; b < NBAND; b++) {
@@ -3340,16 +3445,16 @@ void loop() {
   if (uprotoAt && now - uprotoAt > 1500) { uprotoAt = 0; if (!demoMode) reconnectReq = true; }
   updLoop(now);
 
-  static uint32_t tSim = 0, tUI = 0, tGraph = 0; static int lastLs = -1;
+  static uint32_t tSim = 0, tUI = 0, tGraph = 0, tCrp = 0; static int lastLs = -1;
+  if (now - tCrp >= 20) { tCrp = now; crpV = crpV * 0.5f + readCrp() * 0.5f; }
   if (now - tSim >= 100) {
     float dt = (now - tSim) / 1000.0f; tSim = now;
-    crpV = crpV * 0.7f + readCrp() * 0.3f;
     tripStep(dt); peaksStep(); logStep(); alertsStep(); parkStep(now);
     if (linkState != lastLs) { lastLs = linkState; if (linkState == 2 && !slotsCustom) autoSlots(); }
     if (scr == PG_SPLASH && now - splashAt > splashMs()) { if (firstRun) savePrefs(); nav(PG_DASH); }
   }
   if (now - tGraph >= 1000) { tGraph = now; graphSample(); }
-  if (!screenOff && (redraw || now - tUI >= 80)) { tUI = now; redraw = false; renderFrame(); }
-  delay(5);
+  if (!screenOff && (redraw || now - tUI >= 33)) { tUI = now; redraw = false; renderFrame(); }
+  delay(1);
 }
 #endif
