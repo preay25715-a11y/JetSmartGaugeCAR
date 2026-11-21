@@ -47,7 +47,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "v1.0.4"
+#define FW_VERSION "v1.0.5"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -1831,48 +1831,22 @@ static void tapData(int x, int y, bool first) {
   if (m == 1) nav(PG_ALL); else if (m == 2 || m == 3) { logKind = (uint8_t)(m - 2); nav(PG_LOG); }
 }
 
-// ---------- data log: CRP volts (diesel) or AFR (petrol) for each 1000 rpm band ----------
+// ---------- data log: CRP volts and AFR (petrol and diesel), a table per rpm band ----------
 static const int LOGN = 8;
 struct LogBin { uint32_t n; float sum, mn, mx; };
 static LogBin logB[2][LOGN];                                    // [0] CRP volts, [1] AFR
 static int logW() { return vehBike() ? 2000 : 1000; }           // rpm per row (bikes rev higher)
 static int logBin(float rpm) { return min(LOGN - 1, (int)(rpm / logW())); }
-static const int TBN = 7, TBV[TBN] = {0, 5, 10, 20, 35, 50, 75};            // AFR map: throttle rows x 1000 rpm columns
-static uint32_t amN[TBN][LOGN]; static float amSum[TBN][LOGN];
-static int tpsRow(float t) { int r = 0; for (int i = 0; i < TBN; i++) if (t >= TBV[i]) r = i; return r; }
-static void logClear() { memset(amN, 0, sizeof amN); memset(amSum, 0, sizeof amSum); for (auto& s : logB) for (auto& b : s) { b.n = 0; b.sum = 0; b.mn = 1e9f; b.mx = -1e9f; } }
+static void logClear() { for (auto& s : logB) for (auto& b : s) { b.n = 0; b.sum = 0; b.mn = 1e9f; b.mx = -1e9f; } }
 static void logStep() {
   bool ok; float rpm = getVal(0x0C, ok); if (!ok || rpm < 400) return;
   int b = logBin(rpm);
-  { bool o1, o2; float t = getVal(0x11, o1), a = metricVal(M_AFR, o2); if (o1 && o2) { int r = tpsRow(t); amN[r][b]++; amSum[r][b] += a; } }
   for (int k = 0; k < 2; k++) { bool o; float v = metricVal(k ? M_AFR : M_CRP, o); if (!o) continue; LogBin& L = logB[k][b]; L.n++; L.sum += v; L.mn = fminf(L.mn, v); L.mx = fmaxf(L.mx, v); }
-}
-static void afrMap(bool rok, float rpm) {                         // petrol: average AFR for each throttle row and 1000 rpm column
-  tile(9, 56, 302, 141);
-  bool ot, oa; float tps = getVal(0x11, ot), afr = metricVal(M_AFR, oa);
-  int cc = rok && rpm >= 400 ? logBin(rpm) : -1, cr = ot ? tpsRow(tps) : -1; char b[40];
-  if (rok) { char t[12]; fmtThou(t, sizeof t, (int)rpm); snprintf(b, sizeof b, "%s rpm   TPS ", t); } else strcpy(b, "-- rpm   TPS ");
-  { char t[8]; if (ot) snprintf(t, sizeof t, "%d%%", (int)lroundf(tps)); else strcpy(t, "--"); strcat(b, t); }
-  txt(F_US, b, 18, 70, T.text);
-  { char t[16]; strcpy(t, "AFR "); if (oa) { char u[8]; fmtv(u, sizeof u, afr, 1); strcat(t, u); } else strcat(t, "--"); txt(F_US, t, 303, 70, oa && afr >= 14.2f && afr <= 15.2f ? T.good : T.text, AL_R); }
-  for (int r = 0; r < TBN; r++) {
-    int y = 78 + (TBN - 1 - r) * 13; char l[6]; snprintf(l, sizeof l, "%d", TBV[r]);
-    txt(F_LS, l, 34, y + 10, T.dim, AL_R);
-    for (int c = 0; c < LOGN; c++) {
-      int x = 38 + c * 33; uint32_t n = amN[r][c]; float v = n ? amSum[r][c] / n : 0; bool cur = r == cr && c == cc;
-      uint16_t fill = !n ? mixRgb(TA.panel, TA.line, 115) : (v >= 13.8f && v <= 15.2f ? mixRgb(TA.panel, TA.good, 128) : mixRgb(TA.line, TA.dim, 77));
-      rr(x, y, 32, 12, 3, fill, cur ? T.good : -1);
-      if (n) { fmtv(b, sizeof b, v, 1); txt(F_LS, b, x + 16, y + 10, T.text, AL_C); }
-      if (cur) disc(x + 3, y + 3, 1.6f, T.good);
-    }
-  }
-  for (int c = 0; c < LOGN; c++) { snprintf(b, sizeof b, "%dK", c * logW() / 1000); txt(F_LS, b, 38 + c * 33 + 16, 183, T.dim, AL_C); }
 }
 static void drawLog() {
   bool dsl = vehDiesel(); int k = logKind; const LogBin* L = logB[k]; int rows = dsl && !vehBike() ? 6 : 8, dec = k == 0 ? 2 : 1; bool ok; float rpm = getVal(0x0C, ok);
   int cur = ok && rpm >= 400 ? logBin(rpm) : -1;
   topBar(ok ? rpm : 0); modeChips(DATA_MODES, 4, 2 + k); chipId(S_RESET, 255, 32, 56, 20, false);
-  if (k == 1 && !dsl) { afrMap(ok, rpm); tabBar(1); return; }        // petrol AFR: map of throttle rows x rpm columns; diesel AFR and every CRP log: table per rpm row
   tile(9, 56, 302, 141);
   lab(S_RPM, LB_TILE, 18, tby(68), T.dim); lab(S_AVG, LB_TILE, 138, tby(68), T.dim, AL_R); lab(S_LOGMIN, LB_TILE, 200, tby(68), T.dim, AL_R); lab(S_GMAX, LB_TILE, 262, tby(68), T.dim, AL_R);
   hl(15, 73, 290, T.sep);
@@ -1882,8 +1856,9 @@ static void drawLog() {
     if (i == cur) rr(12, y, 296, 14, 5, T.panel2, T.acc);
     if (i == LOGN - 1) snprintf(lb, sizeof lb, "%dK+", i * logW() / 1000); else snprintf(lb, sizeof lb, "%d-%dK", i * logW() / 1000, (i + 1) * logW() / 1000);
     txt(F_US, lb, 18, y + 11, i == cur ? T.accL : T.text);
-    uint16_t col = n ? T.text : T.dim;
-    if (n) fmtv(b, sizeof b, L[i].sum / n, dec); else strcpy(b, "--"); txt(F_US, b, 138, y + 11, col, AL_R);
+    uint16_t col = n ? T.text : T.dim, cav = col;
+    if (n && k == 1 && !dsl) { float a = L[i].sum / n; if (a >= 13.8f && a <= 15.2f) cav = T.good; }   // petrol AFR in the 13.8-15.2 window
+    if (n) fmtv(b, sizeof b, L[i].sum / n, dec); else strcpy(b, "--"); txt(F_US, b, 138, y + 11, cav, AL_R);
     if (n) fmtv(b, sizeof b, L[i].mn, dec); else strcpy(b, "--"); txt(F_US, b, 200, y + 11, col, AL_R);
     if (n) fmtv(b, sizeof b, L[i].mx, dec); else strcpy(b, "--"); txt(F_US, b, 262, y + 11, col, AL_R);
     rr(272, y + 5, 32, 4, 1, T.dark); int w = (int)lroundf(32.0f * n / nmax); if (w >= 2) rr(272, y + 5, w, 4, 1, T.acc);
