@@ -47,7 +47,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "v1.0.6"
+#define FW_VERSION "v1.0.7"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -585,11 +585,13 @@ static Msg msgs[MAXM];                                  // used by the OBD task 
 static bool cntOk = true;                                   // the adapter takes the "number of replies" digit (010C1): it stops waiting as soon as the first answer is in
 static bool multiOk = false;                                // several PIDs in one request (CAN only); switched off by itself when the car does not answer them
 static uint8_t multiBad = 0, multiShort = 0;
+static bool kMulti = false;                                 // K-line: RPM + speed in ONE request (J1979 only promises this on CAN, so it is tried and dropped by itself when the car does not answer both)
 static uint8_t pfail[256]; static uint32_t pskip[256];      // a PID that keeps answering nothing is skipped for a while, so it cannot slow the others down
 static uint32_t iterNow = 0;                                // poll round counter
 static bool vinPending = false;                             // the VIN is read a few rounds after the link came up, so the first values show at once
 static volatile uint16_t obdRpmMs = 0;                      // measured time between two RPM updates (shown on the ECU page)
 static void resetPollState() { memset(pfail, 0, sizeof pfail); memset(pskip, 0, sizeof pskip); multiBad = 0; multiShort = 0; }
+static void multiOff() { multiOk = false; kMulti = false; resetPollState(); }       // the car does not take combined requests: one PID per request from now on
 static uint32_t pollTmo() { return protoNum >= 6 ? 800 : 1500; }   // CAN answers in milliseconds: a silent adapter is noticed quickly
 static bool queryPid(uint8_t pid, uint8_t* b, int& n, uint32_t tmo = 1200, int mode = 1, int frame = -1) {
   char cmd[12];
@@ -666,7 +668,7 @@ static bool elmInit() {
   int p = 0;
   for (unsigned i = 0; i < d.length(); i++) { char c = d[i]; if (c >= '1' && c <= '9') { p = c - '0'; break; } }
   protoNum = p;
-  cntOk = true; multiOk = p >= 6; resetPollState(); obdRpmMs = 0;       // CAN: combined requests are tried first and dropped by themselves if the car does not take them
+  cntOk = true; multiOk = p >= 6; resetPollState(); kMulti = p >= 3 && p <= 5; obdRpmMs = 0;       // CAN: combined requests are tried first and dropped by themselves if the car does not take them
   if (p >= 3 && p <= 5) elmQuery("ATST64", 1000);            // slow K-line ECUs: allow 400 ms for an answer
   if (p && p != lastProto) { lastProto = p; protoDirty = true; }
   return true;
@@ -806,20 +808,21 @@ static int queryMulti(const uint8_t* ids, int cnt, uint8_t* got) {  // one reque
   }
   return ok;
 }
-static void pollGroup(const uint8_t* ids, int cnt, int& fails) {
+static int pollGroup(const uint8_t* ids, int cnt, int& fails) {      // returns how many PIDs the car answered
   uint8_t got[6] = {0, 0, 0, 0, 0, 0};
   int ok = queryMulti(ids, cnt, got);
   if (ok == 0) {                                                     // nothing decoded: the car is silent, or it does not take combined requests - one plain RPM query tells which
     int f2 = 0;
-    if (pollPid(0x0C, f2)) { fails = 0; if (++multiBad >= 2) { multiOk = false; resetPollState(); } }
+    if (pollPid(0x0C, f2)) { fails = 0; if (++multiBad >= 2) multiOff(); }
     else fails++;
-    return;
+    return 0;
   }
   fails = 0; multiBad = 0;
   if (got[0]) noteRpm();
   bool all = true;
   for (int q = 0; q < cnt; q++) { if (got[q]) { pfail[ids[q]] = 0; pskip[ids[q]] = 0; } else { all = false; notePidFail(ids[q]); } }
-  if (all) multiShort = 0; else if (++multiShort >= 6) { multiOk = false; resetPollState(); }   // the car only answers part of a combined request: back to single requests
+  if (all) multiShort = 0; else if (++multiShort >= 6) multiOff();   // the car only answers part of a combined request: back to single requests
+  return ok;
 }
 static bool pollPid(uint8_t pid, int& fails) {
   uint8_t b[9]; int n = 0;
@@ -875,6 +878,11 @@ static void autoPick() {
   carBuf[0] = 0; vinBuf[0] = 0; pinDirty = true;         // loop() saves the choice
 }
 
+static void pollOther(int& rrFg, int& rrBg, bool bg, int& fails) {   // one PID that is not RPM/speed: the ones on screen first, background ones (alerts, trip, graphs) in between
+  int p = nextWanted(bg ? rrBg : rrFg, bg ? 1 : 2);
+  if (p < 0) p = nextWanted(bg ? rrFg : rrBg, bg ? 2 : 1);
+  if (p >= 0) pollPid((uint8_t)p, fails);
+}
 void obdTask(void*) {
   int rrFg = 0, rrBg = 0, fails = 0, iter = 0; uint32_t lastMil = 0;
   for (;;) {
@@ -930,17 +938,20 @@ void obdTask(void*) {
         }
         pollGroup(ids, cnt, fails);
         if (single >= 0 && multiOk) pollPid((uint8_t)single, fails);
-      } else {
-        pollPid(0x0C, fails); pollPid(0x0D, fails);
-        int others = protoNum >= 6 || protoNum == 0 ? 3 : 2;               // K-line answers are slower: fewer other PIDs per round keeps rpm/speed lively
-        for (int k = 0; k < others; k++) {
-          bool bg = (iter % 4 == 3 && k == 0);                              // PIDs that are on screen are polled 3 rounds out of 4, background ones (alerts, trip, graphs) in between
-          int p = nextWanted(bg ? rrBg : rrFg, bg ? 1 : 2);
-          if (p < 0) p = nextWanted(bg ? rrFg : rrBg, bg ? 2 : 1);
-          if (p >= 0) pollPid((uint8_t)p, fails);
+      } else if (kMulti && protoNum >= 3 && protoNum <= 5) {
+        // K-line, pair mode: RPM + speed in ONE request, then one ordinary PID, twice per round -> RPM every 2nd request
+        static const uint8_t RS[2] = {0x0C, 0x0D};
+        for (int h = 0; h < 2 && kMulti && fails < 8 && !abortWait(); h++) {
+          if (pollGroup(RS, 2, fails) < 2 && !abortWait()) pollPid(0x0D, fails);        // the car gave only one of them: speed is asked alone
+          pollOther(rrFg, rrBg, iter % 4 == 3 && h == 0, fails);
         }
+      } else {
+        // one PID per request: RPM twice per round (the gauge people watch), speed once, then the others (K-line: 1, CAN fallback: 2)
+        pollPid(0x0C, fails); pollPid(0x0D, fails); pollPid(0x0C, fails);
+        int others = protoNum >= 6 || protoNum == 0 ? 2 : 1;
+        for (int k = 0; k < others; k++) pollOther(rrFg, rrBg, iter % 4 == 3 && k == 0, fails);   // on-screen PIDs 3 rounds out of 4, background ones in between
       }
-      if (millis() - lastMil > 2000) { pollPid(0x01, fails); lastMil = millis(); }          // warning lamp / readiness bits
+      if (millis() - lastMil > (protoNum >= 6 ? 2000u : 4000u)) { pollPid(0x01, fails); lastMil = millis(); }   // warning lamp / readiness bits (K-line: every request counts, so less often)
       vTaskDelay(1);
     }
     linkDown();
