@@ -47,7 +47,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "v1.0.3"
+#define FW_VERSION "v1.0.4"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -140,12 +140,22 @@ static const Model MODELS[] = {
 static const int NMODEL = sizeof(MODELS) / sizeof(MODELS[0]);
 static int vehModel = -1;                        // chosen model (index into MODELS) or -1 = automatic (VIN)
 
+// ---- v1.0.4: screen flip, motorcycle auto detection ----
+static int autoModel = -1;                       // bike model taught by an earlier pick for this VIN code (-1 = none)
+static bool autoBike = false;                    // the VIN says this is a motorcycle (saved, so the scale is right before the car answers)
+static bool flipScr = false;                     // screen turned 180 degrees (gauge fitted upside down)
+struct VMap { char c[6]; uint8_t m; };            // VIN characters 4-8 (model / type code) -> model the owner picked for them
+static VMap vmap[8]; static int nvmap = 0, vmapNext = 0;
+static volatile bool vinNew = false;             // a VIN was read: loop() applies it
+static volatile bool btBrowsing = false;         // the Bluetooth page is open: no automatic adapter search meanwhile
+static int effModel() { return vehModel >= 0 ? vehModel : autoModel; }
+
 // VIN world-manufacturer codes -> brand (0..5 = a brand above, 100+ = another make that is only named)
 struct Wmi { const char* w; uint8_t brand; };
 static const char* const OTHER[] = {"FORD", "SUZUKI", "MG", "CHEVROLET", "SUBARU", "BMW", "HINO", "GWM", "BENZ", "VOLVO", "KIA", "HYUNDAI"};
 static const Wmi WMIS[] = {
   {"MR0", 0}, {"MR1", 0}, {"MR2", 0}, {"JT", 0}, {"4T1", 0}, {"2T1", 0}, {"5TD", 0}, {"MHF", 0}, {"SB1", 0},
-  {"MLH", 6}, {"MRH", 1}, {"JHM", 1}, {"JH1", 1}, {"1HG", 1}, {"2HG", 1}, {"19X", 1}, {"SHH", 1}, {"MHR", 1}, {"LHG", 1},
+  {"MLH", 6}, {"JH2", 6}, {"ME4", 6}, {"MRH", 1}, {"JHM", 1}, {"JH1", 1}, {"1HG", 1}, {"2HG", 1}, {"19X", 1}, {"SHH", 1}, {"MHR", 1}, {"LHG", 1},
   {"MPA", 2}, {"MP1", 2}, {"JAA", 2}, {"JAB", 2}, {"JAL", 2}, {"JAC", 2},
   {"MMA", 3}, {"MMB", 3}, {"MMC", 3}, {"MMD", 3}, {"MMT", 3}, {"ML3", 3}, {"JA3", 3}, {"JA4", 3}, {"JA7", 3}, {"JMB", 3}, {"JMY", 3}, {"JMA", 3},
   {"MNT", 4}, {"MDH", 4}, {"JN1", 4}, {"JN6", 4}, {"JN8", 4}, {"SJN", 4}, {"3N1", 4}, {"1N4", 4},
@@ -687,6 +697,7 @@ static void readVin() {
   if (mdl[0]) snprintf(carBuf, sizeof carBuf, "%s", mdl);
   else if (br[0]) snprintf(carBuf, sizeof carBuf, "%s", br);
   else snprintf(carBuf, sizeof carBuf, "VIN %.3s", vinBuf);
+  vinNew = true;
 }
 static void doEcuInfo() {
   int nm = parseMsgs(elmQuery("090A", 4000), msgs, MAXM);
@@ -842,13 +853,40 @@ static int nextWanted(int& rr, int tier) {
   return -1;
 }
 
+static uint32_t autoAt = 0;
+static void autoPick() {
+  doScan();
+  if (btBrowsing || selAddr[0]) return;                  // the owner is on the Bluetooth page / has picked one meanwhile
+  int nObd = 0, top = -999, second = -999, bi = -1; BtDev best; memset(&best, 0, sizeof best);
+  portENTER_CRITICAL(&btMux);
+  for (int i = 0; i < btCount; i++) if (btList[i].obd) {
+    nObd++; int r = btList[i].rssi;
+    if (r > top) { second = top; top = r; bi = i; } else if (r > second) second = r;
+  }
+  if (bi >= 0) best = btList[bi];
+  portEXIT_CRITICAL(&btMux);
+  if (bi < 0 || (nObd > 1 && top - second < 8)) return;  // none, or several that are about equally close: the owner picks
+  portENTER_CRITICAL(&btMux);
+  if (!selAddr[0]) {
+    memcpy(selAddr, best.addr, sizeof selAddr); strcpy(selName, best.name[0] ? best.name : best.addr);
+    selBle = best.ble; selAType = best.atype; bleTry = 0; selGen = selGen + 1; pinIdx = 0; pinOk = false;
+  }
+  portEXIT_CRITICAL(&btMux);
+  carBuf[0] = 0; vinBuf[0] = 0; pinDirty = true;         // loop() saves the choice
+}
+
 void obdTask(void*) {
   int rrFg = 0, rrBg = 0, fails = 0, iter = 0; uint32_t lastMil = 0;
   for (;;) {
     if (scanReq) { scanReq = false; doScan(); continue; }
     if (demoMode || !selAddr[0]) {            // demo, or OBD mode with no adapter chosen yet
       linkDown();
-      linkState = demoMode ? 0 : 3; vTaskDelay(200); continue;
+      linkState = demoMode ? 0 : 3;
+      if (!demoMode && !btBrowsing && millis() > 2500 && (autoAt == 0 || millis() - autoAt > 25000)) {   // nothing chosen yet: search by itself (first time, then every 25 s)
+        autoAt = millis(); linkState = 1; autoPick(); if (!selAddr[0]) linkState = 3;
+        continue;
+      }
+      vTaskDelay(200); continue;
     }
     if (reconnectReq) { reconnectReq = false; linkDown(); }
     if (!linkIsUp()) {
@@ -1301,13 +1339,13 @@ static void presentBand(int b) {                              // push the band u
 }
 static void invalidatePanel() { for (int i = 0; i < NBAND; i++) bandHashOk[i] = false; }
 
-static bool vehDiesel() { if (ecuDieselKnown) return ecuDiesel; return vehModel >= 0 && (MODELS[vehModel].flags & VF_D); }
+static bool vehDiesel() { if (ecuDieselKnown) return ecuDiesel; int m = effModel(); return m >= 0 && (MODELS[m].flags & VF_D); }
 static bool vehFromEcu() { return ecuDieselKnown; }           // true when petrol / diesel was read from the car itself
-static bool vehHybrid() { return (ecuHybrid && !demoMode) || (vehModel >= 0 && (MODELS[vehModel].flags & VF_H)); }
-static bool vehBike() { return vehModel >= 0 && (MODELS[vehModel].flags & VF_M); }
-static int ringMaxK() { if (vehBike()) return constrain((MODELS[vehModel].redline + 9) / 10, 6, 16); return vehDiesel() ? 6 : 8; }          // tacho scale in 1000 rpm
+static bool vehHybrid() { int m = effModel(); return (ecuHybrid && !demoMode) || (m >= 0 && (MODELS[m].flags & VF_H)); }
+static bool vehBike() { int m = effModel(); return m >= 0 ? (MODELS[m].flags & VF_M) != 0 : (vehModel < 0 && autoBike); }   // a car picked by the owner always wins
+static int ringMaxK() { if (vehBike()) { int m = effModel(); return m >= 0 ? constrain((MODELS[m].redline + 9) / 10, 6, 16) : 12; } return vehDiesel() ? 6 : 8; }          // tacho scale in 1000 rpm
 static int shiftMax() { return vehBike() ? 16000 : 9000; }
-static int vehCc() { return vehModel >= 0 ? MODELS[vehModel].cc : 1500; }
+static int vehCc() { int m = effModel(); return m >= 0 ? MODELS[m].cc : (vehBike() ? 150 : 1500); }
 
 enum { M_AFR = 256, M_BOOST, M_FUELRATE, M_LAMBDA, M_CRP };
 
@@ -1521,6 +1559,8 @@ static void loadPrefs() {
   invScreen = prefs.getBool("inv", false);
 #endif
   vehModel = prefs.getInt("veh", -1); lastProto = prefs.getInt("proto", 0); userProto = prefs.getInt("uproto", 0); unitL100 = prefs.getBool("unitl", false); slotsCustom = prefs.getBool("slc", false);
+  flipScr = prefs.getBool("flip", false); autoBike = prefs.getBool("abike", false); autoModel = prefs.getInt("amodel", -1);
+  nvmap = prefs.getInt("nvmap", 0); if (nvmap < 0 || nvmap > 8 || prefs.getBytes("vmap", vmap, sizeof vmap) != sizeof vmap) nvmap = 0;
   String ba = prefs.getString("btaddr", ""), bn = prefs.getString("btname", "");
   int bk = prefs.getInt("btkind", 0), bp = prefs.getInt("btpin", 0); bool bo = prefs.getBool("btpinok", false);
   uint8_t s[6]; if (prefs.getBytes("slots", s, 6) == 6) { bool good = true; for (int i = 0; i < 6; i++) if (s[i] >= NMET) good = false; if (good) memcpy(slots, s, 6); }
@@ -1528,9 +1568,11 @@ static void loadPrefs() {
   prefs.end();
   applyTheme(th);
   if (shiftRpm < 3000 || shiftRpm > 9000) shiftRpm = 6500;
-  if (tankL < 10 || tankL > 200) tankL = 44;
+  if (tankL < 3 || tankL > 200) tankL = 44;                 // motorcycles carry 4-25 L
   if (fuelCal < 70 || fuelCal > 130) fuelCal = 100;
   if (vehModel < -1 || vehModel >= NMODEL) vehModel = -1;
+  if (autoModel < -1 || autoModel >= NMODEL) autoModel = -1;
+  for (int i = 0; i < nvmap; i++) { vmap[i].c[5] = 0; if (vmap[i].m >= NMODEL) vmap[i].m = 0; }
   if (lastProto < 0 || lastProto > 9) lastProto = 0;
   if (userProto < 0 || userProto > 9) userProto = 0;
   uint8_t tmp6[6];
@@ -1546,6 +1588,8 @@ static void savePrefs() {
   prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6); prefs.putBool("slc", slotsCustom);
   prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
   prefs.putBool("unitl", unitL100);
+  prefs.putBool("flip", flipScr); prefs.putBool("abike", autoBike); prefs.putInt("amodel", autoModel);
+  prefs.putInt("nvmap", nvmap); prefs.putBytes("vmap", vmap, sizeof vmap);
   prefs.putString("btaddr", selAddr); prefs.putString("btname", selName);
   prefs.putInt("btkind", selBle ? 1 + selAType : 0); prefs.putInt("btpin", pinIdx); prefs.putBool("btpinok", pinOk);
   prefs.putBytes("pkall", &pkA, sizeof pkA);
@@ -1561,6 +1605,7 @@ static void applyInvert() { tft.invertDisplay(invScreen); }
 enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG, PG_UPD };
 static Page scr = PG_SPLASH;
 static bool redraw = true;
+static void applyFlip() { tft.setRotation(flipScr ? 3 : 1); invalidatePanel(); redraw = true; }      // the picture is turned 180 degrees; every band is sent again
 static int gsel = 0, gmode = 0;                           // graph set (0 rpm, 1 temps, 2 afr, 3 batt) and time base (0 = 60 s, 1 = 15 min)
 static bool allMode = false;
 
@@ -1601,8 +1646,9 @@ static const char* protoName(int p) {
 }
 static void carName(char* d, size_t n) {
   d[0] = 0;
-  if (vehModel >= 0) {
-    const Model& m = MODELS[vehModel]; const char* br = m.brand == 6 ? "HONDA" : BRANDS[m.brand];     // the bike tile is named HONDA BIKE, the car name just HONDA
+  int em = effModel();
+  if (em >= 0) {
+    const Model& m = MODELS[em]; const char* br = m.brand == 6 ? "HONDA" : BRANDS[m.brand];     // the bike tile is named HONDA BIKE, the car name just HONDA
     if (!strncmp(m.name, br, strlen(br))) snprintf(d, n, "%s", m.name); else snprintf(d, n, "%s %s", br, m.name);
   } else if (demoMode) snprintf(d, n, "MAZDA 2");
   else snprintf(d, n, "%s", carBuf);
@@ -2401,7 +2447,7 @@ static void tapCodes(int x, int y, bool first) {
 }
 
 // ---------- setup ----------
-static const int SU_Y0 = 64, SU_H = 36, SU_N = 3;
+static const int SU_Y0 = 64, SU_H = 27, SU_N = 4;
 static void rowLabel(int y, int h, StrId mainL, StrId sub, bool hasSub) {
   hl(9, y + h - 1, 302, T.sep);
   int o = (h - 28) / 2;                                              // rows taller than 28 px keep their text centred
@@ -2418,6 +2464,7 @@ static void setupRow(int i) {
     case 0: rowLabel(y, SU_H, S_LANG, S_COUNT, false); chipS("EN", 164, y + 4, 70, SU_H - 9, !thai); chipId(S_THAI, 238, y + 4, 73, SU_H - 9, thai); break;
     case 1: rowLabel(y, SU_H, S_SHIFT, S_SHIFTD, true); fmtThou(b, sizeof b, shiftRpm); stepBtns(y, SU_H, b, ""); break;
     case 2: rowLabel(y, SU_H, S_COLORS, S_COLTIP, true); chipId(S_STD, 164, y + 4, 70, SU_H - 9, !invScreen); chipId(S_INV, 238, y + 4, 73, SU_H - 9, invScreen); break;
+    case 3: rowLabel(y, SU_H, S_FLIP, S_FLIPD, true); chipId(S_NORMAL, 164, y + 4, 70, SU_H - 9, !flipScr); chipId(S_FLIPPED, 238, y + 4, 73, SU_H - 9, flipScr); break;
   }
 }
 static void themeCard(int i) {
@@ -2435,8 +2482,31 @@ static void drawSetup() {
   chipId(S_BTNAME, 9, 177, 71, 20, false); chipId(S_VEHICLE, 86, 177, 71, 20, false); chipId(S_MORE, 163, 177, 71, 20, false); chipId(S_UPDTITLE, 240, 177, 71, 20, false);
   tabBar(5);
 }
+static bool vmapPut(const char* key, int m) {          // true when something changed
+  for (int i = 0; i < nvmap; i++) if (!strcmp(vmap[i].c, key)) { if (vmap[i].m == m) return false; vmap[i].m = (uint8_t)m; return true; }
+  int i = nvmap < 8 ? nvmap++ : (vmapNext++ & 7);
+  memcpy(vmap[i].c, key, 6); vmap[i].m = (uint8_t)m; return true;
+}
+static void vinApply() {                               // a VIN came in: motorcycle? which model did the owner pick for this code last time?
+  if (strlen(vinBuf) < 11) return;
+  bool bike = vinBrand == 6; int mdl = -1; bool learned = false;
+  char key[6] = ""; if (bike) { memcpy(key, vinBuf + 3, 5); key[5] = 0; }
+  if (bike && vehModel >= 0 && MODELS[vehModel].brand == 6) learned = vmapPut(key, vehModel);      // the owner picked this bike's model: remember it for this VIN code
+  else if (bike && vehModel < 0) for (int i = 0; i < nvmap; i++) if (!strcmp(vmap[i].c, key)) mdl = vmap[i].m;
+  if (mdl >= NMODEL) mdl = -1;
+  if (bike != autoBike || mdl != autoModel) {
+    bool was = autoBike; autoBike = bike; autoModel = mdl;
+    if (vehModel < 0) {
+      if (mdl >= 0) { tankL = MODELS[mdl].tank; shiftRpm = max(3000, MODELS[mdl].redline * 100 - 300); }
+      else if (bike) { if (tankL == 44) tankL = 6; if (shiftRpm == 6500) shiftRpm = 8500; }         // first time on a bike: scooter-sized defaults (still adjustable in SETUP)
+      else if (was) { if (tankL < 20) tankL = 44; if (shiftRpm > 8000) shiftRpm = 6500; }           // back on a car: a bike's tank / shift values must not stay
+    }
+    autoSlots(); logClear(); redraw = true; learned = true;
+  }
+  if (learned) savePrefs();
+}
 static void applyVehicle(int idx) {                 // idx = -1: automatic (from the VIN)
-  vehModel = idx;
+  vehModel = idx; autoModel = -1; vinNew = vinBuf[0] != 0;     // the VIN is looked at again (remembers a bike model / goes back to automatic)
   if (idx >= 0) { tankL = MODELS[idx].tank; shiftRpm = max(3000, MODELS[idx].redline * 100 - 300); }
   carBuf[0] = 0; slotsCustom = false; autoSlots(); logClear();
   savePrefs(); nav(PG_SETUP);
@@ -2463,6 +2533,9 @@ static void tapSetup(int x, int y, bool first) {
     } else if (i == 2 && first) {
       if (hit(x, y, 164, ry, 70, rh) && invScreen) { invScreen = false; applyInvert(); savePrefs(); }
       else if (hit(x, y, 238, ry, 73, rh) && !invScreen) { invScreen = true; applyInvert(); savePrefs(); }
+    } else if (i == 3 && first) {
+      if (hit(x, y, 164, ry, 70, rh) && flipScr) { flipScr = false; applyFlip(); savePrefs(); }
+      else if (hit(x, y, 238, ry, 73, rh) && !flipScr) { flipScr = true; applyFlip(); savePrefs(); }
     }
   }
 }
@@ -2505,7 +2578,7 @@ static void tapSetup2(int x, int y, bool first) {
     if (i == 0 && first && (on || off)) { warnOn = on; saveSoon(); }
     else if (i == 1 && first && (on || off)) { parkOn = on; saveSoon(); }
     else if (i == 2 && (minus || plus)) { stepVal(bright, 10, 100, plus ? 1 : -1, 10); applyBright(); saveSoon(); }
-    else if (i == 3 && (minus || plus)) { stepVal(tankL, 10, 200, plus ? 1 : -1, 1); saveSoon(); }
+    else if (i == 3 && (minus || plus)) { stepVal(tankL, 3, 200, plus ? 1 : -1, 1); saveSoon(); }
     else if (i == 4 && (minus || plus)) { stepVal(fuelCal, 70, 130, plus ? 1 : -1, 1); saveSoon(); }
     else if (i == 5 && first && (minus || plus)) { userProto = (userProto + (plus ? 1 : 9)) % 10; uprotoAt = millis(); saveSoon(); }
   }
@@ -3374,6 +3447,7 @@ static void pollTouch(uint32_t now) {
   if (t) {
     TS_Point p = ts.getPoint();
     int x = constrain(map(p.x, 200, 3700, 1, 320), 0, 319), y = constrain(map(p.y, 240, 3800, 1, 240), 0, 239);
+    if (flipScr) { x = 319 - x; y = 239 - y; }                       // the touch layer turns with the glass
     if (!wasTouched) {
       repAt = now + 450;
       if (screenOff) { screenOff = false; applyBright(); } else handleTouch(x, y, true);
@@ -3382,7 +3456,7 @@ static void pollTouch(uint32_t now) {
   wasTouched = t;
 }
 static void initPanel() {
-  tft.init(); tft.setRotation(1); tft.setSwapBytes(true); applyInvert(); tft.fillScreen(0);
+  tft.init(); tft.setRotation(flipScr ? 3 : 1); tft.setSwapBytes(true); applyInvert(); tft.fillScreen(0);
   ledcSetup(0, 5000, 8); ledcAttachPin(21, 0); applyBright();
   tsSPI.begin(25, 39, 32, 33); ts.begin(tsSPI); ts.setRotation(1);
 }
@@ -3439,6 +3513,8 @@ void loop() {
   uint32_t now = millis();
   pollTouch(now);
 
+  btBrowsing = (scr == PG_BT);
+  if (vinNew) { vinNew = false; vinApply(); }
   if (pinDirty || protoDirty) { pinDirty = false; protoDirty = false; savePrefs(); }
   if (prefsDirty && now - prefsAt > 1500) { prefsDirty = false; savePrefs(); }
   if (pkDirty && now - pkSaved > 60000u) { pkDirty = false; pkSaved = now; savePrefs(); }
