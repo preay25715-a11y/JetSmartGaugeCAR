@@ -47,7 +47,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #ifndef CRP_RATIO
 #define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
 #endif
-#define FW_VERSION "v1.0.7"
+#define FW_VERSION "v1.0.8"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -959,11 +959,16 @@ void obdTask(void*) {
   }
 }
 
-static float crpV = 0;                                // CRP signal volts (GPIO35 through the divider)
-static float readCrp() {
-  uint32_t s = 0;
-  for (int i = 0; i < 32; i++) s += analogReadMilliVolts(CRP_PIN);
-  return (s / 32.0f) / 1000.0f * CRP_RATIO;
+static float crpV = 0;                                // CRP signal volts = pin volts x divider ratio
+static float crpPin = 0;                              // volts at the IO35 pin itself (filtered)
+static int crpRatio10 = (int)(CRP_RATIO * 10 + 0.5f); // divider ratio x10, set on the CRP sensor page (the build default is CRP_RATIO)
+static float crpMn = 99, crpMx = 0; static uint32_t crpSince = 0;     // lowest / highest pin volts since the CRP page was opened or reset
+static float readCrp() {                              // volts at the pin: mean of 32 reads without the 4 lowest and 4 highest (ignition / injector spikes)
+  uint16_t v[32];
+  for (int i = 0; i < 32; i++) v[i] = (uint16_t)analogReadMilliVolts(CRP_PIN);
+  for (int i = 1; i < 32; i++) { uint16_t k = v[i]; int j = i - 1; while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; j--; } v[j + 1] = k; }
+  uint32_t s = 0; for (int i = 4; i < 28; i++) s += v[i];
+  return (s / 24.0f) / 1000.0f;
 }
 
 // =====================================================================================
@@ -1563,7 +1568,7 @@ static void loadPrefs() {
   firstRun = !prefs.isKey("inv");
   thai = prefs.getBool("thai", false); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true);
   shiftRpm = prefs.getInt("shift", 6500); bright = prefs.getInt("bright", 80); int th = prefs.getInt("theme", 0);
-  dashMain = prefs.getUChar("dmain", prefs.getBool("crpm", false) ? 1 : 0); if (dashMain > 2) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100);
+  dashMain = prefs.getUChar("dmain", prefs.getBool("crpm", false) ? 1 : 0); if (dashMain > 2) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100); crpRatio10 = prefs.getInt("crpr", crpRatio10);
 #ifdef TFT_INVERSION_ON
   invScreen = prefs.getBool("inv", true);                    // ST7789 boards normally need the inversion on
 #else
@@ -1581,6 +1586,7 @@ static void loadPrefs() {
   if (shiftRpm < 3000 || shiftRpm > 9000) shiftRpm = 6500;
   if (tankL < 3 || tankL > 200) tankL = 44;                 // motorcycles carry 4-25 L
   if (fuelCal < 70 || fuelCal > 130) fuelCal = 100;
+  if (crpRatio10 < 10 || crpRatio10 > 150) crpRatio10 = (int)(CRP_RATIO * 10 + 0.5f);
   if (vehModel < -1 || vehModel >= NMODEL) vehModel = -1;
   if (autoModel < -1 || autoModel >= NMODEL) autoModel = -1;
   for (int i = 0; i < nvmap; i++) { vmap[i].c[5] = 0; if (vmap[i].m >= NMODEL) vmap[i].m = 0; }
@@ -1597,7 +1603,7 @@ static void savePrefs() {
   prefs.begin("gauge", false);
   prefs.putBool("thai", thai); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putUChar("dmain", dashMain);
   prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6); prefs.putBool("slc", slotsCustom);
-  prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
+  prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putInt("crpr", crpRatio10); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
   prefs.putBool("unitl", unitL100);
   prefs.putBool("flip", flipScr); prefs.putBool("abike", autoBike); prefs.putInt("amodel", autoModel);
   prefs.putInt("nvmap", nvmap); prefs.putBytes("vmap", vmap, sizeof vmap);
@@ -1613,7 +1619,7 @@ static void applyInvert() { tft.invertDisplay(invScreen); }
 // =====================================================================================
 //  Screens
 // =====================================================================================
-enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG, PG_UPD };
+enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG, PG_UPD, PG_CRP };
 static Page scr = PG_SPLASH;
 static bool redraw = true;
 static void applyFlip() { tft.setRotation(flipScr ? 3 : 1); invalidatePanel(); redraw = true; }      // the picture is turned 180 degrees; every band is sent again
@@ -2573,14 +2579,15 @@ static void drawSetup2() {
   subHeader(S_SETUP2, S_COUNT, false);
   txt(F_LM, FW_VERSION, 311, 18, T.dim, AL_R);
   for (int i = 0; i < 6; i++) setup2Row(i);
-  chipId(S_TESTALERT, 9, 210, 146, 22, false); chipId(S_RESETPK, 165, 210, 146, 22, false);
+  chipId(S_TESTALERT, 9, 210, 96, 22, false); chipId(S_RESETPK, 112, 210, 96, 22, false); chipId(S_CRPCAL, 215, 210, 96, 22, false);
 }
 static void startTestAlert();
 static void tapSetup2(int x, int y, bool first) {
   if (first) {
     if (hitBack(x, y)) { savePrefs(); nav(PG_SETUP); return; }
-    if (hit(x, y, 9, 210, 146, 22)) { startTestAlert(); return; }
-    if (hit(x, y, 165, 210, 146, 22)) { peaksClear(pkA); peaksClear(pkD); pkDirty = true; savePrefs(); return; }
+    if (hit(x, y, 9, 210, 96, 22)) { startTestAlert(); return; }
+    if (hit(x, y, 112, 210, 96, 22)) { peaksClear(pkA); peaksClear(pkD); pkDirty = true; savePrefs(); return; }
+    if (hit(x, y, 215, 210, 96, 22)) { nav(PG_CRP); return; }
   }
   for (int i = 0; i < 6; i++) {
     int ry = S2_Y0 + i * S2_H + 4, rh = S2_H - 9;
@@ -2592,6 +2599,44 @@ static void tapSetup2(int x, int y, bool first) {
     else if (i == 3 && (minus || plus)) { stepVal(tankL, 3, 200, plus ? 1 : -1, 1); saveSoon(); }
     else if (i == 4 && (minus || plus)) { stepVal(fuelCal, 70, 130, plus ? 1 : -1, 1); saveSoon(); }
     else if (i == 5 && first && (minus || plus)) { userProto = (userProto + (plus ? 1 : 9)) % 10; uprotoAt = millis(); saveSoon(); }
+  }
+}
+
+// ---------- CRP sensor: what the IO35 pin really sees, and the divider ratio ----------
+static void drawCrpCal() {
+  subHeader(S_CRPCAL, S_COUNT, false);
+  txt(F_LM, FW_VERSION, 311, 18, T.dim, AL_R);
+  char b[24]; int mv = (int)lroundf(crpPin * 1000);
+  tile(9, 30, 302, 50);
+  lab(S_CRPPIN, LB_TILE, 18, thai ? 47 : 45, T.dim);
+  snprintf(b, sizeof b, "%d.%03d", mv / 1000, mv % 1000); txtVU(F_NL, b, F_LS, "V", 18, 72, T.text, T.dim, AL_L);
+  lab(S_CRPRANGE, LB_TILE, 303, thai ? 47 : 45, T.dim, AL_R);
+  int lo = (int)lroundf((crpMn > crpMx ? crpPin : crpMn) * 1000), hi = (int)lroundf(fmaxf(crpMx, crpMn > crpMx ? crpPin : 0) * 1000);
+  snprintf(b, sizeof b, "%d.%03d - %d.%03d", lo / 1000, lo % 1000, hi / 1000, hi % 1000); txt(F_UM, b, 303, 70, T.text, AL_R);
+  tile(9, 84, 302, 50);
+  lab(S_CRPV, LB_TILE, 18, thai ? 101 : 99, T.dim);
+  int cv = (int)lroundf(clampf(crpV, 0, 99.99f) * 100); snprintf(b, sizeof b, "%d.%02d", cv / 100, cv % 100); txtVU(F_NL, b, F_LS, "V", 18, 126, T.accL, T.dim, AL_L);
+  rowLabel(138, 29, S_CRPRATIO, S_CRPRATIOD, true);
+  snprintf(b, sizeof b, "%d.%d", crpRatio10 / 10, crpRatio10 % 10); stepBtns(138, 29, b, "x");
+  uint32_t el = millis() - crpSince; StrId st = S_CRPMOVE; uint16_t col = T.good;
+  if (crpPin > 3.1f) { st = S_CRPHI; col = T.hot; }
+  else if (el < 4000) { st = S_CRPWAIT; col = T.dim; }
+  else if (crpMx < 0.15f) { st = S_CRPLOW; col = T.warn; }
+  else if (crpMx - crpMn < 0.012f) { st = S_CRPFLAT; col = T.warn; }
+  tile(9, 171, 302, 32, 8);
+  lab(st, LB_ROW, 160, thai ? 192 : 190, col, AL_C, 290);
+  chipId(S_CRPRESET, 9, 210, 146, 22, false); chipId(S_CRPDEF, 165, 210, 146, 22, false);
+}
+static void tapCrpCal(int x, int y, bool first) {
+  if (first) {
+    if (hitBack(x, y)) { savePrefs(); nav(PG_SETUP2); return; }
+    if (hit(x, y, 9, 210, 146, 22)) { crpMn = 99; crpMx = 0; crpSince = millis(); return; }
+    if (hit(x, y, 165, 210, 146, 22)) { crpRatio10 = (int)(CRP_RATIO * 10 + 0.5f); saveSoon(); return; }
+  }
+  int ry = 142, rh = 20;
+  if (y >= ry && y < ry + rh) {
+    if (hit(x, y, 164, ry, 30, rh)) { stepVal(crpRatio10, 10, 150, -1, 1); saveSoon(); }
+    else if (hit(x, y, 281, ry, 30, rh)) { stepVal(crpRatio10, 10, 150, 1, 1); saveSoon(); }
   }
 }
 
@@ -3366,6 +3411,7 @@ static void nav(Page p) {
     case PG_BT: btOff = 0; if (!selAddr[0] && scanState != 1 && !demoMode) btStartScan(); break;
     case PG_PARK: parkAt = millis(); break;
     case PG_UPD: updErr = UE_NONE; break;
+    case PG_CRP: crpMn = 99; crpMx = 0; crpSince = millis(); break;
     default: break;
   }
 }
@@ -3394,6 +3440,7 @@ static void drawScene() {
     case PG_VEH: drawVeh(); break;
     case PG_PARK: drawPark(); break;
     case PG_UPD: drawUpd(); break;
+    case PG_CRP: drawCrpCal(); break;
   }
 #endif
 }
@@ -3447,6 +3494,7 @@ static void handleTouch(int x, int y, bool first) {
     case PG_VEH: tapVeh(x, y, first); return;
     case PG_PARK: if (first) nav(PG_DASH); return;
     case PG_UPD: tapUpd(x, y, first); return;
+    case PG_CRP: tapCrpCal(x, y, first); return;
   }
 #endif
 }
@@ -3533,7 +3581,10 @@ void loop() {
   updLoop(now);
 
   static uint32_t tSim = 0, tUI = 0, tGraph = 0, tCrp = 0; static int lastLs = -1;
-  if (now - tCrp >= 20) { tCrp = now; crpV = crpV * 0.5f + readCrp() * 0.5f; }
+  if (now - tCrp >= 20) {
+    tCrp = now; crpPin = crpPin * 0.5f + readCrp() * 0.5f; crpV = crpPin * crpRatio10 / 10.0f;
+    if (now - crpSince > 600) { crpMn = fminf(crpMn, crpPin); crpMx = fmaxf(crpMx, crpPin); }     // skip the first 0.6 s while the filter settles
+  }
   if (now - tSim >= 100) {
     float dt = (now - tSim) / 1000.0f; tSim = now;
     tripStep(dt); peaksStep(); logStep(); alertsStep(); parkStep(now);
