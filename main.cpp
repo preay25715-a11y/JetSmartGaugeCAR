@@ -41,13 +41,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#ifndef CRP_PIN
-#define CRP_PIN 35          // input-only ADC1 pin on the CYD P3 connector
-#endif
-#ifndef CRP_RATIO
-#define CRP_RATIO 3.0f      // divider ratio: (Rtop+Rbottom)/Rbottom, keep the pin <= 3.3 V
-#endif
-#define FW_VERSION "v1.0.8"
+#define FW_VERSION "v1.0.9"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -959,17 +953,8 @@ void obdTask(void*) {
   }
 }
 
-static float crpV = 0;                                // CRP signal volts = pin volts x divider ratio
-static float crpPin = 0;                              // volts at the IO35 pin itself (filtered)
-static int crpRatio10 = (int)(CRP_RATIO * 10 + 0.5f); // divider ratio x10, set on the CRP sensor page (the build default is CRP_RATIO)
-static float crpMn = 99, crpMx = 0; static uint32_t crpSince = 0;     // lowest / highest pin volts since the CRP page was opened or reset
-static float readCrp() {                              // volts at the pin: mean of 32 reads without the 4 lowest and 4 highest (ignition / injector spikes)
-  uint16_t v[32];
-  for (int i = 0; i < 32; i++) v[i] = (uint16_t)analogReadMilliVolts(CRP_PIN);
-  for (int i = 1; i < 32; i++) { uint16_t k = v[i]; int j = i - 1; while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; j--; } v[j + 1] = k; }
-  uint32_t s = 0; for (int i = 4; i < 28; i++) s += v[i];
-  return (s / 24.0f) / 1000.0f;
-}
+static int crpFs = 200;                               // rail pressure (MPa) at 4.5 V: the sensor is taken as linear, 0.5 V = 0 MPa ... 4.5 V = crpFs (set on the CRP sensor page)
+static float crpMn = 1e9f, crpMx = -1e9f;             // lowest / highest rail pressure (MPa) seen since the CRP page was opened or reset
 
 // =====================================================================================
 //  Graphics core (V4).  The screen is composed in horizontal bands of BAND_H rows inside tPix and pushed band by band, so every
@@ -1387,6 +1372,11 @@ static float fuelRate(bool& ok, bool& est) {                    // litres per ho
   if (!ol || lam < 0.5f || lam > 1.6f) lam = 1.0f;
   ok = true; return air / (14.7f * lam) * 3600.0f / 745.0f * fuelCal / 100.0f;
 }
+static float crpMPa(bool& ok) {                       // common-rail pressure from the ECU: PID 23 (diesel / direct injection), else PID 59; kPa -> MPa
+  bool o; float k = getVal(0x23, o);
+  if (!o) k = getVal(0x59, o);
+  ok = o; return k / 1000.0f;
+}
 static float metricVal(int src, bool& ok) {
   if (src < 256) return getVal((uint8_t)src, ok);
   bool o1, o2;
@@ -1397,7 +1387,7 @@ static float metricVal(int src, bool& ok) {
     }
     case M_BOOST: { float m = getVal(0x0B, o1), b = getVal(0x33, o2); ok = o1; return m - (o2 ? b : 101.0f); }
     case M_FUELRATE: { bool est; float f = fuelRate(ok, est); return f; }
-    case M_CRP: ok = true; return crpV;
+    case M_CRP: { float p = crpMPa(ok); return 0.5f + 4.0f * p / crpFs; }          // the volts a 0.5-4.5 V rail sensor gives at that pressure
   }
   ok = false; return 0;
 }
@@ -1425,7 +1415,7 @@ enum { MI_COOL = 0, MI_OIL, MI_INTAKE, MI_BATT, MI_AFR, MI_LOAD, MI_THR, MI_MAP,
        MI_EGT, MI_AMB, MI_RAIL, MI_PEDAL, MI_TORQ, MI_FRATE, MI_HV, MI_CAT, MI_BARO, MI_LAMBDA, MI_RUNT, MI_CRP };
 static bool metSupported(int i) {
   int s = MET[i].src;
-  if (s == M_CRP) return true;
+  if (s == M_CRP) return psup[0x23] || psup[0x59];
   if (s == M_AFR || s == M_LAMBDA) return psup[0x24] || psup[0x44];
   if (s == M_BOOST) return psup[0x0B];
   if (s == M_FUELRATE) return psup[0x5E] || psup[0x10] || (psup[0x0B] && psup[0x0C]);
@@ -1568,7 +1558,7 @@ static void loadPrefs() {
   firstRun = !prefs.isKey("inv");
   thai = prefs.getBool("thai", false); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true);
   shiftRpm = prefs.getInt("shift", 6500); bright = prefs.getInt("bright", 80); int th = prefs.getInt("theme", 0);
-  dashMain = prefs.getUChar("dmain", prefs.getBool("crpm", false) ? 1 : 0); if (dashMain > 2) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100); crpRatio10 = prefs.getInt("crpr", crpRatio10);
+  dashMain = prefs.getUChar("dmain", prefs.getBool("crpm", false) ? 1 : 0); if (dashMain > 2) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100); crpFs = prefs.getInt("crpfs", 200);
 #ifdef TFT_INVERSION_ON
   invScreen = prefs.getBool("inv", true);                    // ST7789 boards normally need the inversion on
 #else
@@ -1586,7 +1576,7 @@ static void loadPrefs() {
   if (shiftRpm < 3000 || shiftRpm > 9000) shiftRpm = 6500;
   if (tankL < 3 || tankL > 200) tankL = 44;                 // motorcycles carry 4-25 L
   if (fuelCal < 70 || fuelCal > 130) fuelCal = 100;
-  if (crpRatio10 < 10 || crpRatio10 > 150) crpRatio10 = (int)(CRP_RATIO * 10 + 0.5f);
+  if (crpFs < 50 || crpFs > 400) crpFs = 200;
   if (vehModel < -1 || vehModel >= NMODEL) vehModel = -1;
   if (autoModel < -1 || autoModel >= NMODEL) autoModel = -1;
   for (int i = 0; i < nvmap; i++) { vmap[i].c[5] = 0; if (vmap[i].m >= NMODEL) vmap[i].m = 0; }
@@ -1603,7 +1593,7 @@ static void savePrefs() {
   prefs.begin("gauge", false);
   prefs.putBool("thai", thai); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putUChar("dmain", dashMain);
   prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6); prefs.putBool("slc", slotsCustom);
-  prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putInt("crpr", crpRatio10); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
+  prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putInt("crpfs", crpFs); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
   prefs.putBool("unitl", unitL100);
   prefs.putBool("flip", flipScr); prefs.putBool("abike", autoBike); prefs.putInt("amodel", autoModel);
   prefs.putInt("nvmap", nvmap); prefs.putBytes("vmap", vmap, sizeof vmap);
@@ -1632,6 +1622,7 @@ static void markSrc(int s, int tier) {
   switch (s) {
     case M_AFR: case M_LAMBDA: markWant(0x24, tier); markWant(0x44, tier); break;
     case M_BOOST: markWant(0x0B, tier); markWant(0x33, tier); break;
+    case M_CRP: markWant(0x23, tier); markWant(0x59, tier); break;
     case M_FUELRATE: markWant(0x5E, tier); markWant(0x10, tier); markWant(0x0B, tier); markWant(0x0F, tier); markWant(0x62, tier); markWant(0x63, tier); break;
   }
 }
@@ -1639,11 +1630,11 @@ static const int ALL_ROWS = 5;
 static uint8_t allIdx[NPID]; static int allN = 0, allPg = 0;
 static void updateWants() {
   memset(want, 0, sizeof want);
-  static const uint8_t BG[] = {0x05, 0x42, 0x5C, 0x5E, 0x10, 0x0B, 0x0F, 0x2F, 0x44, 0x24, 0x33, 0x04, 0x06, 0x62, 0x63};
+  static const uint8_t BG[] = {0x05, 0x42, 0x5C, 0x5E, 0x10, 0x0B, 0x0F, 0x2F, 0x44, 0x24, 0x33, 0x04, 0x06, 0x62, 0x63, 0x23, 0x59};
   for (unsigned i = 0; i < sizeof BG; i++) markWant(BG[i], 1);
   markWant(0x0C, 2); markWant(0x0D, 2);
   markWant(0x5E, 2); markWant(0x10, 2); markWant(0x24, 2); markWant(0x44, 2);      // fuel rate / air flow / lambda feed the trip and consumption figures all the time
-  if (scr == PG_DASH) for (int i = 0; i < 6; i++) markSrc(MET[slots[i]].src, 2);
+  if (scr == PG_DASH) { for (int i = 0; i < 6; i++) markSrc(MET[slots[i]].src, 2); if (dashMain != 2) markSrc(M_CRP, 2); }
   else if (scr == PG_DATA) { for (int i = 0; i < 16; i++) { DTile t; dtileOf(i, t); markSrc(t.src, 2); } }
   else if (scr == PG_ALL) {
     for (int i = 0; i < NPID; i++) markWant(PIDS[i].id, 1);
@@ -1655,6 +1646,7 @@ static void updateWants() {
   }
   else if (scr == PG_TRIP || scr == PG_PARK) { markSrc(M_FUELRATE, 2); markWant(0x2F, 2); }
   else if (scr == PG_STATUS) { markWant(0x21, 2); markWant(0x30, 2); markWant(0x31, 2); }
+  else if (scr == PG_LOG || scr == PG_CRP) markSrc(M_CRP, 2);
 }
 
 static const char* protoName(int p) {
@@ -1791,7 +1783,7 @@ static void ringDraw(float rpm) {                                 // tacho: trac
 }
 // dash centre + bottom bar show one of three values: 0 speed, 1 CRP volts, 2 AFR (a tap on the ring or the bar steps to the next)
 static void dashOf(int m, char* t, size_t n, const char*& unit, float& frac, StrId& lid) {
-  if (m == 1) { int cv = (int)lroundf(clampf(crpV, 0, 9.99f) * 100); snprintf(t, n, "%d.%02d", cv / 100, cv % 100); unit = "V"; frac = crpV / 5; lid = S_CRPV; }
+  if (m == 1) { bool o; float v = metricVal(M_CRP, o); if (o) { int cv = (int)lroundf(clampf(v, 0, 9.99f) * 100); snprintf(t, n, "%d.%02d", cv / 100, cv % 100); } else strcpy(t, "--"); unit = "V"; frac = o ? v / 5 : 0; lid = S_CRPV; }
   else if (m == 2) { bool o; float a = metricVal(M_AFR, o); if (o) fmtv(t, n, clampf(a, 0, 99.9f), 1); else strcpy(t, "--"); unit = ""; frac = o ? (a - 10) / 10 : 0; lid = S_AFR; }
   else { float sp = gv0(0x0D); snprintf(t, n, "%d", (int)sp); unit = "km/h"; frac = sp / 200; lid = S_SPEED; }
 }
@@ -1819,7 +1811,7 @@ static void tapDash(int x, int y, bool first) {
   if (!first) return;
   if (tabTap(x, y, PG_DASH)) return;
   for (int i = 0; i < 6; i++) if (hit(x, y, DT_X[i], DT_Y[i], 83, 38)) { slots[i] = (uint8_t)nextMetric(slots[i], i); slotsCustom = true; updateWants(); saveSoon(); return; }
-  if (hit(x, y, 94, 34, 132, 132) || hit(x, y, 9, 168, 302, 29)) { dashMain = (uint8_t)((dashMain + 1) % 3); saveSoon(); }
+  if (hit(x, y, 94, 34, 132, 132) || hit(x, y, 9, 168, 302, 29)) { dashMain = (uint8_t)((dashMain + 1) % 3); updateWants(); saveSoon(); }
 }
 
 // ---------- data grid ----------
@@ -2602,27 +2594,31 @@ static void tapSetup2(int x, int y, bool first) {
   }
 }
 
-// ---------- CRP sensor: what the IO35 pin really sees, and the divider ratio ----------
+// ---------- CRP sensor: the rail pressure the ECU reports, and the volts it is shown as ----------
 static void drawCrpCal() {
   subHeader(S_CRPCAL, S_COUNT, false);
   txt(F_LM, FW_VERSION, 311, 18, T.dim, AL_R);
-  char b[24]; int mv = (int)lroundf(crpPin * 1000);
+  bool ok; float p = clampf(crpMPa(ok), 0, 999); char b[24];
+  if (ok) { crpMn = fminf(crpMn, p); crpMx = fmaxf(crpMx, p); }
   tile(9, 30, 302, 50);
-  lab(S_CRPPIN, LB_TILE, 18, thai ? 47 : 45, T.dim);
-  snprintf(b, sizeof b, "%d.%03d", mv / 1000, mv % 1000); txtVU(F_NL, b, F_LS, "V", 18, 72, T.text, T.dim, AL_L);
+  lab(S_CRPRAIL, LB_TILE, 18, thai ? 47 : 45, T.dim);
+  if (ok) { int d = (int)lroundf(p * 10); snprintf(b, sizeof b, "%d.%d", d / 10, d % 10); } else strcpy(b, "--");
+  txtVU(F_NL, b, F_LS, "MPa", 18, 72, T.text, T.dim, AL_L);
   lab(S_CRPRANGE, LB_TILE, 303, thai ? 47 : 45, T.dim, AL_R);
-  int lo = (int)lroundf((crpMn > crpMx ? crpPin : crpMn) * 1000), hi = (int)lroundf(fmaxf(crpMx, crpMn > crpMx ? crpPin : 0) * 1000);
-  snprintf(b, sizeof b, "%d.%03d - %d.%03d", lo / 1000, lo % 1000, hi / 1000, hi % 1000); txt(F_UM, b, 303, 70, T.text, AL_R);
+  if (crpMn <= crpMx) { int lo = (int)lroundf(crpMn * 10), hi = (int)lroundf(crpMx * 10); snprintf(b, sizeof b, "%d.%d - %d.%d", lo / 10, lo % 10, hi / 10, hi % 10); } else strcpy(b, "-- - --");
+  txt(F_UM, b, 303, 70, T.text, AL_R);
   tile(9, 84, 302, 50);
   lab(S_CRPV, LB_TILE, 18, thai ? 101 : 99, T.dim);
-  int cv = (int)lroundf(clampf(crpV, 0, 99.99f) * 100); snprintf(b, sizeof b, "%d.%02d", cv / 100, cv % 100); txtVU(F_NL, b, F_LS, "V", 18, 126, T.accL, T.dim, AL_L);
-  rowLabel(138, 29, S_CRPRATIO, S_CRPRATIOD, true);
-  snprintf(b, sizeof b, "%d.%d", crpRatio10 / 10, crpRatio10 % 10); stepBtns(138, 29, b, "x");
-  uint32_t el = millis() - crpSince; StrId st = S_CRPMOVE; uint16_t col = T.good;
-  if (crpPin > 3.1f) { st = S_CRPHI; col = T.hot; }
-  else if (el < 4000) { st = S_CRPWAIT; col = T.dim; }
-  else if (crpMx < 0.15f) { st = S_CRPLOW; col = T.warn; }
-  else if (crpMx - crpMn < 0.012f) { st = S_CRPFLAT; col = T.warn; }
+  bool ov; float v = metricVal(M_CRP, ov);
+  if (ov) { int cv = (int)lroundf(clampf(v, 0, 99.99f) * 100); snprintf(b, sizeof b, "%d.%02d", cv / 100, cv % 100); } else strcpy(b, "--");
+  txtVU(F_NL, b, F_LS, "V", 18, 126, T.accL, T.dim, AL_L);
+  txt(F_UM, psup[0x23] ? "PID 23" : psup[0x59] ? "PID 59" : "", 303, 124, T.dim, AL_R);
+  rowLabel(138, 29, S_CRPFS, S_CRPFSD, true);
+  snprintf(b, sizeof b, "%d", crpFs); stepBtns(138, 29, b, "MPa");
+  StrId st = S_CRPMOVE; uint16_t col = T.good;
+  if (!demoMode && linkState != 2) { st = S_CRPNOLINK; col = T.warn; }
+  else if (!demoMode && !psup[0x23] && !psup[0x59]) { st = S_CRPNOPID; col = T.warn; }
+  else if (!ok) { st = S_CRPWAIT; col = T.dim; }
   tile(9, 171, 302, 32, 8);
   lab(st, LB_ROW, 160, thai ? 192 : 190, col, AL_C, 290);
   chipId(S_CRPRESET, 9, 210, 146, 22, false); chipId(S_CRPDEF, 165, 210, 146, 22, false);
@@ -2630,13 +2626,13 @@ static void drawCrpCal() {
 static void tapCrpCal(int x, int y, bool first) {
   if (first) {
     if (hitBack(x, y)) { savePrefs(); nav(PG_SETUP2); return; }
-    if (hit(x, y, 9, 210, 146, 22)) { crpMn = 99; crpMx = 0; crpSince = millis(); return; }
-    if (hit(x, y, 165, 210, 146, 22)) { crpRatio10 = (int)(CRP_RATIO * 10 + 0.5f); saveSoon(); return; }
+    if (hit(x, y, 9, 210, 146, 22)) { crpMn = 1e9f; crpMx = -1e9f; return; }
+    if (hit(x, y, 165, 210, 146, 22)) { crpFs = 200; saveSoon(); return; }
   }
   int ry = 142, rh = 20;
   if (y >= ry && y < ry + rh) {
-    if (hit(x, y, 164, ry, 30, rh)) { stepVal(crpRatio10, 10, 150, -1, 1); saveSoon(); }
-    else if (hit(x, y, 281, ry, 30, rh)) { stepVal(crpRatio10, 10, 150, 1, 1); saveSoon(); }
+    if (hit(x, y, 164, ry, 30, rh)) { stepVal(crpFs, 50, 400, -1, 10); saveSoon(); }
+    else if (hit(x, y, 281, ry, 30, rh)) { stepVal(crpFs, 50, 400, 1, 10); saveSoon(); }
   }
 }
 
@@ -3411,7 +3407,7 @@ static void nav(Page p) {
     case PG_BT: btOff = 0; if (!selAddr[0] && scanState != 1 && !demoMode) btStartScan(); break;
     case PG_PARK: parkAt = millis(); break;
     case PG_UPD: updErr = UE_NONE; break;
-    case PG_CRP: crpMn = 99; crpMx = 0; crpSince = millis(); break;
+    case PG_CRP: crpMn = 1e9f; crpMx = -1e9f; break;
     default: break;
   }
 }
@@ -3560,7 +3556,6 @@ void setup() {
   digitalWrite(4, HIGH); digitalWrite(16, HIGH); digitalWrite(17, HIGH);
   loadPrefs(); updNoteVersion();
   initPanel();
-  analogSetPinAttenuation(CRP_PIN, ADC_11db);
   linkState = demoMode ? 0 : (selAddr[0] ? 1 : 3);
   if (demoMode && !slotsCustom) autoSlots();
   tripReset(); peaksClear(pkD); logClear();
@@ -3580,11 +3575,7 @@ void loop() {
   if (uprotoAt && now - uprotoAt > 1500) { uprotoAt = 0; if (!demoMode) reconnectReq = true; }
   updLoop(now);
 
-  static uint32_t tSim = 0, tUI = 0, tGraph = 0, tCrp = 0; static int lastLs = -1;
-  if (now - tCrp >= 20) {
-    tCrp = now; crpPin = crpPin * 0.5f + readCrp() * 0.5f; crpV = crpPin * crpRatio10 / 10.0f;
-    if (now - crpSince > 600) { crpMn = fminf(crpMn, crpPin); crpMx = fmaxf(crpMx, crpPin); }     // skip the first 0.6 s while the filter settles
-  }
+  static uint32_t tSim = 0, tUI = 0, tGraph = 0; static int lastLs = -1;
   if (now - tSim >= 100) {
     float dt = (now - tSim) / 1000.0f; tSim = now;
     tripStep(dt); peaksStep(); logStep(); alertsStep(); parkStep(now);
