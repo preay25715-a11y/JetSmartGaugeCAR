@@ -41,7 +41,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.10"
+#define FW_VERSION "v1.0.11"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -852,10 +852,11 @@ static uint8_t crpSrc = 0;                            // 0 = auto (PID 23, else 
 static uint8_t crpFastPid = 0;                        // the rail PID while it is on screen: asked in every request group instead of once per rotation
 static bool crpHave() { return crpSrc == 1 ? psup[0x23] : crpSrc == 2 ? psup[0x59] : (psup[0x23] || psup[0x59]); }
 static uint8_t crpPid() { return crpSrc == 1 ? 0x23 : crpSrc == 2 ? 0x59 : psup[0x23] ? 0x23 : psup[0x59] ? 0x59 : 0; }
+static uint8_t thrFast = 0;                           // the pedal / throttle PID on screen (CAN groups): asked in every request instead of once per rotation
 static int nextWanted(int& rr, int tier) {
   for (int i = 0; i < 255; i++) {
     rr = (rr % 255) + 1;
-    if (psup[rr] && want[rr] == tier && rr != 0x0C && rr != 0x0D && rr != 0x01 && rr != crpFastPid && (int32_t)(iterNow - pskip[rr]) >= 0) return rr;
+    if (psup[rr] && want[rr] == tier && rr != 0x0C && rr != 0x0D && rr != 0x01 && rr != crpFastPid && rr != thrFast && (int32_t)(iterNow - pskip[rr]) >= 0) return rr;
   }
   return -1;
 }
@@ -926,13 +927,19 @@ void obdTask(void*) {
       else if (req == 3) { req = 0; doFreeze(); }
       else if (req == 4) { req = 0; doEcuInfo(); }
       iter++; iterNow = (uint32_t)iter;
-      { uint8_t cp = crpPid(); crpFastPid = (cp && psup[cp] && want[cp] == 2) ? cp : 0; }
+      { uint8_t cp = crpPid(); crpFastPid = (cp && psup[cp] && want[cp] == 2 && (int32_t)(iterNow - pskip[cp]) >= 0) ? cp : 0; }
+      thrFast = 0;
+      if (multiOk && protoNum >= 6) {                                                       // CAN: the pedal (else the throttle) on screen travels with RPM in every request; K-line has no room for it
+        static const uint8_t TP[2] = {0x49, 0x11};                                          // accelerator pedal D first, then throttle position (they follow each other)
+        for (int i = 0; i < 2 && !thrFast; i++) if (psup[TP[i]] && want[TP[i]] == 2 && (int32_t)(iterNow - pskip[TP[i]]) >= 0) thrFast = TP[i];
+      }
       if (vinPending && iter >= 6) { vinPending = false; readVin(); }
       if (multiOk && protoNum >= 6) {
         // CAN: RPM, speed and up to 4 more PIDs travel in ONE request (the last place rotates the background PIDs: alerts, trip, graphs)
         uint8_t ids[6]; int cnt = 0, single = -1;
         ids[cnt++] = 0x0C; ids[cnt++] = 0x0D;
         if (crpFastPid && pidLen(crpFastPid)) ids[cnt++] = crpFastPid;                      // the rail pressure on screen: in every request
+        if (thrFast) ids[cnt++] = thrFast;                                                  // so is the pedal / throttle (at most 2 pinned in all: 2 places stay for the rotation)
         int nOther = 6 - cnt;
         for (int k = 0; k < nOther; k++) {
           bool bg = (k == nOther - 1);
@@ -988,6 +995,7 @@ static const int SCR_W = 320, SCR_H = 240, BAND_H = 20, NBAND = SCR_H / BAND_H;
 alignas(4) static uint16_t tPix[SCR_W * BAND_H];            // the band being composed (12.8 KB)
 static int bandY0 = 0, bandY1 = BAND_H;
 static uint32_t uiNow = 0;                                    // time of the frame being drawn
+static float rpmUi = 0;                                       // the RPM the dash shows this frame (rpmFollow)
 
 static inline uint16_t* rowPtr(int y) { return tPix + (y - bandY0) * SCR_W; }
 static inline int clampi(int v, int a, int b) { return v < a ? a : v > b ? b : v; }
@@ -1810,7 +1818,7 @@ static void dashOf(int m, char* t, size_t n, const char*& unit, float& frac, Str
   else { float sp = gv0(0x0D); snprintf(t, n, "%d", (int)sp); unit = "km/h"; frac = sp / 200; lid = S_SPEED; }
 }
 static void drawDash() {
-  float rpm = gv0(0x0C);
+  float rpm = rpmUi;
   topBar(rpm);
   for (int i = 0; i < 6; i++) dtile(i);
   ringDraw(rpm);
@@ -1844,7 +1852,7 @@ static void fuelTag() {                                         // Petrol / Dies
 }
 static uint8_t logKind = 0;                                     // log page: 0 = CRP volts, 1 = AFR
 static void drawData() {
-  topBar(gv0(0x0C)); modeChips(DATA_MODES, 4, 0); fuelTag();
+  topBar(rpmUi); modeChips(DATA_MODES, 4, 0); fuelTag();
   for (int i = 0; i < 16; i++) {
     DTile t; dtileOf(i, t); int x = GX[i & 3], y = GY[i >> 2];
     tile(x, y, 71, 33);
@@ -1935,7 +1943,7 @@ static void allBuild() { allN = 0; for (int i = 0; i < NPID; i++) if (allMode ||
 static int allPages() { return max(1, (allN + ALL_ROWS - 1) / ALL_ROWS); }
 static void drawAll() {
   int pages = allPages(); allPg = clampi(allPg, 0, pages - 1);
-  topBar(gv0(0x0C)); modeChips(DATA_MODES, 2, 1);
+  topBar(rpmUi); modeChips(DATA_MODES, 2, 1);
   chipArrow(121, 32, 24, 20, -1, false);
   char pg[12]; snprintf(pg, sizeof pg, "%d/%d", allPg + 1, pages); txt(F_LM, pg, 170, 45, T.dim, AL_C);
   chipArrow(195, 32, 24, 20, 1, false);
@@ -2062,7 +2070,7 @@ static const StrId GBTN[4] = {S_GRPM, S_GTEMPS, S_GAFR, S_GBATT};
 static const int GBX[5] = {9, 70, 131, 192, 253};
 static void drawGraph() {
   GSer s[3]; int n; gDefs(s, n);
-  topBar(gv0(0x0C));
+  topBar(rpmUi);
   graphReadouts(s, n); graphAxes(s, n);
   for (int i = 0; i < 4; i++) chipId(GBTN[i], GBX[i], 168, 56, 22, gsel == i);
   chipId(gmode ? S_G15M : S_G60S, GBX[4], 168, 58, 22, false);
@@ -2101,7 +2109,7 @@ static void tripBars() {
   lab(S_LAST30, LB_TILE, 304, tby(142), T.dim, AL_R);
 }
 static void drawTrip() {
-  topBar(gv0(0x0C)); modeChips(TRIP_MODES, 2, 0);
+  topBar(rpmUi); modeChips(TRIP_MODES, 2, 0);
   bool have = tFuel > 0.002f || tNow > 0 || tNowKmL > 0; float rg = rangeKm();
   char rt[16]; if (rg >= 0) snprintf(rt, sizeof rt, "%d km", (int)rg); else strcpy(rt, "-- km");
   int rw = textW(F_US, rt);
@@ -2138,7 +2146,7 @@ static void tapTrip(int x, int y, bool first) {
 static const int PKX[3] = {9, 112, 215}, PKY[3] = {56, 103, 150};
 static void drawPeaks() {
   const Peaks& p = pkAllMode ? pkA : pkD;
-  topBar(gv0(0x0C)); modeChips(TRIP_MODES, 2, 1);
+  topBar(rpmUi); modeChips(TRIP_MODES, 2, 1);
   chipId(pkAllMode ? S_ALLTIME : S_THISDRIVE, 181, 32, 72, 20, pkAllMode); chipId(S_RESET, 257, 32, 54, 20, false);
   struct E { StrId lb; float v; int dec; const char* unit; uint32_t t; bool good, bad; };
   E e[9] = {
@@ -2353,7 +2361,7 @@ static void codeRow(int r) {
 static void drawCodes() {
   if (clearArmed && uiNow - clearAt > 4000) clearArmed = false;
   int pages = max(1, (min((int)codeCount, 24) + CODE_ROWS - 1) / CODE_ROWS); codePg = clampi(codePg, 0, pages - 1);
-  topBar(gv0(0x0C)); codeChips(0);
+  topBar(rpmUi); codeChips(0);
   codesBanner();
   if (clearArmed) {
     rrG(9, 77, 302, 89, 9, TA.panel2, TA.panel, T.warn);
@@ -2401,7 +2409,7 @@ static void monitorsDraw() {
     txtVU(F_NM, b, F_LS, ST3[i].unit, cx, sy + sh - 5, ok ? T.text : T.dim, T.dim, AL_C);
   }
 }
-static void drawStatus() { topBar(gv0(0x0C)); codeChips(1); monitorsDraw(); tabBar(4); }
+static void drawStatus() { topBar(rpmUi); codeChips(1); monitorsDraw(); tabBar(4); }
 
 // ---------- freeze frame ----------
 static const uint8_t FZM[12] = {MI_RPM, MI_SPEED, MI_COOL, MI_LOAD, MI_STFT, MI_LTFT, MI_MAP, MI_INTAKE, MI_THR, MI_MAF, MI_TIMING, MI_BATT};
@@ -2415,7 +2423,7 @@ static void freezeRead() {
   frzState = 1; frzVer = frzVer + 1; req = 3;
 }
 static void drawFreeze() {
-  topBar(gv0(0x0C)); codeChips(2);
+  topBar(rpmUi); codeChips(2);
   tile(9, 56, 302, 28, 9);
   if (frzState == 2 && frzCode[0]) {
     txt(F_UL, frzCode, 19, 75, T.text);
@@ -2449,7 +2457,7 @@ static void ecuBox(int y, StrId lb, const char* v) {
   txt(f, t, 18, y + 30, v[0] ? T.text : T.dim);
 }
 static void drawEcu() {
-  topBar(gv0(0x0C)); codeChips(3);
+  topBar(rpmUi); codeChips(3);
   ecuBox(56, S_VIN, vinBuf); ecuBox(96, S_ECUNAME, ecuName); ecuBox(136, S_CALID, calId);
   tile(9, 175, 302, 22, 8);
   lab(S_PROTO, LB_TILE, 18, tby(189), T.dim);
@@ -2507,7 +2515,7 @@ static void themeCard(int i) {
   lab(sel ? S_SELECTED : S_TAPUSE, LB_TILE, x + 142, y + (thai ? 20 : 17), sel ? T.accL : T.dim, AL_R);
 }
 static void drawSetup() {
-  topBar(gv0(0x0C));
+  topBar(rpmUi);
   themeCard(0); themeCard(1);
   for (int i = 0; i < SU_N; i++) setupRow(i);
   chipId(S_BTNAME, 9, 177, 71, 20, false); chipId(S_VEHICLE, 86, 177, 71, 20, false); chipId(S_MORE, 163, 177, 71, 20, false); chipId(S_UPDTITLE, 240, 177, 71, 20, false);
@@ -3514,11 +3522,33 @@ static void drawScene() {
   }
 #endif
 }
+// ---------- RPM that follows the pedal (v1.0.11) ----------
+// The car answers about every 70 ms (CAN) and a frame reaches the glass some 50 ms after it was composed. rpmFollow() continues the last trend over
+// that gap, so the ring, the number and the shift strip are where the engine is now. Steady revs (idle, cruising) stay below the dead band, and then the
+// number is exactly what the ECU said.
+static const int RS_COMP = 60, RS_MAXH = 240, RS_CAP = 350;     // ms the picture is late by, longest look-ahead (ms), largest lead (rpm)
+static bool rsOn = false; static float rsV1 = 0, rsSlope = 0, rsPrevS = 0; static uint32_t rsT1 = 0;     // last reply, its time, the trend (rpm per ms), and the step before
+static float rpmFollow() {                                      // once per frame, from the frame's snapshot
+  bool ok; float v = getVal(0x0C, ok);
+  if (!ok) { rsOn = false; rsSlope = rsPrevS = 0; return 0; }
+  uint32_t t = pageS[0x0C];
+  if (!rsOn) { rsOn = true; rsV1 = v; rsT1 = t; rsSlope = rsPrevS = 0; return v; }
+  if (t != rsT1) {                                              // a new reply
+    float dt = (float)(int32_t)(t - rsT1), dv = v - rsV1, s = 0;
+    if (dt >= 8 && dt <= 600 && fabsf(dv) >= 30 + 0.2f * dt) s = dv / dt;       // below the dead band it is noise (idle jitter), not the pedal
+    float tgt = (s != 0 && rsPrevS != 0 && (s > 0) == (rsPrevS > 0)) ? (s + rsPrevS) * 0.5f : 0;   // a trend needs two steps the same way: noise changes sign
+    rsSlope = tgt * 0.7f + rsSlope * 0.3f; rsPrevS = s; rsV1 = v; rsT1 = t;
+  }
+  float h = clampf((float)(int32_t)(uiNow - rsT1) + RS_COMP, 0, RS_MAXH);
+  float r = v + clampf(rsSlope * h, -RS_CAP, RS_CAP);
+  return r < 0 ? 0 : r;
+}
 static void renderFrame() {
   uiNow = snapNow = millis();                                   // one consistent snapshot of the car data for all bands
   memcpy(pvS, pv, sizeof pv); memcpy(psupS, psup, sizeof psup); memcpy(pageS, page, sizeof page);
   snapOn = true;
 #ifndef UPD_BUILD
+  rpmUi = rpmFollow();
   if (scr == PG_ALL) { int oN = allN, oP = allPg; allBuild(); if (allN != oN || allPg != oP) updateWants(); }
   if (scr == PG_BT) btBuildView();
 #endif
