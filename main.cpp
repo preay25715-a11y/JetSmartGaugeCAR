@@ -41,7 +41,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.11"
+#define FW_VERSION "v1.0.12"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -753,6 +753,7 @@ static void doFreeze() {
 }
 
 static bool pollPid(uint8_t pid, int& fails);
+static uint16_t ftAsk = 0, ftSilent = 0;                             // requests for RPM / speed, and how many of them were not answered (the fast-timing watch counts them)
 static uint8_t pidLen(uint8_t id) {                                  // data bytes (SAE J1979) of the PIDs that may be asked together; 0 = ask alone
   switch (id) {
     case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0D: case 0x0E: case 0x0F: case 0x11:
@@ -804,11 +805,13 @@ static int queryMulti(const uint8_t* ids, int cnt, uint8_t* got) {  // one reque
 }
 static int pollGroup(const uint8_t* ids, int cnt, int& fails) {      // returns how many PIDs the car answered
   uint8_t got[6] = {0, 0, 0, 0, 0, 0};
+  ftAsk++;
   int ok = queryMulti(ids, cnt, got);
   if (ok == 0) {                                                     // nothing decoded: the car is silent, or it does not take combined requests - one plain RPM query tells which
     int f2 = 0;
     if (pollPid(0x0C, f2)) { fails = 0; if (++multiBad >= 2) multiOff(); }
     else fails++;
+    ftSilent++;
     return 0;
   }
   fails = 0; multiBad = 0;
@@ -820,6 +823,7 @@ static int pollGroup(const uint8_t* ids, int cnt, int& fails) {      // returns 
 }
 static bool pollPid(uint8_t pid, int& fails) {
   uint8_t b[9]; int n = 0;
+  if (pid == 0x0C || pid == 0x0D) ftAsk++;
   if (queryPid(pid, b, n, pollTmo())) {
     storePid(pid, b, n, millis()); fails = 0; pfail[pid] = 0; pskip[pid] = 0;
     if (pid == 0x0C) noteRpm();
@@ -829,8 +833,96 @@ static bool pollPid(uint8_t pid, int& fails) {
       ecuDiesel = (b[1] & 0x08) != 0; ecuDieselKnown = true;            // SAE J1979: PID 01 byte B bit 3 = compression ignition
     }
     if (pid == 0x51) { int f = b[0]; if (f >= 0x10 && f <= 0x15) ecuHybrid = true; if (f == 4 || f == 0x12) { ecuDiesel = true; ecuDieselKnown = true; } }
-  } else { fails++; notePidFail(pid); return false; }
+  } else { fails++; notePidFail(pid); if (pid == 0x0C || pid == 0x0D) ftSilent++; return false; }
   return true;
+}
+
+// ---------- faster ELM timing on CAN (v1.0.12) ----------
+static uint8_t ftState = 0;                                          // 0 not used (K-line, adapter refused), 1 on trial, 2 kept, 3 given up (the adapter did worse with it)
+static char ftBadAddr[18] = "";                                      // the adapter that did worse: not tried again
+static uint16_t ftN = 0, ftMiss = 0;
+static void ftBegin() {
+  ftState = 0; ftN = ftMiss = 0;
+  if (protoNum < 6 || !selAddr[0] || !strcmp(ftBadAddr, selAddr)) return;
+  if (elmQuery("ATAT2", 800).indexOf("OK") < 0) return;              // an adapter without adaptive timing: leave it as it is
+  elmQuery("ATST19", 800);                                           // 25 x 4 ms = 100 ms to wait for an answer (the ELM default is 200 ms)
+  ftState = 1;
+}
+static void ftRevert() {
+  elmQuery("ATAT1", 800); elmQuery("ATST32", 800);                   // the ELM defaults
+  ftState = 3;
+  int f = 0;
+  if (pollPid(0x0C, f)) { strncpy(ftBadAddr, selAddr, sizeof ftBadAddr - 1); ftBadAddr[sizeof ftBadAddr - 1] = 0; protoDirty = true; }   // the car answers now: it was the timing. (Silent still = ignition off, not the adapter's fault: not remembered)
+}
+static void ftWatch(uint16_t asks, uint16_t misses) {                // after each round while the timing is on trial
+  if (ftState != 1) return;
+  ftN += asks; ftMiss += misses;
+  if (ftMiss >= 6 && ftMiss * 3 > ftN) ftRevert();                   // more than 1 request in 3 came back empty: worse than before
+  else if (ftN >= 100) ftState = 2;                                  // 100 requests without trouble: keep it
+}
+
+// ---------- CAN listen (v1.0.12) ----------
+struct LsRow { uint16_t id; uint16_t n; uint8_t d[8]; uint8_t dn; };
+static const int LS_MAX = 40;                                        // distinct IDs followed in "all IDs" mode
+static volatile bool listenWant = false;                             // the CAN listen page is open (set by the UI)
+static volatile uint8_t listenMode = 0, listenGen = 0, listenSt = 0; // mode 0 = ID 202 only, 1 = all IDs; state 0 off, 1 starting, 2 listening, 4 cannot (no CAN 11-bit)
+static volatile uint32_t lsTotal = 0, lsStart = 0; static volatile uint16_t lsRate = 0; static volatile uint8_t lsBuf = 0, lsDistinct = 0;
+static LsRow lsLast, lsTop[5]; static volatile uint8_t lsTopN = 0;  // the last frame of the filtered ID; the five busiest IDs of the last second
+static LsRow lsTab[LS_MAX]; static uint8_t lsTabN = 0; static uint16_t lsWin = 0;
+static void lsLine(const char* s, int k) {                           // "2020B5C0000FF0000": 3 hex digits of ID, then the data bytes (ATH1, spaces off)
+  if (k >= 10 && !strncmp(s, "BUFFERFULL", 10)) { lsBuf = 1; return; }
+  if (k < 3 || k > 19 || ((k - 3) & 1) || !isHexStr(s, k)) return;
+  uint16_t id = (uint16_t)((hv(s[0]) << 8) | (hv(s[1]) << 4) | hv(s[2]));
+  int dn = (k - 3) / 2; uint8_t d[8];
+  for (int i = 0; i < dn; i++) d[i] = (uint8_t)((hv(s[3 + 2 * i]) << 4) | hv(s[4 + 2 * i]));
+  if (listenMode == 0 && id != 0x202) return;
+  lsTotal = lsTotal + 1; lsWin++;
+  if (listenMode == 0) { lsLast.id = id; lsLast.dn = (uint8_t)dn; memcpy(lsLast.d, d, dn); lsLast.n = 1; return; }
+  int i = 0; while (i < lsTabN && lsTab[i].id != id) i++;
+  if (i == lsTabN) { if (lsTabN >= LS_MAX) return; lsTab[i].id = id; lsTab[i].n = 0; lsTabN++; }
+  lsTab[i].n++; lsTab[i].dn = (uint8_t)dn; memcpy(lsTab[i].d, d, dn);
+}
+static void lsSecond() {                                             // once per second: the rate, and the five busiest IDs
+  lsRate = lsWin; lsWin = 0;
+  LsRow top[5]; int nt = 0;
+  for (int i = 0; i < lsTabN; i++) {
+    if (!lsTab[i].n) continue;
+    int pos;
+    if (nt < 5) pos = nt++; else if (lsTab[i].n > top[4].n) pos = 4; else continue;
+    while (pos > 0 && top[pos - 1].n < lsTab[i].n) { top[pos] = top[pos - 1]; pos--; }
+    top[pos] = lsTab[i];
+  }
+  for (int i = 0; i < nt; i++) lsTop[i] = top[i];
+  lsTopN = (uint8_t)nt; lsDistinct = (uint8_t)lsTabN;
+  for (int i = 0; i < lsTabN; i++) lsTab[i].n = 0;
+}
+static void doListen() {
+  uint8_t g = listenGen, mode = listenMode;
+  listenSt = 1; lsTotal = 0; lsRate = 0; lsWin = 0; lsTabN = 0; lsTopN = 0; lsDistinct = 0; lsBuf = 0; lsLast.n = 0; lsLast.dn = 0; lsStart = millis();
+  elmQuery("ATH1", 800);                                             // frames with their ID
+  if (mode == 0) elmQuery("ATCRA202", 800);                          // only the engine data frame (Mazda 3 2017 layout: RPM, speed, pedal)
+  while (linkAvail()) linkRead();
+  linkSend("ATMA");
+  listenSt = 2;
+  char ln[40]; int k = 0; uint32_t tWin = millis();
+  while (listenWant && g == listenGen && !abortWait()) {
+    bool got = false;
+    while (linkAvail()) {
+      char c = (char)linkRead(); got = true;
+      if (c == '\r' || c == '\n') { if (k) lsLine(ln, k); k = 0; }
+      else if (c != ' ' && c != '>') { if (k < 38) ln[k++] = c; else k = 39; }
+    }
+    uint32_t t = millis();
+    if (t - tWin >= 1000) { tWin = t; lsSecond(); }
+    if (!got) vTaskDelay(1);
+  }
+  if (!linkIsUp()) return;
+  linkSend("");                                                      // any character stops the monitor
+  uint32_t t0 = millis(); bool prompt = false;
+  while (millis() - t0 < 1500 && linkIsUp()) { if (linkAvail()) { if (linkRead() == '>') { prompt = true; break; } } else vTaskDelay(1); }
+  if (!prompt) { linkDown(); return; }                               // the adapter does not come back: reconnect (the normal start-up runs again)
+  elmQuery("ATCRA", 800); elmQuery("ATAR", 800); elmQuery("ATH0", 800);   // back to what the polling expects
+  listenSt = 0;
 }
 
 static void detectVehicle() {
@@ -853,10 +945,25 @@ static uint8_t crpFastPid = 0;                        // the rail PID while it i
 static bool crpHave() { return crpSrc == 1 ? psup[0x23] : crpSrc == 2 ? psup[0x59] : (psup[0x23] || psup[0x59]); }
 static uint8_t crpPid() { return crpSrc == 1 ? 0x23 : crpSrc == 2 ? 0x59 : psup[0x23] ? 0x23 : psup[0x59] ? 0x59 : 0; }
 static uint8_t thrFast = 0;                           // the pedal / throttle PID on screen (CAN groups): asked in every request instead of once per rotation
+static uint16_t pidEvery(uint8_t pid, int tier) {          // shortest time between two requests of one PID (ms): fast movers every round, slow ones on a timer
+  uint16_t e;
+  switch (pid) {
+    case 0x5E: e = 300; break;                                                       // fuel rate
+    case 0x78: case 0x79: case 0x7A: case 0x7B: e = 250; break;                      // exhaust gas temperatures
+    case 0x06: case 0x07: case 0x08: case 0x09: e = 400; break;                      // fuel trims
+    case 0x0F: case 0x42: e = 600; break;                                            // intake air temperature, battery volts
+    case 0x05: case 0x5C: case 0x1F: case 0x3C: case 0x3D: case 0x3E: case 0x3F: case 0x5B: e = 1000; break;   // coolant, oil, run time, catalyst, hybrid battery
+    case 0x2F: case 0x33: case 0x46: e = 2500; break;                                // fuel level, barometer, ambient (the screen calls a value old after 8 s)
+    default: e = 0;                                                                  // load, MAP, MAF, throttle, pedal, lambda, rail pressure, torque, timing: as often as the car answers
+  }
+  if (tier == 1 && e < 400) e = 400;                                                 // background PIDs (alerts, trip, graphs) never need more
+  return e;
+}
+static bool pidDue(uint8_t pid, int tier) { uint32_t p = page[pid]; if (!p) return true; uint16_t e = pidEvery(pid, tier); return !e || (uint32_t)(millis() - p) >= e; }
 static int nextWanted(int& rr, int tier) {
   for (int i = 0; i < 255; i++) {
     rr = (rr % 255) + 1;
-    if (psup[rr] && want[rr] == tier && rr != 0x0C && rr != 0x0D && rr != 0x01 && rr != crpFastPid && rr != thrFast && (int32_t)(iterNow - pskip[rr]) >= 0) return rr;
+    if (psup[rr] && want[rr] == tier && rr != 0x0C && rr != 0x0D && rr != 0x01 && rr != crpFastPid && rr != thrFast && (int32_t)(iterNow - pskip[rr]) >= 0 && pidDue((uint8_t)rr, tier)) return rr;
   }
   return -1;
 }
@@ -919,14 +1026,19 @@ void obdTask(void*) {
         continue;
       }
       if (!sb && gen == selGen && (!pinOk || pinIdx != pinSaved)) { pinOk = true; pinDirty = true; }   // this PIN works: remember it
-      discoverPids(); detectVehicle(); fails = 0; iter = 0; linkState = 2; lastMil = millis();
+      discoverPids(); detectVehicle(); ftBegin(); fails = 0; iter = 0; linkState = 2; lastMil = millis();
     }
     while (!demoMode && linkIsUp() && fails < 8 && !scanReq && !reconnectReq) {
       if (req == 1) { req = 0; doReadCodes(); }
       else if (req == 2) { req = 0; doClearCodes(); }
       else if (req == 3) { req = 0; doFreeze(); }
       else if (req == 4) { req = 0; doEcuInfo(); }
+      if (listenWant && !demoMode) {
+        if (protoNum == 6 || protoNum == 8) { doListen(); fails = 0; lastMil = millis(); continue; }      // 11-bit CAN: the polling waits while the page listens
+        listenSt = 4;                                                                                    // anything else: nothing to listen to, the polling goes on
+      }
       iter++; iterNow = (uint32_t)iter;
+      uint16_t ftA0 = ftAsk, ftS0 = ftSilent;
       { uint8_t cp = crpPid(); crpFastPid = (cp && psup[cp] && want[cp] == 2 && (int32_t)(iterNow - pskip[cp]) >= 0) ? cp : 0; }
       thrFast = 0;
       if (multiOk && protoNum >= 6) {                                                       // CAN: the pedal (else the throttle) on screen travels with RPM in every request; K-line has no room for it
@@ -970,6 +1082,7 @@ void obdTask(void*) {
           else pollOther(rrFg, rrBg, iter % 4 == 3 && k == bgk, fails);                // on-screen PIDs 3 rounds out of 4, background ones in between
         }
       }
+      ftWatch((uint16_t)(ftAsk - ftA0), (uint16_t)(ftSilent - ftS0));
       if (millis() - lastMil > (protoNum >= 6 ? 2000u : 4000u)) { pollPid(0x01, fails); lastMil = millis(); }   // warning lamp / readiness bits (K-line: every request counts, so less often)
       vTaskDelay(1);
     }
@@ -1590,6 +1703,7 @@ static void loadPrefs() {
 #else
   invScreen = prefs.getBool("inv", false);
 #endif
+  { String fb = prefs.getString("ftbad", ""); strncpy(ftBadAddr, fb.c_str(), sizeof ftBadAddr - 1); ftBadAddr[sizeof ftBadAddr - 1] = 0; }
   vehModel = prefs.getInt("veh", -1); lastProto = prefs.getInt("proto", 0); userProto = prefs.getInt("uproto", 0); unitL100 = prefs.getBool("unitl", false); slotsCustom = prefs.getBool("slc", false);
   flipScr = prefs.getBool("flip", false); autoBike = prefs.getBool("abike", false); autoModel = prefs.getInt("amodel", -1);
   nvmap = prefs.getInt("nvmap", 0); if (nvmap < 0 || nvmap > 8 || prefs.getBytes("vmap", vmap, sizeof vmap) != sizeof vmap) nvmap = 0;
@@ -1626,7 +1740,7 @@ static void savePrefs() {
   prefs.putBool("unitl", unitL100);
   prefs.putBool("flip", flipScr); prefs.putBool("abike", autoBike); prefs.putInt("amodel", autoModel);
   prefs.putInt("nvmap", nvmap); prefs.putBytes("vmap", vmap, sizeof vmap);
-  prefs.putString("btaddr", selAddr); prefs.putString("btname", selName);
+  prefs.putString("btaddr", selAddr); prefs.putString("btname", selName); prefs.putString("ftbad", ftBadAddr);
   prefs.putInt("btkind", selBle ? 1 + selAType : 0); prefs.putInt("btpin", pinIdx); prefs.putBool("btpinok", pinOk);
   prefs.putBytes("pkall", &pkA, sizeof pkA);
   prefs.end();
@@ -1638,7 +1752,7 @@ static void applyInvert() { tft.invertDisplay(invScreen); }
 // =====================================================================================
 //  Screens
 // =====================================================================================
-enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG, PG_UPD, PG_CRP, PG_CRPCAL };
+enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG, PG_UPD, PG_CRP, PG_CRPCAL, PG_LISTEN };
 static Page scr = PG_SPLASH;
 static bool redraw = true;
 static void applyFlip() { tft.setRotation(flipScr ? 3 : 1); invalidatePanel(); redraw = true; }      // the picture is turned 180 degrees; every band is sent again
@@ -1677,6 +1791,7 @@ static void updateWants() {
   else if (scr == PG_TRIP || scr == PG_PARK) { markSrc(M_FUELRATE, 2); markWant(0x2F, 2); }
   else if (scr == PG_STATUS) { markWant(0x21, 2); markWant(0x30, 2); markWant(0x31, 2); }
   else if (scr == PG_LOG || scr == PG_CRP || scr == PG_CRPCAL) markSrc(M_CRP, 2);
+  listenWant = (scr == PG_LISTEN);
 }
 
 static const char* protoName(int p) {
@@ -2456,13 +2571,63 @@ static void ecuBox(int y, StrId lb, const char* v) {
   if (textW(f, t) > 284) { char t2[32]; fitText(t2, sizeof t2, t, f, 284); strcpy(t, t2); }
   txt(f, t, 18, y + 30, v[0] ? T.text : T.dim);
 }
+static void hexBytes(char* d, size_t cap, const uint8_t* b, int n) { size_t k = 0; d[0] = 0; for (int i = 0; i < n && k + 3 < cap; i++) k += snprintf(d + k, cap - k, i ? " %02X" : "%02X", b[i]); }
+static void drawListen() {
+  subHeader(S_LISTEN, S_COUNT, false);
+  uint8_t mode = listenMode; char b[48];
+  chipS("ID 202", 9, 30, 146, 22, mode == 0); chipId(S_LSALL, 165, 30, 146, 22, mode == 1);
+  tile(9, 58, 302, 50);
+  lab(S_LSRATE, LB_TILE, 18, thai ? 75 : 73, T.dim);
+  snprintf(b, sizeof b, "%u", (unsigned)lsRate);
+  txtVU(F_NL, b, F_LS, "/s", 18, 100, T.text, T.dim, AL_L);
+  lab(S_LSTIM, LB_TILE, 303, thai ? 75 : 73, T.dim, AL_R);
+  txt(F_UM, (ftState == 1 || ftState == 2) ? "ATAT2  ATST19" : "ATAT1  ATST32", 303, 98, T.text, AL_R);
+  tile(9, 112, 302, 96);
+  uint32_t el = uiNow - lsStart; uint32_t tot = lsTotal; bool have = tot > 0;
+  if (mode == 0) {
+    lab(S_LSLAST, LB_TILE, 18, thai ? 129 : 127, T.dim);
+    lab(S_LSDEC, LB_TILE, 303, thai ? 129 : 127, T.dim, AL_R, 190);
+    if (lsLast.n && lsLast.dn) { hexBytes(b, sizeof b, lsLast.d, lsLast.dn); txt(F_UL, b, 18, 156, T.text); } else txt(F_UL, "--", 18, 156, T.dim);
+    if (lsLast.n && lsLast.dn >= 5) {
+      const uint8_t* d = lsLast.d;
+      int rpm = ((d[0] << 8) | d[1]) / 4, spd = ((d[2] << 8) | d[3]) / 100;
+      snprintf(b, sizeof b, "RPM %d   km/h %d   B4 %d", rpm, spd, d[4]); txt(F_UM, b, 18, 190, T.accL);
+    } else txt(F_UM, "RPM --   km/h --   B4 --", 18, 190, T.dim);
+  } else {
+    lab(S_LSIDS, LB_TILE, 18, thai ? 129 : 127, T.dim);
+    snprintf(b, sizeof b, "%u", (unsigned)lsDistinct); txt(F_UM, b, 303, 130, T.text, AL_R);
+    for (int i = 0; i < 5; i++) {
+      int by = 145 + i * 14;
+      if (i < lsTopN) {
+        snprintf(b, sizeof b, "%03X", lsTop[i].id); txt(F_UM, b, 18, by, T.accL);
+        snprintf(b, sizeof b, "%u/s", (unsigned)lsTop[i].n); txt(F_UM, b, 100, by, T.dim, AL_R);
+        hexBytes(b, sizeof b, lsTop[i].d, lsTop[i].dn); txt(F_UM, b, 114, by, T.text);
+      } else if (i == 0) txt(F_UM, "--", 18, by, T.dim);
+    }
+  }
+  StrId st = S_LSWAIT; uint16_t col = T.dim;
+  if (!demoMode && linkState != 2) { st = S_CRPNOLINK; col = T.warn; }
+  else if (!demoMode && listenSt == 4) { st = S_LSCAN; col = T.warn; }
+  else if (have && lsBuf) { st = S_LSFULL; col = T.warn; }
+  else if (have) { st = S_LSOK; col = T.good; }
+  else if (el > 2500) { st = S_LSNONE; col = T.warn; }
+  tile(9, 212, 302, 24, 8);
+  lab(st, LB_ROW, 160, thai ? 228 : 226, col, AL_C, 290);
+}
+static void tapListen(int x, int y, bool first) {
+  if (!first) return;
+  if (hitBack(x, y)) { nav(PG_ECU); return; }
+  int m = hit(x, y, 9, 30, 146, 22) ? 0 : hit(x, y, 165, 30, 146, 22) ? 1 : -1;
+  if (m >= 0 && m != listenMode) { listenMode = (uint8_t)m; listenGen = listenGen + 1; lsTotal = 0; lsRate = 0; lsTopN = 0; lsDistinct = 0; lsBuf = 0; lsLast.n = 0; lsStart = millis(); }
+}
 static void drawEcu() {
   topBar(rpmUi); codeChips(3);
   ecuBox(56, S_VIN, vinBuf); ecuBox(96, S_ECUNAME, ecuName); ecuBox(136, S_CALID, calId);
-  tile(9, 175, 302, 22, 8);
+  tile(9, 175, 198, 22, 8);
   lab(S_PROTO, LB_TILE, 18, tby(189), T.dim);
+  chipId(S_LISTEN, 215, 175, 96, 22, false);
   char pn[32]; if (!protoNum) strcpy(pn, "--"); else if (obdRpmMs && linkState == 2) snprintf(pn, sizeof pn, "%s  %u ms", protoName(protoNum), (unsigned)obdRpmMs); else snprintf(pn, sizeof pn, "%s", protoName(protoNum));
-  txt(F_UM, pn, 303, thai ? 192 : 189, T.text, AL_R);
+  txt(F_UM, pn, 199, thai ? 192 : 189, T.text, AL_R);
   tabBar(4);
 }
 // the four code pages share one row of chips (and its Read chip); returns true when the touch was handled
@@ -3488,6 +3653,7 @@ static void nav(Page p) {
     case PG_PARK: parkAt = millis(); break;
     case PG_UPD: updErr = UE_NONE; break;
     case PG_CRP: crpMn = 1e9f; crpMx = -1e9f; break;
+    case PG_LISTEN: listenMode = 0; listenGen = listenGen + 1; lsTotal = 0; lsRate = 0; lsTopN = 0; lsDistinct = 0; lsBuf = 0; lsLast.n = 0; lsStart = millis(); listenSt = 1; break;
     case PG_CRPCAL: { bool o; float v = metricVal(M_CRP, o); crpMeter = o ? clampi((int)lroundf(v * 100), 50, 450) : 125; crpMsg = 0; } break;
     default: break;
   }
@@ -3519,6 +3685,7 @@ static void drawScene() {
     case PG_UPD: drawUpd(); break;
     case PG_CRP: drawCrpCal(); break;
     case PG_CRPCAL: drawCrpCalib(); break;
+    case PG_LISTEN: drawListen(); break;
   }
 #endif
 }
@@ -3566,7 +3733,10 @@ static void renderFrame() {
 }
 
 #ifndef UPD_BUILD
-static void tapStatus(int x, int y, bool first) { if (first) codeTouch(x, y, scr); }
+static void tapStatus(int x, int y, bool first) {
+  if (first && scr == PG_ECU && hit(x, y, 215, 175, 96, 22)) { nav(PG_LISTEN); return; }
+  if (first) codeTouch(x, y, scr);
+}
 #endif
 static void handleTouch(int x, int y, bool first) {
 #ifdef UPD_BUILD
@@ -3596,6 +3766,7 @@ static void handleTouch(int x, int y, bool first) {
     case PG_UPD: tapUpd(x, y, first); return;
     case PG_CRP: tapCrpCal(x, y, first); return;
     case PG_CRPCAL: tapCrpCalib(x, y, first); return;
+    case PG_LISTEN: tapListen(x, y, first); return;
   }
 #endif
 }
