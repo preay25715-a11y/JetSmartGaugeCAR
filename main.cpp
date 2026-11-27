@@ -41,7 +41,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.12"
+#define FW_VERSION "v1.0.13"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -215,6 +215,7 @@ static const int NPID = sizeof(PIDS) / sizeof(PIDS[0]);
 static float pv[256];
 static bool psup[256]; static uint8_t want[256];     // want: 0 no, 1 background, 2 on screen
 static uint32_t page[256];
+static volatile uint8_t linkMode = 0;     // 0 = ELM327 over Bluetooth, 1 = Honda K-line board on the UART pins (v1.0.13)
 static volatile int linkState = 0;        // 0 demo, 1 connecting, 2 connected, 3 no adapter chosen
 static volatile bool mil = false;
 static volatile int dtcCount = 0;
@@ -925,6 +926,134 @@ static void doListen() {
   listenSt = 0;
 }
 
+// ---------- Honda K-line, UART straight to a K-line board (v1.0.13) ----------
+#ifndef KL_RX
+#define KL_RX 22                                                     // K-line board TX -> here (the board's 5 V output through a divider: this pin is 3.3 V)
+#endif
+#ifndef KL_TX
+#define KL_TX 27                                                     // here -> K-line board RX
+#endif
+static uint8_t klT11[24]; static volatile uint8_t klT11n = 0;        // the last live table (bytes after "71 11"), as the ECU sent it
+static uint8_t klId[10]; static volatile uint8_t klIdN = 0;          // ECU id (table 0x00)
+static volatile uint32_t klOk = 0, klBad = 0;                        // tables answered / requests without a usable answer
+static volatile uint16_t klRate = 0;                                 // tables answered in the last second
+static volatile uint8_t klEchoSt = 0;                                // 0 not known yet, 1 the board repeats what we send, 2 it does not
+static volatile uint8_t klSt = 0;                                    // 0 off, 1 waking the ECU, 2 linked, 3 no answer
+static bool klUp = false;
+struct KlLive { int rpm, spd, ect, iat, map; float tps, batt, inj, ign; bool injOk, ignOk; };
+static bool klAbort() { return linkMode != 1 || scanReq || reconnectReq; }
+static void klOpen() { if (!klUp) { Serial2.begin(10400, SERIAL_8N1, KL_RX, KL_TX); klUp = true; } while (Serial2.available()) Serial2.read(); }
+static void klClose() { if (klUp) { Serial2.end(); klUp = false; } pinMode(KL_TX, OUTPUT); digitalWrite(KL_TX, HIGH); }     // the TX pin rests high: a floating pin must not pull the K line down
+static void klWake() {                                               // K line low for 70 ms, then high for 130 ms: the ECU starts to listen
+  klClose();
+  pinMode(KL_TX, OUTPUT); digitalWrite(KL_TX, HIGH); vTaskDelay(5);
+  digitalWrite(KL_TX, LOW); vTaskDelay(70);
+  digitalWrite(KL_TX, HIGH); vTaskDelay(130);
+  klOpen();
+}
+// one request: frame = type, length (whole frame), data, checksum (the frame adds up to 0). Returns the reply length (0 = no usable answer), the reply in r.
+// A single-wire board repeats every byte we send: that echo is recognised by itself (the reply type never equals the request type) and skipped.
+static int klSend(uint8_t mt, const uint8_t* d, int dl, uint8_t* r, uint32_t tmo = 350) {
+  uint8_t f[12]; int n = 0; f[n++] = mt; f[n++] = (uint8_t)(dl + 3);
+  for (int i = 0; i < dl && n < 10; i++) f[n++] = d[i];
+  uint8_t s = 0; for (int i = 0; i < n; i++) s = (uint8_t)(s + f[i]);
+  f[n++] = (uint8_t)(0x100 - s);
+  while (Serial2.available()) Serial2.read();
+  Serial2.write(f, n);
+  uint8_t b[64]; int k = 0, off = -1; uint32_t t0 = millis(), lim = tmo + (uint32_t)n * 2;
+  while ((uint32_t)(millis() - t0) < lim) {
+    bool got = false;
+    while (Serial2.available() && k < (int)sizeof b) { b[k++] = (uint8_t)Serial2.read(); got = true; }
+    if (off < 0 && k >= 1) { if (b[0] != f[0]) off = 0; else if (k >= n) off = memcmp(b, f, n) ? 0 : n; }
+    if (off >= 0 && k - off >= 2) {
+      int len = b[off + 1];
+      if (len < 4 || len > 40) break;                                // not a frame
+      if (k - off >= len) {
+        uint8_t sum = 0; for (int i = 0; i < len; i++) sum = (uint8_t)(sum + b[off + i]);
+        if (sum || b[off] != (mt & 0x0F)) break;                     // checksum or reply type wrong
+        memcpy(r, b + off, len); klEchoSt = off ? 1 : 2; return len;
+      }
+    }
+    if (klAbort()) break;
+    if (!got) vTaskDelay(1);
+  }
+  return 0;
+}
+static int klTable(uint8_t t, uint8_t* out, int cap) {               // the data bytes of one table (after "71 tt"); -1 = no answer
+  uint8_t d[2] = {0x71, t}, r[44];
+  int n = klSend(0x72, d, 2, r);
+  if (n < 5 || r[2] != 0x71 || r[3] != t) return -1;
+  int m = n - 5; if (m > cap) m = cap;
+  memcpy(out, r + 4, m); return m;
+}
+static bool klDecode(const uint8_t* v, int n, KlLive& o) {           // table 0x11 (community layout, as in the Jet_HONDA_APP); unconfirmed on most models
+  if (n < 14) return false;
+  o.rpm = (v[0] << 8) | v[1]; o.tps = v[3] / 1.6f; o.ect = (int)v[5] - 40; o.iat = (int)v[7] - 40; o.map = v[9]; o.batt = v[12] / 10.0f; o.spd = v[13];
+  o.injOk = n >= 16; o.inj = o.injOk ? (float)((v[14] << 8) | v[15]) / 250.0f : 0;
+  o.ignOk = n >= 17; o.ign = o.ignOk ? v[16] / 2.0f - 64.0f : 0;
+  return true;
+}
+static void klPut(uint8_t pid, float v, uint32_t t) { if (plausible(pid, v)) { pv[pid] = v; page[pid] = t; } }
+static void klStore(const KlLive& o) {                               // the gauge's own PIDs: the same screens as with an ELM327
+  uint32_t t = millis();
+  klPut(0x0C, (float)o.rpm, t); klPut(0x0D, (float)o.spd, t); klPut(0x05, (float)o.ect, t); klPut(0x0F, (float)o.iat, t);
+  klPut(0x0B, (float)o.map, t); klPut(0x11, fminf(o.tps, 100.0f), t); klPut(0x42, o.batt, t);
+  if (o.ignOk) { klPut(0x0E, o.ign, t); psup[0x0E] = true; }
+  noteRpm();
+}
+static bool klConnect() {                                            // wake, ping, ECU id (the live table is accepted too): all within a few seconds, or the ECU goes back to sleep
+  uint8_t r[44], p = 0x72, o[24];
+  for (int a = 0; a < 2 && !klAbort(); a++) {
+    klSt = 1; klWake();
+    if (!klSend(0xFE, &p, 1, r)) continue;
+    int n = klTable(0x00, o, sizeof o);
+    if (n < 0 && !klAbort()) n = klTable(0x00, o, sizeof o);
+    if (n >= 0) { klIdN = (uint8_t)(n > 10 ? 10 : n); memcpy(klId, o, klIdN); } else klIdN = 0;   // an ECU without table 0 may still give the live table
+    if (klAbort()) break;
+    KlLive lv; n = klTable(0x11, o, sizeof o);
+    if (n >= 14 && klDecode(o, n, lv)) { memcpy(klT11, o, n); klT11n = (uint8_t)n; klStore(lv); klOk = klOk + 1; return true; }   // linked only when the live table really comes
+  }
+  return false;
+}
+static void klHexStr(char* d, size_t cap, const uint8_t* b, int n) { size_t k = 0; d[0] = 0; for (int i = 0; i < n && k + 3 < cap; i++) k += snprintf(d + k, cap - k, i ? " %02X" : "%02X", b[i]); }
+static void klRun() {                                                // obdTask: this is the whole link while the K-line mode is on
+  linkDown(); reconnectReq = false; klSt = 0; linkState = 1;
+  while (!klAbort()) {
+    if (!klConnect()) {
+      linkState = 1; klSt = 3;
+      for (int i = 0; i < 12 && !klAbort(); i++) vTaskDelay(100);    // the next wake in about a second
+      continue;
+    }
+    memset(psup, 0, sizeof psup);
+    { static const uint8_t KP[] = {0x0C, 0x0D, 0x05, 0x0F, 0x0B, 0x11, 0x42}; for (unsigned i = 0; i < sizeof KP; i++) psup[KP[i]] = true; }
+    protoNum = 0; cntOk = true; multiOk = false; kMulti = false; resetPollState(); obdRpmMs = 0;
+    ecuHybrid = false; ecuDieselKnown = true; ecuDiesel = false; mil = false; dtcCount = 0; monValid = false; vinPending = false; ftState = 0; klRate = 0;
+    klSt = 2; linkState = 2;
+    int misses = 0; uint16_t rn = 0; uint32_t tRate = millis();
+    while (!klAbort()) {
+      if (req) {                                                     // the code / freeze / ECU info pages: only the ECU info is available on this link
+        int q = req; req = 0;
+        if (q == 1 || q == 2) { codeState = 4; codeVer = codeVer + 1; }
+        else if (q == 3) { frzState = 3; frzVer = frzVer + 1; }
+        else if (q == 4) { strcpy(ecuName, "HONDA K-LINE"); klHexStr(calId, sizeof calId, klId, klIdN > 6 ? 6 : klIdN); ecuInfoVer = ecuInfoVer + 1; }
+      }
+      if (listenWant) listenSt = 4;                                  // the CAN listen page has nothing to listen to here
+      uint8_t t[24]; int n = klTable(0x11, t, sizeof t); KlLive lv;
+      if (n >= 14 && klDecode(t, n, lv)) {
+        memcpy(klT11, t, n); klT11n = (uint8_t)n; klStore(lv); klOk = klOk + 1; rn++; misses = 0;
+      } else {
+        klBad = klBad + 1;
+        if (++misses >= 4) break;                                    // 4 requests in a row without a usable answer: wake the ECU again
+        vTaskDelay(20);
+      }
+      uint32_t now = millis(); if (now - tRate >= 1000) { klRate = rn; rn = 0; tRate = now; }
+      vTaskDelay(1);
+    }
+    linkState = 1; klSt = klAbort() ? 0 : 3; klRate = 0;
+  }
+  klClose(); klSt = 0;
+}
+
 static void detectVehicle() {
   uint8_t b[9]; int n = 0;
   ecuHybrid = psup[0x5B]; ecuDieselKnown = false; ecuDiesel = false;
@@ -999,6 +1128,7 @@ void obdTask(void*) {
   int rrFg = 0, rrBg = 0, fails = 0, iter = 0; uint32_t lastMil = 0;
   for (;;) {
     if (scanReq) { scanReq = false; doScan(); continue; }
+    if (linkMode == 1) { klRun(); continue; }                       // Honda K-line board: no Bluetooth, no ELM327
     if (demoMode || !selAddr[0]) {            // demo, or OBD mode with no adapter chosen yet
       linkDown();
       linkState = demoMode ? 0 : 3;
@@ -1580,13 +1710,13 @@ static void autoSlots() {                                       // default tiles
   if (slotsCustom) return;
   for (int i = 0; i < 6; i++) slots[i] = 255;
   bool d = vehDiesel();
-  static const int C0[] = {MI_COOL}, C1[] = {MI_OIL, MI_THR, MI_MAP}, C2[] = {MI_LOAD, MI_THR, MI_PEDAL}, C3[] = {MI_INTAKE, MI_AMB},
+  static const int C0[] = {MI_COOL}, C1[] = {MI_OIL, MI_THR, MI_MAP}, C2[] = {MI_LOAD, MI_THR, MI_PEDAL, MI_TIMING}, C3[] = {MI_INTAKE, MI_AMB},
                    C4[] = {MI_BATT}, C5P[] = {MI_AFR, MI_LAMBDA, MI_MAP, MI_TIMING}, C5D[] = {MI_BOOST, MI_RAIL, MI_MAP, MI_EGT};
   slots[0] = (uint8_t)firstSupported(C0, 1, MI_COOL);
   slots[3] = (uint8_t)firstSupported(C3, 2, MI_INTAKE);
   slots[1] = (uint8_t)firstSupported(C1, 3, MI_OIL);
   slots[4] = (uint8_t)firstSupported(C4, 1, MI_BATT);
-  slots[2] = (uint8_t)firstSupported(C2, 3, MI_LOAD);
+  slots[2] = (uint8_t)firstSupported(C2, 4, MI_LOAD);
   slots[5] = (uint8_t)firstSupported(d ? C5D : C5P, 4, MI_AFR);
   for (int i = 0; i < 6; i++) if (slots[i] >= NMET) slots[i] = (uint8_t)i;
 }
@@ -1703,6 +1833,7 @@ static void loadPrefs() {
 #else
   invScreen = prefs.getBool("inv", false);
 #endif
+  linkMode = prefs.getUChar("lmode", 0) == 1 ? 1 : 0;
   { String fb = prefs.getString("ftbad", ""); strncpy(ftBadAddr, fb.c_str(), sizeof ftBadAddr - 1); ftBadAddr[sizeof ftBadAddr - 1] = 0; }
   vehModel = prefs.getInt("veh", -1); lastProto = prefs.getInt("proto", 0); userProto = prefs.getInt("uproto", 0); unitL100 = prefs.getBool("unitl", false); slotsCustom = prefs.getBool("slc", false);
   flipScr = prefs.getBool("flip", false); autoBike = prefs.getBool("abike", false); autoModel = prefs.getInt("amodel", -1);
@@ -1740,7 +1871,7 @@ static void savePrefs() {
   prefs.putBool("unitl", unitL100);
   prefs.putBool("flip", flipScr); prefs.putBool("abike", autoBike); prefs.putInt("amodel", autoModel);
   prefs.putInt("nvmap", nvmap); prefs.putBytes("vmap", vmap, sizeof vmap);
-  prefs.putString("btaddr", selAddr); prefs.putString("btname", selName); prefs.putString("ftbad", ftBadAddr);
+  prefs.putString("btaddr", selAddr); prefs.putString("btname", selName); prefs.putString("ftbad", ftBadAddr); prefs.putUChar("lmode", linkMode);
   prefs.putInt("btkind", selBle ? 1 + selAType : 0); prefs.putInt("btpin", pinIdx); prefs.putBool("btpinok", pinOk);
   prefs.putBytes("pkall", &pkA, sizeof pkA);
   prefs.end();
@@ -1805,6 +1936,7 @@ static void carName(char* d, size_t n) {
     const Model& m = MODELS[em]; const char* br = m.brand == 6 ? "HONDA" : BRANDS[m.brand];     // the bike tile is named HONDA BIKE, the car name just HONDA
     if (!strncmp(m.name, br, strlen(br))) snprintf(d, n, "%s", m.name); else snprintf(d, n, "%s %s", br, m.name);
   } else if (demoMode) snprintf(d, n, "MAZDA 2");
+  else if (linkMode == 1) snprintf(d, n, "HONDA BIKE");                 // K-line link, no model picked
   else snprintf(d, n, "%s", carBuf);
 }
 static void goPage(Page p) { scr = p; redraw = true; updateWants(); }
@@ -1850,15 +1982,15 @@ static void topBar(float rpm) {
   uint16_t dc = linkOk ? T.good : T.warn;
   discA(14, 13, 4.6f, dc, 41); discA(14, 13, 3.6f, dc, 71); disc(14, 13, 2.5f, dc);
   StrId sid = linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_SELDEV;
-  if (linkState == 2) txt(F_LM, selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
+  if (linkState == 2) txt(F_LM, linkMode == 1 ? "K-LINE" : selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
   else lab(sid, LB_SM, 22, thai ? 17 : 16, T.dim);
-  const char* pn = linkState == 2 ? protoName(protoNum) : "";
+  const char* pn = linkState == 2 ? (linkMode == 1 ? "HONDA" : protoName(protoNum)) : "";
   if (pn[0]) txt(F_LM, pn, 311, 16, T.dim, AL_R);
   else if (linkState != 2) txt(F_LM, FW_VERSION, 311, 16, T.dim, AL_R);         // the screen's firmware version while there is no link
   char nm[32]; carName(nm, sizeof nm);
   if (nm[0]) { char t[32]; if (textW(F_UM, nm) > 150) fitText(t, sizeof t, nm, F_UM, 150); else strcpy(t, nm); txt(F_UM, t, 160, 16, T.accL, AL_C); }
   else if (!demoMode && linkState == 2) lab(S_UNKNOWN, LB_BTNM, 160, thai ? 17 : 16, T.dim, AL_C);
-  else if (!demoMode && linkState == 1 && selName[0]) { char t[32]; fitText(t, sizeof t, selName, F_UM, 150); txt(F_UM, t, 160, 16, T.dim, AL_C); }
+  else if (!demoMode && linkMode == 0 && linkState == 1 && selName[0]) { char t[32]; fitText(t, sizeof t, selName, F_UM, 150); txt(F_UM, t, 160, 16, T.dim, AL_C); }
   shiftStrip(rpm);
 }
 // mode chips on the first row of the Data / Trip / Codes pages
@@ -2626,7 +2758,7 @@ static void drawEcu() {
   tile(9, 175, 198, 22, 8);
   lab(S_PROTO, LB_TILE, 18, tby(189), T.dim);
   chipId(S_LISTEN, 215, 175, 96, 22, false);
-  char pn[32]; if (!protoNum) strcpy(pn, "--"); else if (obdRpmMs && linkState == 2) snprintf(pn, sizeof pn, "%s  %u ms", protoName(protoNum), (unsigned)obdRpmMs); else snprintf(pn, sizeof pn, "%s", protoName(protoNum));
+  char pn[32]; if (linkMode == 1) { if (obdRpmMs && linkState == 2) snprintf(pn, sizeof pn, "HONDA  %u ms", (unsigned)obdRpmMs); else strcpy(pn, "HONDA K-LINE"); } else if (!protoNum) strcpy(pn, "--"); else if (obdRpmMs && linkState == 2) snprintf(pn, sizeof pn, "%s  %u ms", protoName(protoNum), (unsigned)obdRpmMs); else snprintf(pn, sizeof pn, "%s", protoName(protoNum));
   txt(F_UM, pn, 199, thai ? 192 : 189, T.text, AL_R);
   tabBar(4);
 }
@@ -2895,13 +3027,14 @@ static void btBuildView() {
 }
 static void btStartScan() { if (scanState != 1) { scanState = 1; btVer = btVer + 1; scanReq = true; btOff = 0; } }
 static void btSelRow() {
-  halo(9, 32, 302, 26, 9, T.acc, 2);
-  rr(9, 32, 302, 26, 9, T.panel2, T.acc);
+  halo(9, 32, 196, 26, 9, T.acc, 2);
+  rr(9, 32, 196, 26, 9, T.panel2, T.acc);
   if (selAddr[0]) {
-    char t[32]; fitText(t, sizeof t, selName[0] ? selName : selAddr, F_UM, 190); txt(F_UM, t, 19, 49, T.text);
+    char t[32]; fitText(t, sizeof t, selName[0] ? selName : selAddr, F_UM, 108); txt(F_UM, t, 19, 49, T.text);
     StrId s = linkState == 2 ? S_CONNECTED : S_CONNECTING; uint16_t c = linkState == 2 ? T.good : T.warn;
-    lab(s, LB_TILE, 303, tby(48), c, AL_R);
-  } else lab(S_NOSEL, LB_BTNM, 160, 49, T.dim, AL_C);
+    lab(s, LB_TILE, 198, tby(48), c, AL_R);
+  } else lab(S_NOSEL, LB_BTNM, 107, 49, T.dim, AL_C);
+  chipId(S_KLHONDA, 211, 32, 100, 26, false);                      // switch to the Honda K-line board
 }
 static void btRow(int r) {
   int y = 76 + r * 28, i = btOff + r;
@@ -2917,7 +3050,60 @@ static void btRow(int r) {
   int lv = !d.rssi ? 0 : d.rssi >= -55 ? 4 : d.rssi >= -67 ? 3 : d.rssi >= -78 ? 2 : 1;
   for (int k = 0; k < 4; k++) { int h = 4 + k * 3; rr(268 + k * 8, y + 22 - h, 5, h, 1, k < lv ? T.accL : T.dark); }
 }
+static void linkModeSet(uint8_t m) {                                 // Bluetooth ELM327 <-> Honda K-line board
+  if (m == linkMode) return;
+  linkMode = m;
+  carBuf[0] = 0; vinBuf[0] = 0; memset(psup, 0, sizeof psup); engineRan = false; klT11n = 0; klIdN = 0; klOk = 0; klBad = 0; klRate = 0;
+  if (vehModel < 0) {                                              // no model picked: a K-line link is a Honda bike, Bluetooth is whatever the VIN says
+    autoModel = -1;
+    if (m == 1) { autoBike = true; if (tankL == 44) tankL = 6; if (shiftRpm == 6500) shiftRpm = 8500; }
+    else { autoBike = false; if (tankL < 20) tankL = 44; if (shiftRpm > 8000) shiftRpm = 6500; }
+  }
+  autoSlots(); logClear();
+  linkState = (m == 1 || selAddr[0]) ? 1 : 3;
+  scanStop = true; reconnectReq = true;
+  savePrefs(); updateWants(); redraw = true;
+}
+static void drawKline() {
+  subHeader(S_KLINE, S_KLBT, true);
+  char b[48]; bool up = klSt == 2;
+  halo(9, 32, 302, 26, 9, T.acc, 2);
+  rr(9, 32, 302, 26, 9, T.panel2, T.acc);
+  txt(F_UM, "HONDA K-LINE  10400", 19, 49, T.text);
+  lab(up ? S_CONNECTED : S_CONNECTING, LB_TILE, 303, tby(48), up ? T.good : T.warn, AL_R);
+  tile(9, 64, 302, 54);
+  lab(S_KLTABLE, LB_TILE, 18, tby(77), T.dim);
+  snprintf(b, sizeof b, "%u/s", (unsigned)klRate); txt(F_UM, up ? b : "--", 303, 78, T.text, AL_R);
+  uint8_t n = klT11n; uint8_t t[24]; memcpy(t, klT11, sizeof t);
+  if (n >= 14 && up) {
+    hexBytes(b, sizeof b, t, n > 9 ? 9 : n); txt(F_UM, b, 18, 96, T.text);
+    if (n > 9) { hexBytes(b, sizeof b, t + 9, n > 18 ? 9 : n - 9); txt(F_UM, b, 18, 110, T.text); }
+  } else txt(F_UM, "-- -- -- -- -- -- -- -- --", 18, 96, T.dim);
+  tile(9, 122, 302, 56);
+  KlLive v; bool have = up && n >= 14 && klDecode(t, n, v);
+  if (have) {
+    snprintf(b, sizeof b, "RPM %d   KMH %d   TPS %d%%   MAP %d", v.rpm, v.spd, (int)lroundf(fminf(v.tps, 100.0f)), v.map); txt(F_UM, b, 18, 141, T.accL);
+    int bv = (int)lroundf(v.batt * 10); snprintf(b, sizeof b, "ECT %d   IAT %d   BATT %d.%dV", v.ect, v.iat, bv / 10, bv % 10); txt(F_UM, b, 18, 157, T.text);
+    if (v.injOk || v.ignOk) {
+      int ij = (int)lroundf(v.inj * 100), ig = (int)lroundf(v.ign * 10);
+      snprintf(b, sizeof b, "INJ %d.%02d ms   IGN %s%d.%d", ij / 100, ij % 100, ig < 0 ? "-" : "", abs(ig) / 10, abs(ig) % 10); txt(F_UM, b, 18, 173, T.text);
+    }
+  } else { txt(F_UM, "RPM --   KMH --   TPS --   MAP --", 18, 141, T.dim); txt(F_UM, "ECT --   IAT --   BATT --", 18, 157, T.dim); }
+  tile(9, 182, 302, 24, 8);
+  lab(S_KLECU, LB_TILE, 18, tby(197), T.dim);
+  if (klIdN) { uint8_t id[10]; memcpy(id, klId, sizeof id); hexBytes(b, sizeof b, id, klIdN > 8 ? 8 : klIdN); txt(F_UM, b, 303, 198, T.text, AL_R); } else txt(F_UM, "--", 303, 198, T.dim, AL_R);
+  StrId st = S_KLWAIT; uint16_t col = T.dim;
+  if (klSt == 2 && klRate > 0) { st = S_KLOKMSG; col = T.good; } else if (klSt == 3) { st = S_KLNONE; col = T.warn; }
+  tile(9, 210, 302, 26, 8);
+  lab(st, LB_ROW, 160, thai ? 227 : 226, col, AL_C, 290);
+}
+static void tapKline(int x, int y, bool first) {
+  if (!first) return;
+  if (hitBack(x, y)) { nav(PG_SETUP); return; }
+  if (hit(x, y, 247, 4, 64, 20)) linkModeSet(0);
+}
 static void drawBt() {
+  if (linkMode == 1) { drawKline(); return; }
   subHeader(S_BTDEV, S_SCAN, true);
   btSelRow();
   int n = nBtView, st = scanState;
@@ -2942,8 +3128,10 @@ static void btPick(int i) {                  // the user tapped a device: rememb
   savePrefs(); updateWants();
 }
 static void tapBt(int x, int y, bool first) {
+  if (linkMode == 1) { tapKline(x, y, first); return; }
   if (!first) return;
   if (hitBack(x, y)) { nav(PG_SETUP); return; }
+  if (hit(x, y, 211, 32, 100, 26)) { linkModeSet(1); return; }
   if (hit(x, y, 247, 4, 64, 20)) { btStartScan(); return; }
   if (hit(x, y, 9, 210, 50, 22)) { if (btOff > 0) btOff = max(0, btOff - 4); return; }
   if (hit(x, y, 65, 210, 50, 22)) { if (btOff + 4 < nBtView) btOff += 4; return; }
@@ -3649,7 +3837,7 @@ static void nav(Page p) {
     case PG_FREEZE: freezeRead(); break;
     case PG_ECU: ecuRead(); break;
     case PG_VEH: vehStep = 0; break;
-    case PG_BT: btOff = 0; if (!selAddr[0] && scanState != 1 && !demoMode) btStartScan(); break;
+    case PG_BT: btOff = 0; if (linkMode == 0 && !selAddr[0] && scanState != 1 && !demoMode) btStartScan(); break;
     case PG_PARK: parkAt = millis(); break;
     case PG_UPD: updErr = UE_NONE; break;
     case PG_CRP: crpMn = 1e9f; crpMx = -1e9f; break;
@@ -3832,7 +4020,7 @@ void setup() {
   digitalWrite(4, HIGH); digitalWrite(16, HIGH); digitalWrite(17, HIGH);
   loadPrefs(); updNoteVersion();
   initPanel();
-  linkState = demoMode ? 0 : (selAddr[0] ? 1 : 3);
+  linkState = demoMode ? 0 : ((linkMode == 1 || selAddr[0]) ? 1 : 3);
   if (demoMode && !slotsCustom) autoSlots();
   tripReset(); peaksClear(pkD); logClear();
   scr = PG_SPLASH; splashAt = millis(); redraw = true; updateWants();
@@ -3843,7 +4031,7 @@ void loop() {
   uint32_t now = millis();
   pollTouch(now);
 
-  btBrowsing = (scr == PG_BT);
+  btBrowsing = (scr == PG_BT && linkMode == 0);
   if (vinNew) { vinNew = false; vinApply(); }
   if (pinDirty || protoDirty) { pinDirty = false; protoDirty = false; savePrefs(); }
   if (prefsDirty && now - prefsAt > 1500) { prefsDirty = false; savePrefs(); }
