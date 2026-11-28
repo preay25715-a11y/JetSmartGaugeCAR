@@ -1,4 +1,5 @@
-// Jet Smart Gauge v1.0.16 - app-side helpers for the MFB-LINK USB sync (115200 baud)
+// Jet Smart Gauge v1.0.17 - app-side helpers for the MFB-LINK sync (USB serial 115200 baud, or Bluetooth LE: Nordic UART service 6e400001-b5a3-f393-e0a9-e50e24dcca9e,
+// write frames to ...0002 (write / write-without-response), answers arrive as notifications on ...0003, the gauge is advertised as "Jet Smart Gauge")
 // frame: 55 AA | type | lenL lenH | payload | xor(type, lenL, lenH, payload...)
 // reply: type|0x80, payload[0] = status (0 ok, 1 no ECU answer, 2 refused / bad request), then the data
 // Every decoder takes the reply payload WITHOUT the status byte (that is what parseFrames() gives you in .data).
@@ -82,10 +83,10 @@ function decodeInfo(p) {
   if (!p || p.length < 37 || p[0] !== 1) return null;
   let o = 37; const str = () => { const L = p[o++]; const s = Buffer.from(p.slice(o, o + L)).toString('latin1'); o += L; return s; };
   const f = p[2], sb = p[14], klN = Math.min(p[26], 10);
-  const out = { mode: p[1] ? 'kline' : 'car', linked: !!(f & 1), demo: !!(f & 2), diesel: !!(f & 4), hybrid: !!(f & 8), bike: !!(f & 16), mil: !!(f & 32), monitorsValid: !!(f & 128),
+  const out = { mode: p[1] ? 'kline' : 'car', linked: !!(f & 1), demo: !!(f & 2), diesel: !!(f & 4), hybrid: !!(f & 8), bike: !!(f & 16), mil: !!(f & 32), monitorsValid: !!(f & 128), bleConnected: !!(f & 64),
     protocol: p[3], codeCount: p[4], codeState: ['unread', 'reading', 'done', 'cleared', 'not readable'][p[5]] || p[5], model: u16(p, 6) === 65535 ? null : u16(p, 6),
     shiftRpm: u16(p, 8), tankL: p[10], fuelCal: p[11], brightness: p[12], theme: p[13],
-    settings: { thai: !!(sb & 1), alerts: !!(sb & 2), parkingScreen: !!(sb & 4), colourful: !!(sb & 8), invert: !!(sb & 16), flip: !!(sb & 32), unitL100: !!(sb & 64) },
+    settings: { thai: !!(sb & 1), alerts: !!(sb & 2), parkingScreen: !!(sb & 4), colourful: !!(sb & 8), invert: !!(sb & 16), flip: !!(sb & 32), unitL100: !!(sb & 64), bleLink: !!(sb & 128) },
     dashCenter: p[15], dashTiles: Array.from(p.slice(16, 22)).map((i) => ({ id: i, name: METRICS[i] || '?' })), monitorsRaw: u32(p, 22),
     klEcuId: Array.from(p.slice(27, 27 + klN)).map((b) => b.toString(16).padStart(2, '0')).join(' ') };
   out.firmware = str(); out.car = str(); out.vin = str(); out.ecu = str(); out.calId = str(); return out;
