@@ -49,7 +49,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.19"
+#define FW_VERSION "v1.2.0"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -62,6 +62,7 @@ Preferences prefs;
 static volatile bool demoMode = false;            // DEMO (SETUP 2): a simulated car for the bench. Never saved: after a restart the gauge is back on the real car
 static bool warnOn = true, parkOn = true;
 static bool appBleOn = true;                    // the phone link over Bluetooth LE (Jet Honda APP, Nordic UART): off = no BLE advertising at all
+static bool afrRec = true;                       // REC of the petrol AFR map (the rpm tables always log)
 static bool colorful = true;                     // each reading in its own colour, rainbow tacho (off = the old white / blue look)
 enum { D_TRIP = 300, D_AVGS, D_DRIVE, D_PKRPM, D_PKSPD, D_PKCOOL, D_MINB };       // K-line mode: derived readings on the data page (trip, this drive's peaks)
 static int shiftRpm = 6500, bright = 80, tankL = 44, fuelCal = 100;
@@ -1042,8 +1043,10 @@ static void mfbReply(uint8_t type, uint8_t st, const uint8_t* d = nullptr, uint1
   h[0] = 0x55; h[1] = 0xAA; h[2] = (uint8_t)(type | 0x80); h[3] = (uint8_t)(L & 255); h[4] = (uint8_t)(L >> 8); h[5] = st;
   uint8_t x = h[2] ^ h[3] ^ h[4] ^ h[5]; for (uint16_t i = 0; i < n; i++) x ^= d[i];
   if (mfbVia == 1) {                                                  // asked over Bluetooth LE: the whole frame goes back the same way (cut into notifications there)
-    static uint8_t ob[300]; if (n > sizeof ob - 7) return;
-    memcpy(ob, h, 6); if (n) memcpy(ob + 6, d, n); ob[6 + n] = x; appBleSend(ob, (uint16_t)(7 + n)); return;
+    static uint8_t ob[300];
+    if (n <= sizeof ob - 7) { memcpy(ob, h, 6); if (n) memcpy(ob + 6, d, n); ob[6 + n] = x; appBleSend(ob, (uint16_t)(7 + n)); return; }
+    uint8_t* fb = (uint8_t*)malloc(7 + (size_t)n); if (!fb) return;                      // a big answer (the AFR map): a buffer for this one frame
+    memcpy(fb, h, 6); memcpy(fb + 6, d, n); fb[6 + n] = x; appBleSend(fb, (uint16_t)(7 + n)); free(fb); return;
   }
   Serial.write(h, 6); if (n) Serial.write(d, n); Serial.write(x);
 }
@@ -1140,7 +1143,7 @@ static void appBlePump() {                                                // ins
 static void appBleSend(const uint8_t* b, uint16_t n) {                   // one frame = a few notifications (at most MTU - 3 bytes each, 20 until the phone asks for more)
   if (!appConn || !appTx) return;
   uint16_t chunk = appMtu > 23 ? (uint16_t)(appMtu - 3) : 20; if (chunk > 180) chunk = 180;
-  for (uint16_t o = 0; o < n && appConn; o = (uint16_t)(o + chunk)) { uint16_t c = (uint16_t)min<int>(chunk, n - o); appTx->setValue((uint8_t*)(b + o), c); appTx->notify(); vTaskDelay(3); }
+  for (uint16_t o = 0; o < n && appConn; o = (uint16_t)(o + chunk)) { uint16_t c = (uint16_t)min<int>(chunk, n - o); appTx->setValue((uint8_t*)(b + o), c); appTx->notify(); vTaskDelay(n > 400 ? 12 : 3); }
 }
 static void appBleTick() {                                                // obdTask (both modes): starts / stops the phone link, keeps it advertising while nobody is connected
   if (!appBleOn) {                                                        // switched off: no advertising, a connected phone is let go (the BLE stack itself stays as it is)
@@ -2080,7 +2083,7 @@ static void graphSample() {
 static void loadPrefs() {
   prefs.begin("gauge", true);
   firstRun = !prefs.isKey("inv");
-  thai = prefs.getBool("thai", false); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true); colorful = prefs.getBool("colr", true); appBleOn = prefs.getBool("appble", true);
+  thai = prefs.getBool("thai", false); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true); colorful = prefs.getBool("colr", true); afrRec = prefs.getBool("afrrec", true); appBleOn = prefs.getBool("appble", true);
   shiftRpm = prefs.getInt("shift", 6500); bright = prefs.getInt("bright", 80); int th = prefs.getInt("theme", 0);
   dashMain = prefs.getUChar("dmain", prefs.getBool("crpm", false) ? 1 : 0); if (dashMain > 2) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100); crpFs = prefs.getInt("crpfs2", 180); crpV0 = prefs.getInt("crpv0", 50); crpTrim = prefs.getInt("crptrim", 100); crpSrc = (uint8_t)prefs.getInt("crpsrc", 0);
 #ifdef TFT_INVERSION_ON
@@ -2120,7 +2123,7 @@ static void loadPrefs() {
 }
 static void savePrefs() {
   prefs.begin("gauge", false);
-  prefs.putBool("thai", thai); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putBool("colr", colorful); prefs.putBool("appble", appBleOn); prefs.putUChar("dmain", dashMain);
+  prefs.putBool("thai", thai); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putBool("colr", colorful); prefs.putBool("afrrec", afrRec); prefs.putBool("appble", appBleOn); prefs.putUChar("dmain", dashMain);
   prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6); prefs.putBool("slc", slotsCustom);
   prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putInt("crpfs2", crpFs); prefs.putInt("crpv0", crpV0); prefs.putInt("crptrim", crpTrim); prefs.putInt("crpsrc", crpSrc); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
   prefs.putBool("unitl", unitL100);
@@ -2159,7 +2162,7 @@ static const int ALL_ROWS = 5;
 static uint8_t allIdx[NPID]; static int allN = 0, allPg = 0;
 static void updateWants() {
   memset(want, 0, sizeof want);
-  static const uint8_t BG[] = {0x05, 0x42, 0x5C, 0x5E, 0x10, 0x0B, 0x0F, 0x2F, 0x44, 0x24, 0x33, 0x04, 0x06, 0x62, 0x63};
+  static const uint8_t BG[] = {0x05, 0x42, 0x5C, 0x5E, 0x10, 0x0B, 0x0F, 0x2F, 0x44, 0x24, 0x33, 0x04, 0x06, 0x62, 0x63, 0x11};
   for (unsigned i = 0; i < sizeof BG; i++) markWant(BG[i], 1);
   markSrc(M_CRP, 1);                                   // rail pressure: asked slowly in the background so the CRP log keeps filling
   markWant(0x0C, 2); markWant(0x0D, 2);
@@ -2176,7 +2179,7 @@ static void updateWants() {
   }
   else if (scr == PG_TRIP || scr == PG_PARK) { markSrc(M_FUELRATE, 2); markWant(0x2F, 2); }
   else if (scr == PG_STATUS) { markWant(0x21, 2); markWant(0x30, 2); markWant(0x31, 2); }
-  else if (scr == PG_LOG || scr == PG_CRP || scr == PG_CRPCAL) markSrc(M_CRP, 2);
+  else if (scr == PG_LOG || scr == PG_CRP || scr == PG_CRPCAL) { markSrc(M_CRP, 2); if (scr == PG_LOG) { markWant(0x11, 2); markSrc(M_AFR, 2); } }
   listenWant = (scr == PG_LISTEN);
 }
 
@@ -2431,36 +2434,110 @@ struct LogBin { uint32_t n; float sum, mn, mx; };
 static LogBin logB[2][LOGN];                                    // [0] CRP volts, [1] AFR
 static int logW() { return vehBike() ? 2000 : 1000; }           // rpm per row (bikes rev higher)
 static int logBin(float rpm) { return min(LOGN - 1, (int)(rpm / logW())); }
-static const int TBN = 7, TBV[TBN] = {0, 5, 10, 20, 35, 50, 75};            // AFR map: throttle rows x 1000 rpm columns
-static uint32_t amN[TBN][LOGN]; static float amSum[TBN][LOGN];
-static int tpsRow(float t) { int r = 0; for (int i = 0; i < TBN; i++) if (t >= TBV[i]) r = i; return r; }
-static void logClear() { memset(amN, 0, sizeof amN); memset(amSum, 0, sizeof amSum); for (auto& s : logB) for (auto& b : s) { b.n = 0; b.sum = 0; b.mn = 1e9f; b.mx = -1e9f; } }
+// ---- the AFR map (petrol): 20 rpm rows x 13 throttle columns on the axes of the Jet Smart Gauge app's AFR LOG (v1.2.0) ----
+static const int AMR = 20, AMC = 13;
+static uint32_t amN[AMR][AMC]; static float amSum[AMR][AMC]; static uint16_t amMn[AMR][AMC], amMx[AMR][AMC];          // samples, sum of AFR, min / max (AFR x 100)
+static uint16_t amYs[AMR]; static uint16_t amTop = 0;                                                                  // rpm of each row, and the redline they were made for
+static const uint8_t AXS[AMC] = {0, 8, 17, 25, 33, 42, 50, 58, 67, 75, 83, 92, 100};                                   // throttle % of each column (the app: 0..100 in twelfths)
+template <class Q> static float axPos(const Q* a, int n, float v) {                                                    // fractional index of v on an ascending axis (the app's axisPos)
+  if (v <= a[0]) return 0; if (v >= a[n - 1]) return (float)(n - 1);
+  int k = 0; while (k < n - 1 && a[k + 1] < v) k++;
+  float d = (float)(a[k + 1] - a[k]); return k + (v - a[k]) / (d != 0 ? d : 1.0f);
+}
+static int afrTop() { int m = effModel(); float raw = m >= 0 ? MODELS[m].redline * 100.0f : ringMaxK() * 900.0f; return max(3000, (int)ceilf(raw / 500.0f) * 500); }     // the redline of the vehicle (else 90 % of the dial), up to 500
+static void amClear() { memset(amN, 0, sizeof amN); memset(amSum, 0, sizeof amSum); memset(amMn, 0, sizeof amMn); memset(amMx, 0, sizeof amMx); }
+static void afrAxes() {                                          // the rpm rows are the app's: from just above idle up to the redline, evenly spaced (rounded to 50 / 100 rpm)
+  int top = afrTop(); if (top == amTop) return;                  // another vehicle / redline: the rows move, the old cells no longer fit
+  int lo = max(600, (int)lround(top * 0.07 / 100.0) * 100), st = top > 8000 ? 100 : 50;
+  for (int i = 0; i < AMR; i++) { int v = (int)lround((lo + (double)(top - lo) * i / (AMR - 1)) / st) * st; amYs[i] = (uint16_t)(!i || v > amYs[i - 1] ? v : amYs[i - 1] + st); }
+  amTop = (uint16_t)top; amClear();
+}
+static void logClear() { amClear(); for (auto& s : logB) for (auto& b : s) { b.n = 0; b.sum = 0; b.mn = 1e9f; b.mx = -1e9f; } }
 static void logStep() {
   bool ok; float rpm = getVal(0x0C, ok); if (!ok || rpm < 400) return;
   int b = logBin(rpm);
-  { bool o1, o2; float t = getVal(0x11, o1), a = metricVal(M_AFR, o2); if (o1 && o2) { int r = tpsRow(t); amN[r][b]++; amSum[r][b] += a; } }
-  for (int k = 0; k < 2; k++) { bool o; float v = metricVal(k ? M_AFR : M_CRP, o); if (!o) continue; LogBin& L = logB[k][b]; L.n++; L.sum += v; L.mn = fminf(L.mn, v); L.mx = fmaxf(L.mx, v); }
-}
-static void afrMap(bool rok, float rpm) {                         // petrol: average AFR for each throttle row and 1000 rpm column
-  tile(9, 56, 302, 141);
-  bool ot, oa; float tps = getVal(0x11, ot), afr = metricVal(M_AFR, oa);
-  int cc = rok && rpm >= 400 ? logBin(rpm) : -1, cr = ot ? tpsRow(tps) : -1; char b[40];
-  if (rok) { char t[12]; fmtThou(t, sizeof t, (int)rpm); snprintf(b, sizeof b, "%s rpm   TPS ", t); } else strcpy(b, "-- rpm   TPS ");
-  { char t[8]; if (ot) snprintf(t, sizeof t, "%d%%", (int)lroundf(tps)); else strcpy(t, "--"); strcat(b, t); }
-  txt(F_US, b, 18, 70, T.text);
-  { char t[16]; strcpy(t, "AFR "); if (oa) { char u[8]; fmtv(u, sizeof u, afr, 1); strcat(t, u); } else strcat(t, "--"); txt(F_US, t, 303, 70, oa && afr >= 14.2f && afr <= 15.2f ? T.good : T.text, AL_R); }
-  for (int r = 0; r < TBN; r++) {
-    int y = 78 + (TBN - 1 - r) * 13; char l[6]; snprintf(l, sizeof l, "%d", TBV[r]);
-    txt(F_LS, l, 34, y + 10, T.dim, AL_R);
-    for (int c = 0; c < LOGN; c++) {
-      int x = 38 + c * 33; uint32_t n = amN[r][c]; float v = n ? amSum[r][c] / n : 0; bool cur = r == cr && c == cc;
-      uint16_t fill = !n ? mixRgb(TA.panel, TA.line, 115) : (v >= 13.8f && v <= 15.2f ? mixRgb(TA.panel, TA.good, 128) : mixRgb(TA.line, TA.dim, 77));
-      rr(x, y, 32, 12, 3, fill, cur ? T.good : -1);
-      if (n) { fmtv(b, sizeof b, v, 1); txt(F_LS, b, x + 16, y + 10, T.text, AL_C); }
-      if (cur) disc(x + 3, y + 3, 1.6f, T.good);
+  if (afrRec && !vehDiesel()) {
+    bool o1, o2; float t = getVal(0x11, o1), a = metricVal(M_AFR, o2);
+    if (o1 && o2 && a > 6 && a < 25) {
+      afrAxes(); int r = (int)(axPos(amYs, AMR, rpm) + 0.5f), c = (int)(axPos(AXS, AMC, t) + 0.5f); uint16_t ac = (uint16_t)lroundf(a * 100);
+      if (!amN[r][c]) amMn[r][c] = amMx[r][c] = ac; else { if (ac < amMn[r][c]) amMn[r][c] = ac; if (ac > amMx[r][c]) amMx[r][c] = ac; }
+      amN[r][c]++; amSum[r][c] += a;
     }
   }
-  for (int c = 0; c < LOGN; c++) { snprintf(b, sizeof b, "%dK", c * logW() / 1000); txt(F_LS, b, 38 + c * 33 + 16, 183, T.dim, AL_C); }
+  for (int k = 0; k < 2; k++) { bool o; float v = metricVal(k ? M_AFR : M_CRP, o); if (!o) continue; LogBin& L = logB[k][b]; L.n++; L.sum += v; L.mn = fminf(L.mn, v); L.mx = fmaxf(L.mx, v); }
+}
+
+// ---- petrol AFR LOG page: the app's heat map ----
+static const int AF_GX = 43, AF_CW = 20, AF_GY = 82, AF_RP = 5;                                                       // grid origin and cell pitch (a cell is 19 x 4 px with 1 px between)
+static int8_t afrSelR = -1, afrSelC = -1; static uint32_t afrSelAt = 0;                                                // a cell picked by a tap or a drag: its numbers show for 5 s
+static const float AF_ST[8][4] = {{10.5f, 210, 40, 60}, {11.5f, 225, 70, 55}, {12.8f, 215, 150, 40}, {14.0f, 70, 190, 110}, {14.7f, 40, 175, 120}, {15.6f, 40, 130, 200}, {16.5f, 70, 90, 220}, {18.0f, 110, 70, 210}};
+static void afrRgb(float v, int* o) {                            // the app's colour scale: rich (red) ... 14.7 (green) ... lean (violet)
+  if (v <= AF_ST[0][0]) { for (int j = 0; j < 3; j++) o[j] = (int)AF_ST[0][j + 1]; return; }
+  for (int i = 1; i < 8; i++) if (v <= AF_ST[i][0]) {
+    float k = (v - AF_ST[i - 1][0]) / (AF_ST[i][0] - AF_ST[i - 1][0]);
+    for (int j = 0; j < 3; j++) o[j] = (int)lroundf(AF_ST[i - 1][j + 1] + (AF_ST[i][j + 1] - AF_ST[i - 1][j + 1]) * k);
+    return;
+  }
+  for (int j = 0; j < 3; j++) o[j] = (int)AF_ST[7][j + 1];
+}
+static uint16_t afrCellCol(int r, int c) {                       // a cell: the colour of its average, the more samples the more solid (as on the app); empty = a dark chip of the theme
+  int e[3] = {(TA.panel2.r + TA.line.r + 1) / 2, (TA.panel2.g + TA.line.g + 1) / 2, (TA.panel2.b + TA.line.b + 1) / 2};
+  uint32_t n = amN[r][c]; if (!n) return C((uint8_t)e[0], (uint8_t)e[1], (uint8_t)e[2]);
+  float k = fminf(1.0f, 0.45f + n / 10.0f); int a[3]; afrRgb(amSum[r][c] / n, a);
+  for (int j = 0; j < 3; j++) a[j] = (int)lroundf(e[j] + (a[j] - e[j]) * k);
+  return C((uint8_t)a[0], (uint8_t)a[1], (uint8_t)a[2]);
+}
+static void afrRowLab(char* b, size_t n, int v) {                // 800, 1.4K, 4.25K, 11.5K
+  if (v < 1000) snprintf(b, n, "%d", v); else if (v % 1000 == 0) snprintf(b, n, "%dK", v / 1000);
+  else if (v % 100 == 0) snprintf(b, n, "%d.%dK", v / 1000, (v % 1000) / 100); else snprintf(b, n, "%d.%02dK", v / 1000, (v % 1000) / 10);
+}
+static void afrMap(bool rok, float rpm) {
+  afrAxes(); tile(9, 56, 302, 141);
+  const uint16_t MAG = C(255, 63, 210), WHT = 0xFFFF;
+  bool ot, oa; float tps = getVal(0x11, ot), afr = metricVal(M_AFR, oa); bool live = rok && rpm >= 400 && ot;
+  float fr_ = live ? axPos(amYs, AMR, rpm) : 0, fc_ = live ? axPos(AXS, AMC, tps) : 0; int lr = live ? (int)(fr_ + 0.5f) : -1, lc = live ? (int)(fc_ + 0.5f) : -1;
+  bool sel = afrSelR >= 0 && (uint32_t)(millis() - afrSelAt) < 5000; char b[56], u[12], v1[12], v2[12], v3[12];
+  // the line on top: the cell picked by a tap, or the live position; and the REC switch
+  if (sel) {
+    uint32_t n = amN[afrSelR][afrSelC]; afrRowLab(u, sizeof u, amYs[afrSelR]); int l = snprintf(b, sizeof b, "%s  %d%%  ", u, AXS[afrSelC]);
+    if (n) { fmtv(v1, sizeof v1, amSum[afrSelR][afrSelC] / n, 2); fmtv(v2, sizeof v2, amMn[afrSelR][afrSelC] / 100.0f, 1); fmtv(v3, sizeof v3, amMx[afrSelR][afrSelC] / 100.0f, 1); snprintf(b + l, sizeof b - l, "AFR %s (%s-%s) x%lu", v1, v2, v3, (unsigned long)n); }
+    else snprintf(b + l, sizeof b - l, "--");
+    txt(F_LS, b, 18, 68, T.accL);
+  } else {
+    char t[12]; if (rok) fmtThou(t, sizeof t, (int)rpm); else strcpy(t, "--");
+    char w[8]; if (ot) snprintf(w, sizeof w, "%d%%", (int)lroundf(tps)); else strcpy(w, "--");
+    snprintf(b, sizeof b, "%s rpm  TPS %s", t, w); txt(F_US, b, 18, 68, T.text);
+    if (live && oa) { fmtv(v1, sizeof v1, afr, 1); snprintf(b, sizeof b, "AFR %s", v1); txt(F_US, b, 250, 68, afr >= 14.2f && afr <= 15.2f ? T.good : T.text, AL_R); }
+  }
+  { bool on = afrRec; rr(256, 58, 47, 13, 6, on ? T.panel : T.dark, on ? T.hot : T.line);
+    if (on) disc(264, 64, 2.6f, T.hot); else { disc(264, 64, 2.6f, T.dim); disc(264, 64, 1.2f, T.dark); }
+    txt(F_LS, "REC", 271, 67, on ? T.text : T.dim); }
+  // the column heads (throttle %), the live one in magenta
+  for (int c = 0; c < AMC; c++) { snprintf(b, sizeof b, "%d", AXS[c]); txt(F_LS, b, AF_GX + c * AF_CW + 9, 79, c == lc ? MAG : T.dim, AL_C); }
+  // the grid
+  for (int r = 0; r < AMR; r++) {
+    int y = AF_GY + r * AF_RP; if (y + AF_RP - 1 <= bandY0 || y >= bandY1) continue;
+    for (int c = 0; c < AMC; c++) fr(AF_GX + c * AF_CW, y, AF_CW - 1, AF_RP - 1, afrCellCol(r, c));
+  }
+  // the row heads (every second row and the last; the live row's in magenta, its neighbours step aside)
+  for (int r = 0; r < AMR; r++) {
+    bool forced = r == lr; if (!forced && (!((r % 2 == 0 && r <= 16) || r == AMR - 1) || r - 1 == lr || r + 1 == lr)) continue;
+    afrRowLab(u, sizeof u, amYs[r]); txt(F_LS, u, AF_GX - 3, AF_GY + r * AF_RP + 4, forced ? MAG : T.dim, AL_R);
+  }
+  if (live) {                                                    // the crosshair, the live cell in a white frame, and the dot at the exact position
+    float px = AF_GX + fc_ * AF_CW + 9, py = AF_GY + fr_ * AF_RP + 1.5f; int ix = (int)lroundf(px), iy = (int)lroundf(py);
+    frA(AF_GX, iy, AMC * AF_CW - 1, 1, WHT, 140); frA(ix, AF_GY, 1, AMR * AF_RP - 1, WHT, 140);
+    int x = AF_GX + lc * AF_CW, y = AF_GY + lr * AF_RP;
+    fr(x - 1, y - 1, AF_CW + 1, 1, WHT); fr(x - 1, y + AF_RP - 1, AF_CW + 1, 1, WHT); fr(x - 1, y - 1, 1, AF_RP + 1, WHT); fr(x + AF_CW - 1, y - 1, 1, AF_RP + 1, WHT);
+    disc((float)ix, (float)iy, 1.8f, MAG);
+  }
+  if (sel) { int x = AF_GX + afrSelC * AF_CW, y = AF_GY + afrSelR * AF_RP;
+    fr(x - 1, y - 1, AF_CW + 1, 1, T.accL); fr(x - 1, y + AF_RP - 1, AF_CW + 1, 1, T.accL); fr(x - 1, y - 1, 1, AF_RP + 1, T.accL); fr(x + AF_CW - 1, y - 1, 1, AF_RP + 1, T.accL); }
+  // the scale: rich (red) ... 14.7 ... lean (violet), as on the app
+  const int bw = AMC * AF_CW - 1;
+  if (bandY1 > 184 && bandY0 < 187) for (int i = 0; i < bw; i++) { int a[3]; afrRgb(10.5f + i / (float)(bw - 1) * 7.5f, a); fr(AF_GX + i, 184, 1, 3, C((uint8_t)a[0], (uint8_t)a[1], (uint8_t)a[2])); }
+  static const float LV[3] = {11.5f, 14.7f, 16.5f};
+  for (int i = 0; i < 3; i++) { fmtv(b, sizeof b, LV[i], 1); txt(F_LS, b, AF_GX + (int)lroundf((LV[i] - 10.5f) / 7.5f * (bw - 1)), 196, T.dim, AL_C); }
 }
 static void drawLog() {
   bool dsl = vehDiesel(); int k = logKind; const LogBin* L = logB[k]; int rows = dsl && !vehBike() ? 6 : 8, dec = k == 0 ? 2 : 1; bool ok; float rpm = getVal(0x0C, ok);
@@ -2485,7 +2562,13 @@ static void drawLog() {
   tabBar(1);
 }
 static void tapLog(int x, int y, bool first) {
+  bool amap = logKind == 1 && !vehDiesel();
+  if (!first && !amap) return;
+  if (amap && hit(x, y, AF_GX - 2, AF_GY - 2, AMC * AF_CW + 3, AMR * AF_RP + 3)) {          // a tap or a drag on the map picks a cell (its numbers show on top for a few seconds)
+    afrSelR = (int8_t)constrain((y - AF_GY) / AF_RP, 0, AMR - 1); afrSelC = (int8_t)constrain((x - AF_GX) / AF_CW, 0, AMC - 1); afrSelAt = millis(); return;
+  }
   if (!first) return;
+  if (amap && hit(x, y, 252, 54, 56, 19)) { afrRec = !afrRec; saveSoon(); return; }         // REC on / off (the map only; the rpm tables keep logging)
   if (tabTap(x, y, PG_LOG)) return;
   int m = modeTap(DATA_MODES, 4, x, y);
   if (m == 0) nav(PG_DATA); else if (m == 1) nav(PG_ALL);
@@ -2598,19 +2681,37 @@ static void mfbSync(uint8_t type, const uint8_t* p, uint16_t n) {
   }
   // LOG_GET: payload[0] = kind: 0 = AFR per rpm band, 1 = CRP volts per rpm band, 2 = AFR map (throttle rows x rpm columns)
   if (n < 1 || p[0] > 2) { mfbReply(type, 2); return; }
-  uint8_t k = p[0], o[8 + TBN + TBN * LOGN * 4]; int m = 0;
-  o[m++] = k; o[m++] = (uint8_t)(k == 2 ? TBN : 1); o[m++] = (uint8_t)LOGN; o[m++] = (uint8_t)(logW() / 100);       // kind, rows, columns, rpm per column / 100
+  uint8_t k = p[0];
   if (k == 2) {
-    for (int r = 0; r < TBN; r++) o[m++] = (uint8_t)TBV[r];                                                             // the throttle % of each row
-    for (int r = 0; r < TBN; r++) for (int c = 0; c < LOGN; c++) {                                                      // count u16, average x100 u16
-      uint32_t cn = amN[r][c]; mP16(o, m, (float)(cn > 65535 ? 65535 : cn)); mP16(o, m + 2, cn ? amSum[r][c] / cn * 100 : 0); m += 4;
+    // The map is kept on the app's own rpm rows (not evenly spaced from 0); the app puts the middle of every column on its own grid, so each row goes into the column whose middle the app
+    // maps back to that row (the answer is at most 100 rpm off; columns of 100 rpm where the app's rows are closer than 300 rpm). Columns above the last one with data are left out.
+    // A throttle row of the answer = a throttle column of the map.
+    afrAxes(); int gap = 9999; for (int r = 1; r < AMR; r++) gap = min(gap, (int)amYs[r] - (int)amYs[r - 1]);
+    const int STEP = gap >= 300 ? 200 : 100; int cols = 1; uint8_t band[AMR];
+    for (int r = 0; r < AMR; r++) {
+      int b0 = amYs[r] / STEP, best = b0; float bd = 1e9f;
+      for (int b = max(0, b0 - 1); b <= b0 + 1; b++) { float d = fabsf(axPos(amYs, AMR, b * STEP + STEP * 0.5f) - r); if (d < bd) { bd = d; best = b; } }
+      band[r] = (uint8_t)best; bool any = false; for (int c = 0; c < AMC; c++) if (amN[r][c]) any = true; if (any && band[r] + 1 > cols) cols = band[r] + 1;
     }
-  } else {
-    const LogBin* L = logB[k == 0 ? 1 : 0];                                                                             // logB[0] = CRP volts, logB[1] = AFR
-    for (int c = 0; c < LOGN; c++) {                                                                                    // count u16, average / min / max x100 u16
-      uint32_t cn = L[c].n; mP16(o, m, (float)(cn > 65535 ? 65535 : cn));
-      mP16(o, m + 2, cn ? L[c].sum / cn * 100 : 0); mP16(o, m + 4, cn ? L[c].mn * 100 : 0); mP16(o, m + 6, cn ? L[c].mx * 100 : 0); m += 8;
+    size_t sz = 4 + AMC + (size_t)AMC * cols * 4; uint8_t* o = (uint8_t*)calloc(sz, 1); if (!o) { mfbReply(type, 3); return; }
+    o[0] = 2; o[1] = (uint8_t)AMC; o[2] = (uint8_t)cols; o[3] = (uint8_t)(STEP / 100);                                  // kind, rows, columns, rpm per column / 100
+    for (int j = 0; j < AMC; j++) o[4 + j] = j ? (uint8_t)((AXS[j - 1] + AXS[j] + 1) / 2) : 0;                          // the throttle % each row starts at (the app takes the middle of the row)
+    uint8_t* cell = o + 4 + AMC;
+    for (int r = 0; r < AMR; r++) for (int j = 0; j < AMC; j++) {                                                      // count u16, average x100 u16
+      uint32_t cn = amN[r][j]; if (!cn) continue;
+      uint8_t* q = cell + (j * cols + band[r]) * 4; uint32_t pn = (uint32_t)q[0] | ((uint32_t)q[1] << 8), pa = (uint32_t)q[2] | ((uint32_t)q[3] << 8);
+      float avg = amSum[r][j] / cn * 100;                                                                              // (two rows in one column: merged)
+      if (pn) { avg = (pn * (float)pa + cn * avg) / (pn + cn); cn += pn; }
+      mP16(q, 0, (float)(cn > 65535 ? 65535 : cn)); mP16(q, 2, avg);
     }
+    mfbReply(type, 0, o, (uint16_t)sz); free(o); return;
+  }
+  uint8_t o[4 + LOGN * 8]; int m = 0;
+  o[m++] = k; o[m++] = 1; o[m++] = (uint8_t)LOGN; o[m++] = (uint8_t)(logW() / 100);                                  // kind, rows, columns, rpm per column / 100
+  const LogBin* L = logB[k == 0 ? 1 : 0];                                                                             // logB[0] = CRP volts, logB[1] = AFR
+  for (int c = 0; c < LOGN; c++) {                                                                                    // count u16, average / min / max x100 u16
+    uint32_t cn = L[c].n; mP16(o, m, (float)(cn > 65535 ? 65535 : cn));
+    mP16(o, m + 2, cn ? L[c].sum / cn * 100 : 0); mP16(o, m + 4, cn ? L[c].mn * 100 : 0); mP16(o, m + 6, cn ? L[c].mx * 100 : 0); m += 8;
   }
   mfbReply(type, 0, o, (uint16_t)m);
 }
