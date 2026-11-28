@@ -1,6 +1,7 @@
 // JetOBD2 Smart Gauge - ESP32 CYD (ESP32-2432S028R), 320x240 landscape
-// OBD-II over ELM327 (Bluetooth Classic or BLE) for Toyota / Honda / Isuzu / Mitsubishi / Nissan / Mazda (and any OBD-II car),
-// demo mode, Thai/English UI, black-blue / black-red themes, boot logo.   Needs ui_assets.h next to this file.
+// Honda motorcycle K-line gauge (v1.0.14): reads the ECU straight from a K-line board on the OBD2 / 6-pin plug, no Bluetooth, no ELM327.
+// Thai/English UI, black-blue / black-red themes, boot logo. The Jet Honda APP can use the gauge as its K-line interface over USB (MFB-LINK).
+// Needs ui_assets.h next to this file.
 #include <Arduino.h>
 #include <SPI.h>
 #include <math.h>
@@ -10,52 +11,32 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #ifdef UPD_BUILD
-// Updater image: Wi-Fi + TLS instead of Bluetooth (the flash is too small for both). Tiny stand-ins keep the shared UI code compiling;
-// nothing here is ever called, the linker drops it.
+// Updater image: Wi-Fi + TLS. The gauge image itself has no Wi-Fi and no Bluetooth.
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include "mbedtls/version.h"
 #include "mbedtls/sha256.h"
 #include <map>
-typedef int esp_ble_addr_type_t;
-struct BTAddr { String toString() { return String(""); } };
-struct BTAdvertisedDevice { BTAddr getAddress() { return {}; } String getName() { return String(""); } int getRSSI() { return 0; } };
-struct BTScanResults { int getCount() { return 0; } BTAdvertisedDevice* getDevice(int) { return nullptr; } };
-struct BluetoothSerial { bool begin(const char*, bool) { return true; } void setPin(const char*) {} bool discoverAsync(void (*)(BTAdvertisedDevice*)) { return true; } void discoverAsyncStop() {}
-  BTScanResults* getScanResults() { return nullptr; } void end() {} int available() { return 0; } int read() { return -1; } void print(const char*) {} void print(char) {} bool connected() { return false; } void disconnect() {} bool connect(uint8_t*) { return false; } };
-struct BLEUUID { BLEUUID(uint16_t) {} String toString() { return String(""); } };
-struct BLEAddress { BLEAddress(uint8_t*) {} String toString() { return String(""); } };
-struct BLERemoteCharacteristic { bool canWrite() { return 0; } bool canWriteNoResponse() { return 0; } bool canNotify() { return 0; } bool canIndicate() { return 0; }
-  void registerForNotify(void (*)(BLERemoteCharacteristic*, uint8_t*, size_t, bool), bool) {} void writeValue(uint8_t*, size_t, bool) {} };
-struct BLERemoteService { BLEUUID getUUID() { return BLEUUID((uint16_t)0); } std::map<std::string, BLERemoteCharacteristic*>* getCharacteristics() { return nullptr; } };
-struct BLEClient { bool connect(BLEAddress, esp_ble_addr_type_t) { return false; } bool isConnected() { return false; } void disconnect() {} std::map<std::string, BLERemoteService*>* getServices() { return nullptr; } };
-struct BLEAdvertisedDevice { BLEAddress getAddress() { return BLEAddress(nullptr); } String getName() { return String(""); } int getRSSI() { return 0; } bool isAdvertisingService(BLEUUID) { return 0; } int getAddressType() { return 0; } };
-struct BLEScanResults { int getCount() { return 0; } BLEAdvertisedDevice getDevice(int) { return {}; } };
-struct BLEScan { void setActiveScan(bool) {} void setInterval(int) {} void setWindow(int) {} BLEScanResults start(int, bool) { return {}; } void clearResults() {} };
-struct BLEDevice { static void init(const char*) {} static BLEClient* createClient() { static BLEClient c; return &c; } static BLEScan* getScan() { static BLEScan s; return &s; } static void deinit(bool) {} };
-#else
-#include <BluetoothSerial.h>
-#include <BLEDevice.h>
 #endif
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.13"
+#define FW_VERSION "v1.0.14"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
 XPT2046_Touchscreen ts(33, 36);
-BluetoothSerial BT;
 Preferences prefs;
 
 
 // ---------- settings ----------
 static const bool demoMode = false;               // the built-in demo was removed in v1.0.2; the constant keeps the old branches compiled out
 static bool warnOn = true, parkOn = true;
+static bool colorful = true;                     // v1.0.14: each reading in its own colour, rainbow tacho (off = the old white / blue look)
 static int shiftRpm = 6500, bright = 80, tankL = 44, fuelCal = 100;
 static bool invScreen = false;                   // panel colour polarity (runtime INVON / INVOFF)
-static uint8_t dashMain = 0;                      // dash centre shows 0 speed, 1 CRP volts, 2 AFR
+static uint8_t dashMain = 0;                      // dash centre shows 0 speed, 1 trip distance
 static uint8_t slots[6] = {0, 1, 2, 3, 4, 5};
 static bool firstRun = true;                     // nothing saved yet (every re-flash starts here)
 static bool engineRan = false, screenOff = false;   // park screen: the engine has run since connecting / the backlight is off
@@ -141,7 +122,6 @@ static bool flipScr = false;                     // screen turned 180 degrees (g
 struct VMap { char c[6]; uint8_t m; };            // VIN characters 4-8 (model / type code) -> model the owner picked for them
 static VMap vmap[8]; static int nvmap = 0, vmapNext = 0;
 static volatile bool vinNew = false;             // a VIN was read: loop() applies it
-static volatile bool btBrowsing = false;         // the Bluetooth page is open: no automatic adapter search meanwhile
 static int effModel() { return vehModel >= 0 ? vehModel : autoModel; }
 
 // VIN world-manufacturer codes -> brand (0..5 = a brand above, 100+ = another make that is only named)
@@ -215,7 +195,7 @@ static const int NPID = sizeof(PIDS) / sizeof(PIDS[0]);
 static float pv[256];
 static bool psup[256]; static uint8_t want[256];     // want: 0 no, 1 background, 2 on screen
 static uint32_t page[256];
-static volatile uint8_t linkMode = 0;     // 0 = ELM327 over Bluetooth, 1 = Honda K-line board on the UART pins (v1.0.13)
+static const uint8_t linkMode = 1;        // the only link: Honda K-line board on the UART pins (the ELM327 / Bluetooth link was removed in v1.0.14)
 static volatile int linkState = 0;        // 0 demo, 1 connecting, 2 connected, 3 no adapter chosen
 static volatile bool mil = false;
 static volatile int dtcCount = 0;
@@ -236,286 +216,6 @@ static volatile int codeCount = 0, codeState = 0, codeVer = 0, req = 0;
 static volatile uint32_t monRaw = 0; static volatile bool monValid = false; static volatile int monVer = 0;
 // freeze frame (Mode 02)
 static char frzCode[6] = ""; static float frzVal[12]; static bool frzOk[12]; static volatile int frzState = 0, frzVer = 0;   // 0 none, 1 reading, 2 done, 3 no data
-// ---------- Bluetooth: nearby-device scan (Classic + BLE), chosen adapter, background link ----------
-#ifndef OBD_PIN
-#define OBD_PIN "1234"                       // first pairing PIN tried for Classic adapters (some use 0000 or 6789)
-#endif
-static const char* const PINS[] = {OBD_PIN, "0000", "6789", "1111"};
-static const int NPINS = 4;
-static volatile int pinIdx = 0, pinSaved = 0;     // PIN that works for the chosen adapter (saved); the next one is tried after a failed connect
-static volatile bool pinDirty = false;            // PIN state changed: save it from the UI loop
-static volatile bool pinOk = false;               // this adapter has connected with pinIdx at least once: stop guessing PINs
-
-struct BtDev { char addr[18]; char name[26]; int8_t rssi; bool obd; bool ble; uint8_t atype; };
-static const int MAXBT = 24;
-static BtDev btList[MAXBT];
-static volatile int btCount = 0, btVer = 0;
-static volatile int scanState = 0;           // 0 idle, 1 scanning, 2 done, 3 failed
-static volatile bool scanReq = false, scanStop = false, reconnectReq = false;
-static char selAddr[18] = "", selName[26] = "";   // adapter picked by the user (saved in flash)
-static bool selBle = false; static uint8_t selAType = 0;   // ... its radio (Classic or BLE) and BLE address type
-static volatile uint32_t selGen = 0;              // counts picks, so a connect attempt that was already running for the old pick cannot change the new pick's PIN / GATT choice
-static portMUX_TYPE btMux = portMUX_INITIALIZER_UNLOCKED;
-static bool btReady = false, bleReady = false, linkActiveBle = false;
-static BLEClient* bleClient = nullptr;             // the one BLE client (created with the BLE stack)
-static BLERemoteCharacteristic* bleTx = nullptr;   // characteristic that takes our commands
-
-static void cleanName(char* d, size_t n, const char* s) {     // printable ASCII only
-  size_t k = 0; bool gap = false;
-  for (; *s && k + 1 < n; s++) {
-    unsigned char c = (unsigned char)*s;
-    if (c >= 32 && c < 127) { d[k++] = (char)c; gap = false; }
-    else if (!gap) { d[k++] = '?'; gap = true; }
-  }
-  d[k] = 0;
-}
-static bool looksObd(const char* nm) {                        // names that look like an OBD-II adapter are listed first
-  static const char* const K[] = {"OBD", "ELM", "V-LINK", "VLINK", "VGATE", "VEEPEAK", "ICAR", "VIECAR", "KONNWEI", "KW90", "CARISTA", "LELINK", "FIXD", "BAFX"};
-  char u[26]; size_t i = 0;
-  for (; nm[i] && i + 1 < sizeof u; i++) u[i] = (char)toupper((unsigned char)nm[i]);
-  u[i] = 0;
-  for (const char* k : K) if (strstr(u, k)) return true;
-  return false;
-}
-static bool parseAddr(const char* s, uint8_t* a) {
-  unsigned v[6];
-  if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
-  for (int i = 0; i < 6; i++) { if (v[i] > 255) return false; a[i] = (uint8_t)v[i]; }
-  return true;
-}
-static bool btBetter(const BtDev& a, const BtDev& b, bool byRssi) {   // OBD-looking names first, then strongest signal
-  if (a.obd != b.obd) return a.obd;
-  if (!byRssi) return false;
-  return (a.rssi ? a.rssi : -127) > (b.rssi ? b.rssi : -127);
-}
-// Add or refresh one device (same address on the same radio = same entry). When the list is full a better device replaces the weakest.
-static void btInsert(const BtDev& t) {                        // caller holds btMux
-  for (int i = 0; i < btCount; i++) {
-    if (btList[i].ble != t.ble || strcmp(btList[i].addr, t.addr)) continue;
-    if (t.name[0]) { memcpy(btList[i].name, t.name, sizeof t.name); btList[i].obd = btList[i].obd || t.obd; }
-    if (t.rssi) btList[i].rssi = t.rssi;
-    if (t.ble) btList[i].atype = t.atype;
-    return;
-  }
-  if (btCount < MAXBT) { btList[btCount] = t; btCount = btCount + 1; return; }
-  int w = 0;
-  for (int i = 1; i < btCount; i++) if (btBetter(btList[w], btList[i], true)) w = i;
-  if (btBetter(t, btList[w], true)) btList[w] = t;
-}
-
-// Called by the Bluetooth stack for every Classic inquiry result (not on the UI core): copy under a lock, never draw here.
-static void onBtFound(BTAdvertisedDevice* d) {
-  auto as = d->getAddress().toString();       // Arduino String on this core (std::string on others): auto + c_str() fits both
-  auto ns = d->getName();
-  const char* ac = as.c_str();
-  if (strlen(ac) != 17) return;
-  BtDev t; memset(&t, 0, sizeof t);
-  for (int i = 0; i < 17; i++) t.addr[i] = (char)toupper((unsigned char)ac[i]);
-  cleanName(t.name, sizeof t.name, ns.c_str());
-  t.rssi = (int8_t)d->getRSSI(); t.obd = looksObd(t.name);
-  portENTER_CRITICAL(&btMux); btInsert(t); portEXIT_CRITICAL(&btMux);
-  btVer = btVer + 1;
-}
-
-static void btUp() { if (!btReady) { BT.begin("JETOBD-GAUGE", true); BT.setPin(PINS[pinIdx]); btReady = true; } }
-
-// forget the library's list of earlier scans (only if this core has discoverClear(); otherwise nothing happens)
-template <class T> static auto btForget(T& b, int) -> decltype(b.discoverClear(), void()) { b.discoverClear(); }
-template <class T> static void btForget(T&, long) {}
-
-// BLEDevice::deinit() if this core has it (it lets BLEDevice::init() run again after the shared Bluetooth stack was restarted)
-template <class T> static auto bleDeinit(int) -> decltype(T::deinit(false), void()) { T::deinit(false); }
-template <class T> static void bleDeinit(long) {}
-
-// Start a Classic inquiry. Some cores refuse a new one after an earlier connect attempt, so retry with a cleaner state each time.
-static bool startDiscovery() {
-  btForget(BT, 0);
-  if (BT.discoverAsync(onBtFound)) return true;
-  BT.discoverAsyncStop(); vTaskDelay(400);                 // an unfinished earlier inquiry can block a new one
-  if (BT.discoverAsync(onBtFound)) return true;
-  if (bleReady) { bleDeinit<BLEDevice>(0); bleReady = false; bleClient = nullptr; bleTx = nullptr; }   // the restart below takes BLE down too; it is set up again when needed
-  BT.end(); btReady = false; vTaskDelay(400);              // last resort: restart the Bluetooth stack
-  btUp(); vTaskDelay(400);
-  btForget(BT, 0);
-  return BT.discoverAsync(onBtFound);
-}
-
-static bool classicScan() {
-  btUp();
-  if (!startDiscovery()) return false;
-  uint32_t t0 = millis();
-  while (millis() - t0 < 10500 && !scanStop) vTaskDelay(50);
-  BT.discoverAsyncStop();
-  vTaskDelay(500);                            // let the last results arrive
-  BTScanResults* res = BT.getScanResults();   // final names / signal of everyone heard during the scan
-  if (res) for (int i = 0, n = res->getCount(); i < n; i++) { BTAdvertisedDevice* d = res->getDevice(i); if (d) onBtFound(d); }
-  return true;
-}
-
-// ---- BLE (Bluetooth Low Energy): many "Bluetooth 4.0 / 5.0, iOS + Android" adapters (KONNWEI KW90x, ...) are BLE, not Classic ----
-static bool bleTxResp = true;                      // write with response (only if it has no write-without-response)
-static int bleTry = 0;                             // which GATT UART candidate to use; advances after a failed ELM handshake
-static uint8_t bleRx[1024]; static uint16_t bleHead = 0, bleTail = 0;   // notification bytes -> ELM reader (guarded by btMux)
-
-static void bleUp() {
-  if (bleReady) return;
-  BLEDevice::init("JETOBD-GAUGE");
-  bleClient = BLEDevice::createClient();           // one client for the whole run (each createClient() takes a GATT slot)
-  bleReady = true;
-}
-static void bleNotify(BLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {   // BLE task: just store the bytes
-  portENTER_CRITICAL(&btMux);
-  for (size_t i = 0; i < n; i++) { uint16_t nx = (uint16_t)((bleHead + 1) & 1023); if (nx == bleTail) break; bleRx[bleHead] = d[i]; bleHead = nx; }
-  portEXIT_CRITICAL(&btMux);
-}
-static int bleAvail() { portENTER_CRITICAL(&btMux); int n = (bleHead - bleTail) & 1023; portEXIT_CRITICAL(&btMux); return n; }
-static int bleReadByte() {
-  int c = -1;
-  portENTER_CRITICAL(&btMux);
-  if (bleHead != bleTail) { c = bleRx[bleTail]; bleTail = (uint16_t)((bleTail + 1) & 1023); }
-  portEXIT_CRITICAL(&btMux);
-  return c;
-}
-static void bleFlush() { portENTER_CRITICAL(&btMux); bleTail = bleHead; portEXIT_CRITICAL(&btMux); }
-
-// scan results: the library returns either an object or a pointer depending on its version - these helpers take both
-template <class R> static int bleCount(R& r) { return r.getCount(); }
-template <class R> static int bleCount(R* r) { return r ? r->getCount() : 0; }
-template <class R> static auto bleDevAt(R& r, int i) -> decltype(r.getDevice(i)) { return r.getDevice(i); }
-template <class R> static auto bleDevAt(R* r, int i) -> decltype(r->getDevice(i)) { return r->getDevice(i); }
-
-static bool bleScan() {
-  bleUp();
-  BLEScan* sc = bleReady ? BLEDevice::getScan() : nullptr;
-  if (!sc) return false;
-  sc->setActiveScan(true);                         // scan responses carry the names
-  sc->setInterval(100); sc->setWindow(99);
-  auto found = sc->start(5, false);                // blocks for 5 s
-  for (int i = 0, n = bleCount(found); i < n; i++) {
-    auto d = bleDevAt(found, i);
-    auto as = d.getAddress().toString();
-    auto ns = d.getName();
-    const char* ac = as.c_str();
-    if (strlen(ac) != 17) continue;
-    BtDev t; memset(&t, 0, sizeof t);
-    for (int k = 0; k < 17; k++) t.addr[k] = (char)toupper((unsigned char)ac[k]);
-    cleanName(t.name, sizeof t.name, ns.c_str());
-    bool uart = d.isAdvertisingService(BLEUUID((uint16_t)0xFFF0)) || d.isAdvertisingService(BLEUUID((uint16_t)0xFFE0)) || d.isAdvertisingService(BLEUUID((uint16_t)0x18F0));
-    if (!t.name[0] && !uart) continue;             // anonymous BLE beacons are just noise
-    t.rssi = (int8_t)d.getRSSI(); t.ble = true; t.atype = (uint8_t)d.getAddressType(); t.obd = uart || looksObd(t.name);
-    portENTER_CRITICAL(&btMux); btInsert(t); portEXIT_CRITICAL(&btMux);
-  }
-  btVer = btVer + 1;
-  sc->clearResults();
-  return true;
-}
-
-static bool svcSkip(const char* u) {               // firmware-update services also look like "notify + write"
-  return strstr(u, "0000fe59") || strstr(u, "00010203-0405-0607-0809-0a0b0c0d1912") || strstr(u, "8d53dc1d");
-}
-static int svcPrio(const char* u) {                // typical ELM327 BLE adapters: FFF0, FFE0, 18F0, Nordic UART, "BLE serial"
-  static const char* const K[] = {"0000fff0", "0000ffe0", "000018f0", "6e400001", "e7810a71"};
-  for (const char* k : K) if (strstr(u, k)) return 2;
-  return 1;
-}
-static bool chCanWrite(BLERemoteCharacteristic* c) { return c->canWrite() || c->canWriteNoResponse(); }
-static bool chCanNotify(BLERemoteCharacteristic* c) { return c->canNotify() || c->canIndicate(); }
-
-// Find the serial-over-GATT pair (one characteristic that notifies, one that takes writes) and subscribe to the notifications.
-static bool bleSetupUart() {
-  bleTx = nullptr; bleFlush();
-  auto* svcs = bleClient->getServices();           // discovers the services on first use
-  if (!svcs) return false;
-  struct Cand { BLERemoteCharacteristic* nf; BLERemoteCharacteristic* wr; int prio; };
-  Cand cand[8]; int nc = 0;
-  for (auto& sv : *svcs) {
-    BLERemoteService* s = sv.second; if (!s) continue;
-    auto su = s->getUUID().toString();
-    char us[48]; { size_t k = 0; for (const char* q = su.c_str(); *q && k + 1 < sizeof us; q++) us[k++] = (char)tolower((unsigned char)*q); us[k] = 0; }
-    if (svcSkip(us)) continue;
-    auto* chs = s->getCharacteristics(); if (!chs) continue;
-    BLERemoteCharacteristic *nf = nullptr, *wr = nullptr;
-    for (auto& cv : *chs) { BLERemoteCharacteristic* c = cv.second; if (c && !nf && chCanNotify(c)) nf = c; }
-    for (auto& cv : *chs) { BLERemoteCharacteristic* c = cv.second; if (c && c != nf && chCanWrite(c)) { wr = c; break; } }
-    if (!wr && nf && chCanWrite(nf)) wr = nf;      // one characteristic does both (HM-10 style FFE1)
-    if (nf && wr && nc < 8) { cand[nc].nf = nf; cand[nc].wr = wr; cand[nc].prio = svcPrio(us); nc++; }
-  }
-  if (!nc) return false;
-  Cand ord[8]; int no = 0;                         // known UART services first; a failed handshake moves on to the next one
-  for (int p = 2; p >= 1; p--) for (int i = 0; i < nc; i++) if (cand[i].prio == p) ord[no++] = cand[i];
-  const Cand& pick = ord[bleTry % no];
-  bleTx = pick.wr; bleTxResp = !bleTx->canWriteNoResponse();
-  pick.nf->registerForNotify(bleNotify, pick.nf->canNotify());
-  return true;
-}
-
-// ---- one interface for the ELM327 code: Classic SPP or BLE, whichever radio the chosen adapter uses ----
-static int linkAvail() { return linkActiveBle ? bleAvail() : BT.available(); }
-static int linkRead() { return linkActiveBle ? bleReadByte() : BT.read(); }
-static void linkSend(const char* cmd) {            // command text + carriage return
-  if (!linkActiveBle) { BT.print(cmd); BT.print('\r'); return; }
-  if (!bleTx) return;
-  uint8_t b[40]; size_t n = strlen(cmd); if (n > 30) n = 30;
-  memcpy(b, cmd, n); b[n++] = '\r';
-  for (size_t o = 0; o < n; o += 20) bleTx->writeValue(b + o, (n - o) > 20 ? 20 : (n - o), bleTxResp);   // default BLE payload is 20 bytes
-}
-static bool linkIsUp() { return linkActiveBle ? (bleClient && bleClient->isConnected()) : (btReady && BT.connected()); }
-static void linkDown() {
-  if (linkActiveBle) { if (bleClient && bleClient->isConnected()) bleClient->disconnect(); bleTx = nullptr; bleFlush(); }
-  else if (btReady && BT.connected()) BT.disconnect();
-}
-static bool linkConnect(const char* sa, bool ble, uint8_t atype) {
-  uint8_t a[6];
-  if (!parseAddr(sa, a)) return false;
-  linkDown();                                      // the chosen adapter may use the other radio than the last link
-  linkActiveBle = ble;
-  if (!ble) { btUp(); BT.setPin(PINS[pinIdx]); return BT.connect(a); }
-  bleUp();
-  BLEAddress ad(a);
-  if (!bleClient->connect(ad, (esp_ble_addr_type_t)atype)) return false;
-  if (!bleSetupUart()) { bleClient->disconnect(); return false; }
-  return true;
-}
-
-static void doScan() {
-  portENTER_CRITICAL(&btMux); btCount = 0; portEXIT_CRITICAL(&btMux);
-  scanStop = false; scanState = 1; btVer = btVer + 1;
-  bool was = linkIsUp(); linkDown(); if (was) vTaskDelay(200);   // no inquiry while a link is up
-  bool okC = classicScan();
-  bool okB = scanStop ? false : bleScan();         // a tap on a device during the Classic part skips the BLE part
-  scanState = (okC || scanStop || (okB && btCount > 0)) ? 2 : 3; btVer = btVer + 1;   // failed = nothing could be scanned and nothing was found
-}
-
-static float decodePid(uint8_t id, const uint8_t* b, int n) {
-  float A = b[0], B = n > 1 ? b[1] : 0, Cc = n > 2 ? b[2] : 0, D = n > 3 ? b[3] : 0, AB = A * 256 + B;
-  switch (id) {
-    case 0x04: case 0x11: case 0x2C: case 0x2E: case 0x2F: case 0x45: case 0x47: case 0x49: case 0x4A:
-    case 0x4C: case 0x52: case 0x5A: case 0x5B: return A * 100 / 255;
-    case 0x05: case 0x0F: case 0x46: case 0x5C: return A - 40;
-    case 0x06: case 0x07: case 0x08: case 0x09: return (A - 128) * 100 / 128;
-    case 0x0A: return A * 3;
-    case 0x0C: return AB / 4;
-    case 0x0E: return A / 2 - 64;
-    case 0x10: return AB / 100;
-    case 0x14: case 0x15: return A / 200;
-    case 0x1F: case 0x21: case 0x31: case 0x4D: case 0x4E: case 0x63: return AB;
-    case 0x22: return AB * 0.079f;
-    case 0x23: case 0x59: return AB * 10;
-    case 0x24: case 0x44: return AB * 2 / 65536;
-    case 0x2D: return A * 100 / 128 - 100;
-    case 0x32: return (float)(int16_t)(uint16_t)AB / 4;
-    case 0x34: return (Cc * 256 + D) / 256 - 128;
-    case 0x3C: case 0x3E: return AB / 10 - 40;
-    case 0x42: return AB / 1000;
-    case 0x43: return AB * 100 / 255;
-    case 0x5D: return AB / 128 - 210;
-    case 0x5E: return AB * 0.05f;
-    case 0x61: case 0x62: return A - 125;
-    case 0x78: return (n >= 3 ? (B * 256 + Cc) : 0) / 10 - 40;     // exhaust gas temperature, sensor 1 of bank 1
-    default: return A;
-  }
-}
-
 static bool snapOn = false; static uint32_t snapNow = 0; static float pvS[256]; static bool psupS[256]; static uint32_t pageS[256];   // data snapshot taken once per frame
 static float getVal(uint8_t pid, bool& ok) {
   uint32_t now = snapOn ? snapNow : millis();
@@ -525,248 +225,8 @@ static float getVal(uint8_t pid, bool& ok) {
   return snapOn ? pvS[pid] : pv[pid];
 }
 
-// ---------- ELM327 communication (runs in obdTask) ----------
-static int linkAvail(); static int linkRead(); static void linkSend(const char* cmd); static bool linkIsUp();   // Classic or BLE, see the Bluetooth section
-static bool abortWait() { return scanReq || reconnectReq || demoMode || !linkIsUp(); }   // the user asked for something else, or the link dropped
-static String elmQuery(const char* cmd, uint32_t tmo = 1500) {
-  while (linkAvail()) linkRead();
-  linkSend(cmd);
-  String r; r.reserve(96); uint32_t t0 = millis();
-  while (millis() - t0 < tmo) {
-    bool got = false;
-    while (linkAvail()) { char c = (char)linkRead(); got = true; if (c == '>') return r; r += c; }
-    if (abortWait()) break;
-    if (!got) vTaskDelay(1);
-  }
-  return r;
-}
-
-// One reply = a list of messages (one per ECU / frame group). Handles the CAN multi-frame layout
-// ("014" then "0: ..." "1: ...") and the K-line layout (one short line per frame).
-struct Msg { uint8_t b[48]; uint8_t n; };
-static int hv(char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; }
-static bool isHexStr(const char* s, int n) { for (int i = 0; i < n; i++) if (!isxdigit((unsigned char)s[i])) return false; return n > 0; }
-static int parseMsgs(const String& raw, Msg* out, int maxm) {
-  int nm = 0, i = 0, len = (int)raw.length(), mf = -1, expect = 0;
-  while (i < len) {
-    int e = i;
-    while (e < len && raw[e] != '\r' && raw[e] != '\n') e++;
-    char ln[96]; int k = 0;
-    for (int j = i; j < e && k < 94; j++) if (raw[j] != ' ') ln[k++] = raw[j];
-    ln[k] = 0; i = e + 1;
-    if (!k) continue;
-    const char* p = ln; int pl = k; bool frame = false;
-    if (pl >= 2 && ln[1] == ':') { frame = true; p = ln + 2; pl = k - 2; }       // "0:" ... "F:" continuation lines
-    if (!isHexStr(p, pl)) continue;                                              // SEARCHING..., NO DATA, BUS INIT, echoes ...
-    if (frame) {
-      if (mf < 0) { if (nm >= maxm) continue; mf = nm++; out[mf].n = 0; expect = 255; }
-      Msg& m = out[mf];
-      for (int j = 0; j + 1 < pl && m.n < (int)sizeof m.b; j += 2) m.b[m.n++] = (uint8_t)((hv(p[j]) << 4) | hv(p[j + 1]));
-      if (m.n >= expect) { m.n = (uint8_t)expect; mf = -1; }
-      continue;
-    }
-    mf = -1;
-    if (pl == 3) { if (nm < maxm) { mf = nm++; out[mf].n = 0; expect = (int)strtol(ln, nullptr, 16); if (expect > (int)sizeof out[mf].b) expect = (int)sizeof out[mf].b; } continue; }
-    if ((pl & 1) || nm >= maxm) continue;
-    Msg& m = out[nm++]; m.n = 0;
-    for (int j = 0; j + 1 < pl && m.n < (int)sizeof m.b; j += 2) m.b[m.n++] = (uint8_t)((hv(p[j]) << 4) | hv(p[j + 1]));
-  }
-  return nm;
-}
-static const int MAXM = 8;
-static Msg msgs[MAXM];                                  // used by the OBD task only
-
-// ---- poll speed (v1.0.3) ----
-static bool cntOk = true;                                   // the adapter takes the "number of replies" digit (010C1): it stops waiting as soon as the first answer is in
-static bool multiOk = false;                                // several PIDs in one request (CAN only); switched off by itself when the car does not answer them
-static uint8_t multiBad = 0, multiShort = 0;
-static bool kMulti = false;                                 // K-line: RPM + speed in ONE request (J1979 only promises this on CAN, so it is tried and dropped by itself when the car does not answer both)
-static uint8_t pfail[256]; static uint32_t pskip[256];      // a PID that keeps answering nothing is skipped for a while, so it cannot slow the others down
-static uint32_t iterNow = 0;                                // poll round counter
-static bool vinPending = false;                             // the VIN is read a few rounds after the link came up, so the first values show at once
+// ---------- helpers for the live values ----------
 static volatile uint16_t obdRpmMs = 0;                      // measured time between two RPM updates (shown on the ECU page)
-static void resetPollState() { memset(pfail, 0, sizeof pfail); memset(pskip, 0, sizeof pskip); multiBad = 0; multiShort = 0; }
-static void multiOff() { multiOk = false; kMulti = false; resetPollState(); }       // the car does not take combined requests: one PID per request from now on
-static uint32_t pollTmo() { return protoNum >= 6 ? 800 : 1500; }   // CAN answers in milliseconds: a silent adapter is noticed quickly
-static bool queryPid(uint8_t pid, uint8_t* b, int& n, uint32_t tmo = 1200, int mode = 1, int frame = -1) {
-  char cmd[12];
-  bool dig = mode == 1 && cntOk;
-  if (mode == 2) snprintf(cmd, sizeof cmd, "02%02X%02X", pid, frame < 0 ? 0 : frame); else snprintf(cmd, sizeof cmd, "%02X%02X%s", mode, pid, dig ? "1" : "");
-  String raw = elmQuery(cmd, tmo);
-  if (dig && raw.indexOf('?') >= 0) { cntOk = false; snprintf(cmd, sizeof cmd, "%02X%02X", mode, pid); raw = elmQuery(cmd, tmo); }   // this adapter does not know the digit
-  int nm = parseMsgs(raw, msgs, MAXM);
-  for (int i = 0; i < nm; i++) {
-    const Msg& m = msgs[i];
-    int off = mode == 2 ? 3 : 2;
-    if (m.n > off && m.b[0] == 0x40 + mode && m.b[1] == pid) { n = m.n - off; if (n > 9) n = 9; memcpy(b, m.b + off, n); return n > 0; }
-  }
-  return false;
-}
-// support bitmaps: every ECU that answers is OR-ed together (engine + gearbox ECU...)
-static bool queryBitmap(uint8_t pid, uint8_t* b4, uint32_t tmo) {
-  char cmd[8]; snprintf(cmd, sizeof cmd, "01%02X", pid);
-  int nm = parseMsgs(elmQuery(cmd, tmo), msgs, MAXM); bool any = false;
-  memset(b4, 0, 4);
-  for (int i = 0; i < nm; i++) {
-    const Msg& m = msgs[i];
-    if (m.n >= 6 && m.b[0] == 0x41 && m.b[1] == pid) { for (int k = 0; k < 4; k++) b4[k] |= m.b[2 + k]; any = true; }
-  }
-  return any;
-}
-
-static void discoverPids() {
-  memset(psup, 0, sizeof psup);
-  for (int base = 0; base < 0xE0; base += 0x20) {
-    uint8_t b[4];
-    if (!queryBitmap((uint8_t)base, b, base == 0 ? 8000 : 2000)) { if (base == 0) break; else continue; }
-    for (int i = 0; i < 32; i++) if (b[i / 8] & (0x80 >> (i % 8))) psup[base + i + 1] = true;
-    if (!(b[3] & 1)) break;
-  }
-}
-
-static bool elmAlive = false;                // set by elmInit: the adapter answered like an ELM327 (so the link itself is fine, even if the car is off)
-static int lastProto = 0;                    // protocol that worked last time (saved), tried first
-static int userProto = 0;                    // 0 = automatic, 1..9 = bus protocol forced from Setup 2 (saved)
-static volatile bool protoDirty = false;
-static bool replyIs0100(const String& r) {
-  int nm = parseMsgs(r, msgs, MAXM);
-  for (int i = 0; i < nm; i++) if (msgs[i].n >= 2 && msgs[i].b[0] == 0x41 && msgs[i].b[1] == 0x00) return true;
-  return false;
-}
-static bool tryProto(int p, uint32_t tmo) {
-  char c[10]; snprintf(c, sizeof c, "ATSP%d", p);
-  elmQuery(c, 1500);
-  return replyIs0100(elmQuery("0100", tmo));
-}
-static bool elmInit() {
-  String z = elmQuery("ATZ", 3500), e = elmQuery("ATE0");
-  elmAlive = z.indexOf("ELM") >= 0 || e.indexOf("OK") >= 0;
-  if (!elmAlive) { e = elmQuery("ATE0"); elmAlive = e.indexOf("OK") >= 0; }
-  elmQuery("ATL0"); elmQuery("ATS0"); elmQuery("ATH0");
-  protoNum = 0;
-  bool ok = false, forced = userProto >= 1 && userProto <= 9;
-  if (forced) ok = tryProto(userProto, userProto >= 6 ? 9000 : 15000);                                    // protocol chosen by the user
-  if (!ok && !forced && lastProto >= 1 && lastProto <= 9) ok = tryProto(lastProto, lastProto >= 6 ? 7000 : 12000);   // the protocol that worked before: quick start
-  if (!ok && !forced) { elmQuery("ATSP0", 1500); ok = replyIs0100(elmQuery("0100", 22000)); }             // automatic search (K-line slow init takes a few seconds per protocol)
-  static int initFails = 0;
-  if (!ok && !forced && elmAlive && !abortWait() && (initFails++ % 4) == 0) {                                          // manual sweep (first try, then every 4th), most common protocols first
-    static const uint8_t SW[] = {6, 7, 5, 4, 3, 8, 9, 2, 1};
-    for (unsigned i = 0; i < sizeof SW && !ok; i++) {
-      if (SW[i] == lastProto) continue;
-      if (tryProto(SW[i], SW[i] >= 6 ? 4000 : 9000)) { ok = true; break; }
-      if (abortWait()) break;
-    }
-  }
-  if (!ok) return false;
-  initFails = 0;
-  String d = elmQuery("ATDPN", 1000); d.trim();
-  int p = 0;
-  for (unsigned i = 0; i < d.length(); i++) { char c = d[i]; if (c >= '1' && c <= '9') { p = c - '0'; break; } }
-  protoNum = p;
-  cntOk = true; multiOk = p >= 6; resetPollState(); kMulti = p >= 3 && p <= 5; obdRpmMs = 0;       // CAN: combined requests are tried first and dropped by themselves if the car does not take them
-  if (p >= 3 && p <= 5) elmQuery("ATST64", 1000);            // slow K-line ECUs: allow 400 ms for an answer
-  if (p && p != lastProto) { lastProto = p; protoDirty = true; }
-  return true;
-}
-
-// ---------- vehicle identification ----------
-static void collectAscii(int nm, uint8_t pid, char* dst, size_t cap, bool vinOnly) {
-  size_t k = 0; dst[0] = 0;
-  for (int i = 0; i < nm; i++) {
-    const Msg& m = msgs[i];
-    if (m.n < 4 || m.b[0] != 0x49 || m.b[1] != pid) continue;
-    for (int j = 3; j < m.n && k + 1 < cap; j++) {
-      uint8_t c = m.b[j];
-      bool ok = vinOnly ? ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')) : (c >= 0x20 && c < 0x7F);
-      if (ok) dst[k++] = (char)c;
-    }
-  }
-  dst[k] = 0;
-}
-static void readVin() {
-  vinBuf[0] = 0; vinBrand = -1; carBuf[0] = 0;
-  int nm = parseMsgs(elmQuery("0902", 5000), msgs, MAXM);
-  collectAscii(nm, 0x02, vinBuf, sizeof vinBuf, true);
-  if (strlen(vinBuf) < 11) { vinBuf[0] = 0; return; }
-  vinBrand = brandFromVin(vinBuf);
-  const char* mdl = modelFromVin(vinBrand, vinBuf);
-  const char* br = brandName(vinBrand);
-  if (mdl[0]) snprintf(carBuf, sizeof carBuf, "%s", mdl);
-  else if (br[0]) snprintf(carBuf, sizeof carBuf, "%s", br);
-  else snprintf(carBuf, sizeof carBuf, "VIN %.3s", vinBuf);
-  vinNew = true;
-}
-static void doEcuInfo() {
-  int nm = parseMsgs(elmQuery("090A", 4000), msgs, MAXM);
-  collectAscii(nm, 0x0A, ecuName, sizeof ecuName, false);
-  nm = parseMsgs(elmQuery("0904", 4000), msgs, MAXM);
-  collectAscii(nm, 0x04, calId, sizeof calId, false);
-  ecuInfoVer = ecuInfoVer + 1;
-}
-
-// ---------- trouble codes ----------
-static void addCode(uint8_t hi, uint8_t lo, bool pend) {
-  if (!hi && !lo) return;
-  char c[6]; snprintf(c, sizeof c, "%c%u%X%02X", "PCBU"[hi >> 6], (hi >> 4) & 3, hi & 0xF, lo);
-  for (int i = 0; i < codeCount; i++) if (!strcmp(codeList[i].code, c)) return;
-  if (codeCount < 24) { strcpy(codeList[codeCount].code, c); codeList[codeCount].pend = pend; codeCount = codeCount + 1; }
-}
-static bool parseCodeMsgs(int nm, uint8_t rsp, bool pend) {     // true if at least one ECU answered with a code list
-  bool got = false;
-  for (int i = 0; i < nm; i++) {
-    const Msg& m = msgs[i];
-    if (m.n < 1 || m.b[0] != rsp) continue;
-    got = true;
-    int off = ((m.n - 1) & 1) ? 2 : 1;                           // CAN replies start with a count byte (odd length), K-line frames do not
-    for (int k = off; k + 1 < m.n; k += 2) addCode(m.b[k], m.b[k + 1], pend);
-  }
-  return got;
-}
-static void doReadCodes() {
-  codeState = 1; codeCount = 0; codeVer = codeVer + 1;
-  String r = elmQuery("03", 4500);
-  int nm = parseMsgs(r, msgs, MAXM);
-  bool got = parseCodeMsgs(nm, 0x43, false);
-  if (!got && r.indexOf("NO DATA") < 0) { codeState = 4; codeVer = codeVer + 1; return; }   // "NO DATA" = nothing stored (some ECUs); silence = no link
-  r = elmQuery("07", 4500);
-  nm = parseMsgs(r, msgs, MAXM);
-  parseCodeMsgs(nm, 0x47, true);
-  codeState = 2; codeVer = codeVer + 1;
-}
-static void doClearCodes() {
-  int nm = parseMsgs(elmQuery("04", 4500), msgs, MAXM); bool ok = false;
-  for (int i = 0; i < nm; i++) if (msgs[i].n >= 1 && msgs[i].b[0] == 0x44) ok = true;
-  if (ok) { codeCount = 0; codeState = 3; mil = false; monValid = false; } else codeState = 4;
-  codeVer = codeVer + 1;
-}
-static const uint8_t FRZ_PID[12] = {0x0C, 0x0D, 0x05, 0x04, 0x06, 0x07, 0x0B, 0x0F, 0x11, 0x10, 0x0E, 0x42};
-static void doFreeze() {
-  frzState = 1; frzCode[0] = 0; frzVer = frzVer + 1;
-  for (int i = 0; i < 12; i++) frzOk[i] = false;
-  uint8_t b[9]; int n = 0;
-  if (!queryPid(0x02, b, n, 3000, 2, 0) || n < 2 || (b[0] == 0 && b[1] == 0)) { frzState = 3; frzVer = frzVer + 1; return; }
-  snprintf(frzCode, sizeof frzCode, "%c%u%X%02X", "PCBU"[b[0] >> 6], (b[0] >> 4) & 3, b[0] & 0xF, b[1]);
-  for (int i = 0; i < 12; i++) {
-    if (abortWait()) return;
-    if (queryPid(FRZ_PID[i], b, n, 2500, 2, 0)) { frzVal[i] = decodePid(FRZ_PID[i], b, n); frzOk[i] = true; }
-  }
-  frzState = 2; frzVer = frzVer + 1;
-}
-
-static bool pollPid(uint8_t pid, int& fails);
-static uint16_t ftAsk = 0, ftSilent = 0;                             // requests for RPM / speed, and how many of them were not answered (the fast-timing watch counts them)
-static uint8_t pidLen(uint8_t id) {                                  // data bytes (SAE J1979) of the PIDs that may be asked together; 0 = ask alone
-  switch (id) {
-    case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0D: case 0x0E: case 0x0F: case 0x11:
-    case 0x2C: case 0x2D: case 0x2E: case 0x2F: case 0x30: case 0x33: case 0x45: case 0x46: case 0x47: case 0x49: case 0x4A: case 0x4C:
-    case 0x51: case 0x52: case 0x5A: case 0x5B: case 0x5C: case 0x61: case 0x62: return 1;
-    case 0x0C: case 0x10: case 0x14: case 0x15: case 0x1F: case 0x21: case 0x22: case 0x23: case 0x31: case 0x32: case 0x3C: case 0x3E:
-    case 0x42: case 0x43: case 0x44: case 0x4D: case 0x4E: case 0x59: case 0x5D: case 0x5E: case 0x63: return 2;
-    case 0x24: case 0x34: return 4;
-  }
-  return 0;
-}
-static void notePidFail(uint8_t pid) { if (++pfail[pid] >= 3) { pfail[pid] = 3; pskip[pid] = iterNow + 30; } }   // 3 misses in a row: leave it alone for 30 rounds
 static void noteRpm() {
   static uint32_t last = 0; uint32_t t = millis();
   if (last && t - last < 3000) obdRpmMs = obdRpmMs ? (uint16_t)((obdRpmMs * 3 + (t - last)) / 4) : (uint16_t)(t - last);
@@ -778,152 +238,6 @@ static bool plausible(uint8_t pid, float v) {                        // "not ava
     case 0x24: case 0x44: return v < 1.9999f;
   }
   return true;
-}
-static void storePid(uint8_t pid, const uint8_t* b, int n, uint32_t t) { float v = decodePid(pid, b, n); if (plausible(pid, v)) { pv[pid] = v; page[pid] = t; } }
-static int queryMulti(const uint8_t* ids, int cnt, uint8_t* got) {  // one request for several PIDs; got[i] = 1 when ids[i] was decoded; returns how many
-  char cmd[24]; int k = snprintf(cmd, sizeof cmd, "01");
-  for (int i = 0; i < cnt; i++) k += snprintf(cmd + k, sizeof cmd - k, "%02X", ids[i]);
-  String r;
-  for (int attempt = 0; attempt < 2; attempt++) {
-    char c2[24]; snprintf(c2, sizeof c2, "%s%s", cmd, cntOk ? "1" : "");
-    r = elmQuery(c2, pollTmo());
-    if (!cntOk || r.indexOf('?') < 0) break;
-    cntOk = false;                                                   // the adapter does not know the digit: ask again without it
-  }
-  int nm = parseMsgs(r, msgs, MAXM), ok = 0; uint32_t t = millis();
-  for (int i = 0; i < nm; i++) {
-    const Msg& m = msgs[i];
-    if (m.n < 3 || m.b[0] != 0x41) continue;
-    int j = 1;
-    while (j < m.n) {
-      uint8_t pid = m.b[j]; int len = pidLen(pid);
-      if (!len || j + 1 + len > m.n) break;
-      for (int q = 0; q < cnt; q++) if (ids[q] == pid && !got[q]) { storePid(pid, m.b + j + 1, len, t); got[q] = 1; ok++; }
-      j += 1 + len;
-    }
-  }
-  return ok;
-}
-static int pollGroup(const uint8_t* ids, int cnt, int& fails) {      // returns how many PIDs the car answered
-  uint8_t got[6] = {0, 0, 0, 0, 0, 0};
-  ftAsk++;
-  int ok = queryMulti(ids, cnt, got);
-  if (ok == 0) {                                                     // nothing decoded: the car is silent, or it does not take combined requests - one plain RPM query tells which
-    int f2 = 0;
-    if (pollPid(0x0C, f2)) { fails = 0; if (++multiBad >= 2) multiOff(); }
-    else fails++;
-    ftSilent++;
-    return 0;
-  }
-  fails = 0; multiBad = 0;
-  if (got[0]) noteRpm();
-  bool all = true;
-  for (int q = 0; q < cnt; q++) { if (got[q]) { pfail[ids[q]] = 0; pskip[ids[q]] = 0; } else { all = false; notePidFail(ids[q]); } }
-  if (all) multiShort = 0; else if (++multiShort >= 6) multiOff();   // the car only answers part of a combined request: back to single requests
-  return ok;
-}
-static bool pollPid(uint8_t pid, int& fails) {
-  uint8_t b[9]; int n = 0;
-  if (pid == 0x0C || pid == 0x0D) ftAsk++;
-  if (queryPid(pid, b, n, pollTmo())) {
-    storePid(pid, b, n, millis()); fails = 0; pfail[pid] = 0; pskip[pid] = 0;
-    if (pid == 0x0C) noteRpm();
-    if (pid == 0x01 && n >= 4) {
-      mil = (b[0] & 0x80) != 0; dtcCount = b[0] & 0x7F;
-      monRaw = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3]; monValid = true; monVer = monVer + 1;
-      ecuDiesel = (b[1] & 0x08) != 0; ecuDieselKnown = true;            // SAE J1979: PID 01 byte B bit 3 = compression ignition
-    }
-    if (pid == 0x51) { int f = b[0]; if (f >= 0x10 && f <= 0x15) ecuHybrid = true; if (f == 4 || f == 0x12) { ecuDiesel = true; ecuDieselKnown = true; } }
-  } else { fails++; notePidFail(pid); if (pid == 0x0C || pid == 0x0D) ftSilent++; return false; }
-  return true;
-}
-
-// ---------- faster ELM timing on CAN (v1.0.12) ----------
-static uint8_t ftState = 0;                                          // 0 not used (K-line, adapter refused), 1 on trial, 2 kept, 3 given up (the adapter did worse with it)
-static char ftBadAddr[18] = "";                                      // the adapter that did worse: not tried again
-static uint16_t ftN = 0, ftMiss = 0;
-static void ftBegin() {
-  ftState = 0; ftN = ftMiss = 0;
-  if (protoNum < 6 || !selAddr[0] || !strcmp(ftBadAddr, selAddr)) return;
-  if (elmQuery("ATAT2", 800).indexOf("OK") < 0) return;              // an adapter without adaptive timing: leave it as it is
-  elmQuery("ATST19", 800);                                           // 25 x 4 ms = 100 ms to wait for an answer (the ELM default is 200 ms)
-  ftState = 1;
-}
-static void ftRevert() {
-  elmQuery("ATAT1", 800); elmQuery("ATST32", 800);                   // the ELM defaults
-  ftState = 3;
-  int f = 0;
-  if (pollPid(0x0C, f)) { strncpy(ftBadAddr, selAddr, sizeof ftBadAddr - 1); ftBadAddr[sizeof ftBadAddr - 1] = 0; protoDirty = true; }   // the car answers now: it was the timing. (Silent still = ignition off, not the adapter's fault: not remembered)
-}
-static void ftWatch(uint16_t asks, uint16_t misses) {                // after each round while the timing is on trial
-  if (ftState != 1) return;
-  ftN += asks; ftMiss += misses;
-  if (ftMiss >= 6 && ftMiss * 3 > ftN) ftRevert();                   // more than 1 request in 3 came back empty: worse than before
-  else if (ftN >= 100) ftState = 2;                                  // 100 requests without trouble: keep it
-}
-
-// ---------- CAN listen (v1.0.12) ----------
-struct LsRow { uint16_t id; uint16_t n; uint8_t d[8]; uint8_t dn; };
-static const int LS_MAX = 40;                                        // distinct IDs followed in "all IDs" mode
-static volatile bool listenWant = false;                             // the CAN listen page is open (set by the UI)
-static volatile uint8_t listenMode = 0, listenGen = 0, listenSt = 0; // mode 0 = ID 202 only, 1 = all IDs; state 0 off, 1 starting, 2 listening, 4 cannot (no CAN 11-bit)
-static volatile uint32_t lsTotal = 0, lsStart = 0; static volatile uint16_t lsRate = 0; static volatile uint8_t lsBuf = 0, lsDistinct = 0;
-static LsRow lsLast, lsTop[5]; static volatile uint8_t lsTopN = 0;  // the last frame of the filtered ID; the five busiest IDs of the last second
-static LsRow lsTab[LS_MAX]; static uint8_t lsTabN = 0; static uint16_t lsWin = 0;
-static void lsLine(const char* s, int k) {                           // "2020B5C0000FF0000": 3 hex digits of ID, then the data bytes (ATH1, spaces off)
-  if (k >= 10 && !strncmp(s, "BUFFERFULL", 10)) { lsBuf = 1; return; }
-  if (k < 3 || k > 19 || ((k - 3) & 1) || !isHexStr(s, k)) return;
-  uint16_t id = (uint16_t)((hv(s[0]) << 8) | (hv(s[1]) << 4) | hv(s[2]));
-  int dn = (k - 3) / 2; uint8_t d[8];
-  for (int i = 0; i < dn; i++) d[i] = (uint8_t)((hv(s[3 + 2 * i]) << 4) | hv(s[4 + 2 * i]));
-  if (listenMode == 0 && id != 0x202) return;
-  lsTotal = lsTotal + 1; lsWin++;
-  if (listenMode == 0) { lsLast.id = id; lsLast.dn = (uint8_t)dn; memcpy(lsLast.d, d, dn); lsLast.n = 1; return; }
-  int i = 0; while (i < lsTabN && lsTab[i].id != id) i++;
-  if (i == lsTabN) { if (lsTabN >= LS_MAX) return; lsTab[i].id = id; lsTab[i].n = 0; lsTabN++; }
-  lsTab[i].n++; lsTab[i].dn = (uint8_t)dn; memcpy(lsTab[i].d, d, dn);
-}
-static void lsSecond() {                                             // once per second: the rate, and the five busiest IDs
-  lsRate = lsWin; lsWin = 0;
-  LsRow top[5]; int nt = 0;
-  for (int i = 0; i < lsTabN; i++) {
-    if (!lsTab[i].n) continue;
-    int pos;
-    if (nt < 5) pos = nt++; else if (lsTab[i].n > top[4].n) pos = 4; else continue;
-    while (pos > 0 && top[pos - 1].n < lsTab[i].n) { top[pos] = top[pos - 1]; pos--; }
-    top[pos] = lsTab[i];
-  }
-  for (int i = 0; i < nt; i++) lsTop[i] = top[i];
-  lsTopN = (uint8_t)nt; lsDistinct = (uint8_t)lsTabN;
-  for (int i = 0; i < lsTabN; i++) lsTab[i].n = 0;
-}
-static void doListen() {
-  uint8_t g = listenGen, mode = listenMode;
-  listenSt = 1; lsTotal = 0; lsRate = 0; lsWin = 0; lsTabN = 0; lsTopN = 0; lsDistinct = 0; lsBuf = 0; lsLast.n = 0; lsLast.dn = 0; lsStart = millis();
-  elmQuery("ATH1", 800);                                             // frames with their ID
-  if (mode == 0) elmQuery("ATCRA202", 800);                          // only the engine data frame (Mazda 3 2017 layout: RPM, speed, pedal)
-  while (linkAvail()) linkRead();
-  linkSend("ATMA");
-  listenSt = 2;
-  char ln[40]; int k = 0; uint32_t tWin = millis();
-  while (listenWant && g == listenGen && !abortWait()) {
-    bool got = false;
-    while (linkAvail()) {
-      char c = (char)linkRead(); got = true;
-      if (c == '\r' || c == '\n') { if (k) lsLine(ln, k); k = 0; }
-      else if (c != ' ' && c != '>') { if (k < 38) ln[k++] = c; else k = 39; }
-    }
-    uint32_t t = millis();
-    if (t - tWin >= 1000) { tWin = t; lsSecond(); }
-    if (!got) vTaskDelay(1);
-  }
-  if (!linkIsUp()) return;
-  linkSend("");                                                      // any character stops the monitor
-  uint32_t t0 = millis(); bool prompt = false;
-  while (millis() - t0 < 1500 && linkIsUp()) { if (linkAvail()) { if (linkRead() == '>') { prompt = true; break; } } else vTaskDelay(1); }
-  if (!prompt) { linkDown(); return; }                               // the adapter does not come back: reconnect (the normal start-up runs again)
-  elmQuery("ATCRA", 800); elmQuery("ATAR", 800); elmQuery("ATH0", 800);   // back to what the polling expects
-  listenSt = 0;
 }
 
 // ---------- Honda K-line, UART straight to a K-line board (v1.0.13) ----------
@@ -941,7 +255,8 @@ static volatile uint8_t klEchoSt = 0;                                // 0 not kn
 static volatile uint8_t klSt = 0;                                    // 0 off, 1 waking the ECU, 2 linked, 3 no answer
 static bool klUp = false;
 struct KlLive { int rpm, spd, ect, iat, map; float tps, batt, inj, ign; bool injOk, ignOk; };
-static bool klAbort() { return linkMode != 1 || scanReq || reconnectReq; }
+static bool mfbActive();
+static bool klAbort() { return mfbActive() || Serial.available() > 0; }       // the Jet Honda APP wants the line (or its first bytes are waiting): the gauge steps back
 static void klOpen() { if (!klUp) { Serial2.begin(10400, SERIAL_8N1, KL_RX, KL_TX); klUp = true; } while (Serial2.available()) Serial2.read(); }
 static void klClose() { if (klUp) { Serial2.end(); klUp = false; } pinMode(KL_TX, OUTPUT); digitalWrite(KL_TX, HIGH); }     // the TX pin rests high: a floating pin must not pull the K line down
 static void klWake() {                                               // K line low for 70 ms, then high for 130 ms: the ECU starts to listen
@@ -953,31 +268,36 @@ static void klWake() {                                               // K line l
 }
 // one request: frame = type, length (whole frame), data, checksum (the frame adds up to 0). Returns the reply length (0 = no usable answer), the reply in r.
 // A single-wire board repeats every byte we send: that echo is recognised by itself (the reply type never equals the request type) and skipped.
+// klRaw: the frame f goes out; the reply is collected into r: the bytes up to and including the length byte (index ml), then the rest of the frame.
+// Returns the reply length, 0 = no answer. Checksum and type are the caller's business (the gauge checks them in klSend, the app does it itself).
+static int klRaw(const uint8_t* f, int fn, int ml, uint32_t tmo, uint8_t* r, int cap) {
+  klOpen();
+  while (Serial2.available()) Serial2.read();
+  Serial2.write(f, fn);
+  static uint8_t b[300]; int k = 0, off = -1; uint32_t t0 = millis(), lim = tmo + (uint32_t)fn * 2;
+  while ((uint32_t)(millis() - t0) < lim) {
+    bool got = false;
+    while (Serial2.available() && k < (int)sizeof b) { b[k++] = (uint8_t)Serial2.read(); got = true; }
+    if (off < 0 && k >= 1) { if (b[0] != f[0]) off = 0; else if (k >= fn) off = memcmp(b, f, fn) ? 0 : fn; }
+    if (off >= 0 && k - off > ml) {
+      int len = b[off + ml];
+      if (len < ml + 2 || len > cap) break;                           // not a frame
+      if (k - off >= len) { memcpy(r, b + off, len); klEchoSt = off ? 1 : 2; return len; }
+    }
+    if (!got) vTaskDelay(1);
+  }
+  return 0;
+}
 static int klSend(uint8_t mt, const uint8_t* d, int dl, uint8_t* r, uint32_t tmo = 350) {
   uint8_t f[12]; int n = 0; f[n++] = mt; f[n++] = (uint8_t)(dl + 3);
   for (int i = 0; i < dl && n < 10; i++) f[n++] = d[i];
   uint8_t s = 0; for (int i = 0; i < n; i++) s = (uint8_t)(s + f[i]);
   f[n++] = (uint8_t)(0x100 - s);
-  while (Serial2.available()) Serial2.read();
-  Serial2.write(f, n);
-  uint8_t b[64]; int k = 0, off = -1; uint32_t t0 = millis(), lim = tmo + (uint32_t)n * 2;
-  while ((uint32_t)(millis() - t0) < lim) {
-    bool got = false;
-    while (Serial2.available() && k < (int)sizeof b) { b[k++] = (uint8_t)Serial2.read(); got = true; }
-    if (off < 0 && k >= 1) { if (b[0] != f[0]) off = 0; else if (k >= n) off = memcmp(b, f, n) ? 0 : n; }
-    if (off >= 0 && k - off >= 2) {
-      int len = b[off + 1];
-      if (len < 4 || len > 40) break;                                // not a frame
-      if (k - off >= len) {
-        uint8_t sum = 0; for (int i = 0; i < len; i++) sum = (uint8_t)(sum + b[off + i]);
-        if (sum || b[off] != (mt & 0x0F)) break;                     // checksum or reply type wrong
-        memcpy(r, b + off, len); klEchoSt = off ? 1 : 2; return len;
-      }
-    }
-    if (klAbort()) break;
-    if (!got) vTaskDelay(1);
-  }
-  return 0;
+  int len = klRaw(f, n, 1, tmo, r, 40);
+  if (len < 4) return 0;
+  uint8_t sum = 0; for (int i = 0; i < len; i++) sum = (uint8_t)(sum + r[i]);
+  if (sum || r[0] != (mt & 0x0F)) return 0;                          // checksum or reply type wrong
+  return len;
 }
 static int klTable(uint8_t t, uint8_t* out, int cap) {               // the data bytes of one table (after "71 tt"); -1 = no answer
   uint8_t d[2] = {0x71, t}, r[44];
@@ -999,8 +319,68 @@ static void klStore(const KlLive& o) {                               // the gaug
   klPut(0x0C, (float)o.rpm, t); klPut(0x0D, (float)o.spd, t); klPut(0x05, (float)o.ect, t); klPut(0x0F, (float)o.iat, t);
   klPut(0x0B, (float)o.map, t); klPut(0x11, fminf(o.tps, 100.0f), t); klPut(0x42, o.batt, t);
   if (o.ignOk) { klPut(0x0E, o.ign, t); psup[0x0E] = true; }
+  if (o.injOk) { pv[0xF1] = o.inj; page[0xF1] = t; psup[0xF1] = true; }         // injector pulse, ms (a gauge-only reading, no OBD-II PID)
   noteRpm();
 }
+// ---------- Jet Honda APP link: MFB-LINK over USB serial ----------
+// Frames: 55 AA | type | lenL lenH | payload | xor(type, lenL, lenH, payload). The answer is type|0x80 with payload[0] = 0 ok, 1 no answer from the ECU, 2 refused.
+// The app asks for PING, WAKE (K low 70 ms, high 130 ms), SENSE (K level) and TXRX (a Honda frame goes out, the ECU's frame comes back, echo removed).
+// While the app talks the gauge keeps its own hands off the K wire, and it shows what the app reads (a table 0x11 answer passing through).
+enum { MFB_PING = 1, MFB_WAKE = 2, MFB_TXRX = 3, MFB_SENSE = 4, MFB_FLIST = 0x13 };
+#define MFB_ID "JET SMART GAUGE K-LINE " FW_VERSION
+static uint8_t mfbB[300]; static uint16_t mfbN = 0;
+static volatile uint32_t mfbAt = 0, mfbHold = 0, mfbFrames = 0; static volatile uint16_t mfbRn = 0; static volatile bool mfbSeen = false;
+static bool mfbActive() { return mfbSeen && (uint32_t)(millis() - mfbAt) < mfbHold; }
+static void mfbReply(uint8_t type, uint8_t st, const uint8_t* d = nullptr, uint16_t n = 0) {
+  uint8_t h[6]; uint16_t L = (uint16_t)(n + 1);
+  h[0] = 0x55; h[1] = 0xAA; h[2] = (uint8_t)(type | 0x80); h[3] = (uint8_t)(L & 255); h[4] = (uint8_t)(L >> 8); h[5] = st;
+  uint8_t x = h[2] ^ h[3] ^ h[4] ^ h[5]; for (uint16_t i = 0; i < n; i++) x ^= d[i];
+  Serial.write(h, 6); if (n) Serial.write(d, n); Serial.write(x);
+}
+static void mfbWatch(const uint8_t* r, int L) {                      // an ECU answer on its way to the app: table 0x11 feeds the gauge's screens, table 0x00 the ECU id
+  uint8_t sum = 0; for (int i = 0; i < L; i++) sum = (uint8_t)(sum + r[i]);
+  if (sum || L < 6 || r[0] != 0x02 || r[2] != 0x71) return;
+  int m = L - 5; if (m > 24) m = 24;
+  if (r[3] == 0x11) {
+    KlLive lv;
+    if (m >= 14 && klDecode(r + 4, m, lv)) { memcpy(klT11, r + 4, m); klT11n = (uint8_t)m; klStore(lv); klOk = klOk + 1; mfbRn = mfbRn + 1; klSt = 2; linkState = 2; }
+  } else if (r[3] == 0x00) { klIdN = (uint8_t)(m > 10 ? 10 : m); memcpy(klId, r + 4, klIdN); }
+}
+static void mfbHandle(uint8_t type, const uint8_t* p, uint16_t n) {
+  mfbAt = millis(); mfbSeen = true; mfbFrames = mfbFrames + 1; mfbHold = 8000;
+  switch (type) {
+    case MFB_PING: mfbReply(type, 0, (const uint8_t*)MFB_ID, (uint16_t)strlen(MFB_ID)); break;
+    case MFB_WAKE: klWake(); mfbReply(type, 0); break;
+    case MFB_SENSE: { klClose(); pinMode(KL_RX, INPUT); vTaskDelay(2); uint8_t v = digitalRead(KL_RX) ? 1 : 0; klOpen(); mfbReply(type, 0, &v, 1); } break;
+    case MFB_TXRX: {
+      if (n < 4) { mfbReply(type, 2); break; }
+      uint8_t ml = p[0]; uint32_t tmo = (uint32_t)p[1] | ((uint32_t)p[2] << 8); static uint8_t rx[256];
+      if (ml > 4) { mfbReply(type, 2); break; }
+      if (p[3] != 0x72 && p[3] != 0xFE) mfbHold = 60000;             // anything but a ping or a table / DTC request (flash, EEPROM): the line stays the app's for a minute
+      int L = klRaw(p + 3, n - 3, ml, tmo, rx, (int)sizeof rx);
+      if (L) { mfbReply(type, 0, rx, (uint16_t)L); mfbWatch(rx, L); } else mfbReply(type, 1);
+    } break;
+    case MFB_FLIST: mfbReply(type, 0); break;                         // no file store on this gauge
+    default: mfbReply(type, 2);                                       // files and sensors: not on this gauge
+  }
+}
+static void mfbFeed(uint8_t v) {
+  if (mfbN == 0) { if (v == 0x55) mfbB[mfbN++] = v; return; }
+  if (mfbN == 1) { if (v == 0xAA) mfbB[mfbN++] = v; else if (v != 0x55) mfbN = 0; return; }
+  if (mfbN >= sizeof mfbB) { mfbN = 0; return; }
+  mfbB[mfbN++] = v;
+  if (mfbN >= 5) {
+    uint16_t L = (uint16_t)(mfbB[3] | (mfbB[4] << 8));
+    if (L > sizeof mfbB - 6) { mfbN = 0; return; }
+    if (mfbN == 6 + L) {
+      uint8_t x = mfbB[2] ^ mfbB[3] ^ mfbB[4]; for (uint16_t i = 0; i < L; i++) x ^= mfbB[5 + i];
+      if (x == mfbB[5 + L]) mfbHandle(mfbB[2], mfbB + 5, L);
+      mfbN = 0;
+    }
+  }
+}
+static void mfbPoll() { while (Serial.available()) mfbFeed((uint8_t)Serial.read()); }
+
 static bool klConnect() {                                            // wake, ping, ECU id (the live table is accepted too): all within a few seconds, or the ECU goes back to sleep
   uint8_t r[44], p = 0x72, o[24];
   for (int a = 0; a < 2 && !klAbort(); a++) {
@@ -1016,51 +396,47 @@ static bool klConnect() {                                            // wake, pi
   return false;
 }
 static void klHexStr(char* d, size_t cap, const uint8_t* b, int n) { size_t k = 0; d[0] = 0; for (int i = 0; i < n && k + 3 < cap; i++) k += snprintf(d + k, cap - k, i ? " %02X" : "%02X", b[i]); }
-static void klRun() {                                                // obdTask: this is the whole link while the K-line mode is on
-  linkDown(); reconnectReq = false; klSt = 0; linkState = 1;
-  while (!klAbort()) {
-    if (!klConnect()) {
-      linkState = 1; klSt = 3;
-      for (int i = 0; i < 12 && !klAbort(); i++) vTaskDelay(100);    // the next wake in about a second
-      continue;
+static void klRun() {                                                // obdTask: the whole link of the gauge
+  klSt = 0; linkState = 1;
+  bool linked = false; int misses = 0; uint16_t rn = 0; uint32_t tRate = millis();
+  for (;;) {
+    mfbPoll();
+    uint32_t now = millis();
+    if (mfbActive()) {                                               // the Jet Honda APP has the line: answer it, keep off the K wire, count what it reads
+      linked = false;
+      if (now - tRate >= 1000) { klRate = mfbRn; mfbRn = 0; tRate = now; }
+      vTaskDelay(1); continue;
     }
-    memset(psup, 0, sizeof psup);
-    { static const uint8_t KP[] = {0x0C, 0x0D, 0x05, 0x0F, 0x0B, 0x11, 0x42}; for (unsigned i = 0; i < sizeof KP; i++) psup[KP[i]] = true; }
-    protoNum = 0; cntOk = true; multiOk = false; kMulti = false; resetPollState(); obdRpmMs = 0;
-    ecuHybrid = false; ecuDieselKnown = true; ecuDiesel = false; mil = false; dtcCount = 0; monValid = false; vinPending = false; ftState = 0; klRate = 0;
-    klSt = 2; linkState = 2;
-    int misses = 0; uint16_t rn = 0; uint32_t tRate = millis();
-    while (!klAbort()) {
-      if (req) {                                                     // the code / freeze / ECU info pages: only the ECU info is available on this link
-        int q = req; req = 0;
-        if (q == 1 || q == 2) { codeState = 4; codeVer = codeVer + 1; }
-        else if (q == 3) { frzState = 3; frzVer = frzVer + 1; }
-        else if (q == 4) { strcpy(ecuName, "HONDA K-LINE"); klHexStr(calId, sizeof calId, klId, klIdN > 6 ? 6 : klIdN); ecuInfoVer = ecuInfoVer + 1; }
+    if (mfbSeen && mfbRn) { mfbRn = 0; }
+    if (!linked) {
+      if (!klConnect()) {
+        if (!klAbort()) { linkState = 1; klSt = 3; klRate = 0; }
+        for (int i = 0; i < 240 && !klAbort(); i++) vTaskDelay(5);   // the next wake in about a second, but the app is served meanwhile
+        continue;
       }
-      if (listenWant) listenSt = 4;                                  // the CAN listen page has nothing to listen to here
-      uint8_t t[24]; int n = klTable(0x11, t, sizeof t); KlLive lv;
-      if (n >= 14 && klDecode(t, n, lv)) {
-        memcpy(klT11, t, n); klT11n = (uint8_t)n; klStore(lv); klOk = klOk + 1; rn++; misses = 0;
-      } else {
-        klBad = klBad + 1;
-        if (++misses >= 4) break;                                    // 4 requests in a row without a usable answer: wake the ECU again
-        vTaskDelay(20);
-      }
-      uint32_t now = millis(); if (now - tRate >= 1000) { klRate = rn; rn = 0; tRate = now; }
-      vTaskDelay(1);
+      memset(psup, 0, sizeof psup);
+      { static const uint8_t KP[] = {0x0C, 0x0D, 0x05, 0x0F, 0x0B, 0x11, 0x42}; for (unsigned i = 0; i < sizeof KP; i++) psup[KP[i]] = true; }
+      protoNum = 0; obdRpmMs = 0;
+      ecuHybrid = false; ecuDieselKnown = true; ecuDiesel = false; mil = false; dtcCount = 0; monValid = false; klRate = 0;
+      klSt = 2; linkState = 2; linked = true; misses = 0; rn = 0; tRate = now;
     }
-    linkState = 1; klSt = klAbort() ? 0 : 3; klRate = 0;
+    if (req) {                                                       // the code / freeze / ECU info pages: only the ECU info is available on this link
+      int q = req; req = 0;
+      if (q == 1 || q == 2) { codeState = 4; codeVer = codeVer + 1; }
+      else if (q == 3) { frzState = 3; frzVer = frzVer + 1; }
+      else if (q == 4) { strcpy(ecuName, "HONDA K-LINE"); klHexStr(calId, sizeof calId, klId, klIdN > 6 ? 6 : klIdN); ecuInfoVer = ecuInfoVer + 1; }
+    }
+    uint8_t t[24]; int n = klTable(0x11, t, sizeof t); KlLive lv;
+    if (n >= 14 && klDecode(t, n, lv)) {
+      memcpy(klT11, t, n); klT11n = (uint8_t)n; klStore(lv); klOk = klOk + 1; rn++; misses = 0;
+    } else {
+      klBad = klBad + 1;
+      if (++misses >= 4) { linked = false; linkState = 1; klSt = 3; klRate = 0; continue; }   // 4 requests in a row without a usable answer: wake the ECU again
+      vTaskDelay(20);
+    }
+    now = millis(); if (now - tRate >= 1000) { klRate = rn; rn = 0; tRate = now; }
+    vTaskDelay(1);
   }
-  klClose(); klSt = 0;
-}
-
-static void detectVehicle() {
-  uint8_t b[9]; int n = 0;
-  ecuHybrid = psup[0x5B]; ecuDieselKnown = false; ecuDiesel = false;
-  int f = 0;
-  pollPid(0x01, f);
-  if (psup[0x51]) pollPid(0x51, f);
-  vinPending = true;                                   // the VIN follows a few rounds later (obdTask), after the first values are on the screen
 }
 
 // CRP: rail pressure from the ECU -> sensor volts through a line  V = V0 + (4.50 - V0) x MPa / full scale  (set on the CRP calibration page)
@@ -1070,156 +446,9 @@ static const int CRP_VTOP = 450;                      // sensor volts x100 at fu
 static int crpMeter = 125; static uint8_t crpMsg = 0; static uint32_t crpMsgAt = 0;   // calibration page: the volts the owner measured with a meter, and the message after Match
 static int crpTrim = 100;                             // % factor on the ECU pressure, to match another tool
 static uint8_t crpSrc = 0;                            // 0 = auto (PID 23, else 59), 1 = PID 23 only, 2 = PID 59 only
-static uint8_t crpFastPid = 0;                        // the rail PID while it is on screen: asked in every request group instead of once per rotation
 static bool crpHave() { return crpSrc == 1 ? psup[0x23] : crpSrc == 2 ? psup[0x59] : (psup[0x23] || psup[0x59]); }
 static uint8_t crpPid() { return crpSrc == 1 ? 0x23 : crpSrc == 2 ? 0x59 : psup[0x23] ? 0x23 : psup[0x59] ? 0x59 : 0; }
-static uint8_t thrFast = 0;                           // the pedal / throttle PID on screen (CAN groups): asked in every request instead of once per rotation
-static uint16_t pidEvery(uint8_t pid, int tier) {          // shortest time between two requests of one PID (ms): fast movers every round, slow ones on a timer
-  uint16_t e;
-  switch (pid) {
-    case 0x5E: e = 300; break;                                                       // fuel rate
-    case 0x78: case 0x79: case 0x7A: case 0x7B: e = 250; break;                      // exhaust gas temperatures
-    case 0x06: case 0x07: case 0x08: case 0x09: e = 400; break;                      // fuel trims
-    case 0x0F: case 0x42: e = 600; break;                                            // intake air temperature, battery volts
-    case 0x05: case 0x5C: case 0x1F: case 0x3C: case 0x3D: case 0x3E: case 0x3F: case 0x5B: e = 1000; break;   // coolant, oil, run time, catalyst, hybrid battery
-    case 0x2F: case 0x33: case 0x46: e = 2500; break;                                // fuel level, barometer, ambient (the screen calls a value old after 8 s)
-    default: e = 0;                                                                  // load, MAP, MAF, throttle, pedal, lambda, rail pressure, torque, timing: as often as the car answers
-  }
-  if (tier == 1 && e < 400) e = 400;                                                 // background PIDs (alerts, trip, graphs) never need more
-  return e;
-}
-static bool pidDue(uint8_t pid, int tier) { uint32_t p = page[pid]; if (!p) return true; uint16_t e = pidEvery(pid, tier); return !e || (uint32_t)(millis() - p) >= e; }
-static int nextWanted(int& rr, int tier) {
-  for (int i = 0; i < 255; i++) {
-    rr = (rr % 255) + 1;
-    if (psup[rr] && want[rr] == tier && rr != 0x0C && rr != 0x0D && rr != 0x01 && rr != crpFastPid && rr != thrFast && (int32_t)(iterNow - pskip[rr]) >= 0 && pidDue((uint8_t)rr, tier)) return rr;
-  }
-  return -1;
-}
-
-static uint32_t autoAt = 0;
-static void autoPick() {
-  doScan();
-  if (btBrowsing || selAddr[0]) return;                  // the owner is on the Bluetooth page / has picked one meanwhile
-  int nObd = 0, top = -999, second = -999, bi = -1; BtDev best; memset(&best, 0, sizeof best);
-  portENTER_CRITICAL(&btMux);
-  for (int i = 0; i < btCount; i++) if (btList[i].obd) {
-    nObd++; int r = btList[i].rssi;
-    if (r > top) { second = top; top = r; bi = i; } else if (r > second) second = r;
-  }
-  if (bi >= 0) best = btList[bi];
-  portEXIT_CRITICAL(&btMux);
-  if (bi < 0 || (nObd > 1 && top - second < 8)) return;  // none, or several that are about equally close: the owner picks
-  portENTER_CRITICAL(&btMux);
-  if (!selAddr[0]) {
-    memcpy(selAddr, best.addr, sizeof selAddr); strcpy(selName, best.name[0] ? best.name : best.addr);
-    selBle = best.ble; selAType = best.atype; bleTry = 0; selGen = selGen + 1; pinIdx = 0; pinOk = false;
-  }
-  portEXIT_CRITICAL(&btMux);
-  carBuf[0] = 0; vinBuf[0] = 0; pinDirty = true;         // loop() saves the choice
-}
-
-static void pollOther(int& rrFg, int& rrBg, bool bg, int& fails) {   // one PID that is not RPM/speed: the ones on screen first, background ones (alerts, trip, graphs) in between
-  int p = nextWanted(bg ? rrBg : rrFg, bg ? 1 : 2);
-  if (p < 0) p = nextWanted(bg ? rrFg : rrBg, bg ? 2 : 1);
-  if (p >= 0) pollPid((uint8_t)p, fails);
-}
-void obdTask(void*) {
-  int rrFg = 0, rrBg = 0, fails = 0, iter = 0; uint32_t lastMil = 0;
-  for (;;) {
-    if (scanReq) { scanReq = false; doScan(); continue; }
-    if (linkMode == 1) { klRun(); continue; }                       // Honda K-line board: no Bluetooth, no ELM327
-    if (demoMode || !selAddr[0]) {            // demo, or OBD mode with no adapter chosen yet
-      linkDown();
-      linkState = demoMode ? 0 : 3;
-      if (!demoMode && !btBrowsing && millis() > 2500 && (autoAt == 0 || millis() - autoAt > 25000)) {   // nothing chosen yet: search by itself (first time, then every 25 s)
-        autoAt = millis(); linkState = 1; autoPick(); if (!selAddr[0]) linkState = 3;
-        continue;
-      }
-      vTaskDelay(200); continue;
-    }
-    if (reconnectReq) { reconnectReq = false; linkDown(); }
-    if (!linkIsUp()) {
-      linkState = 1;
-      char sa[18]; bool sb; uint8_t st; uint32_t gen;
-      portENTER_CRITICAL(&btMux); memcpy(sa, selAddr, sizeof sa); sb = selBle; st = selAType; gen = selGen; portEXIT_CRITICAL(&btMux);
-      bool ok = linkConnect(sa, sb, st);
-      if (!ok) {
-        if (!sb && !pinOk && gen == selGen) pinIdx = (pinIdx + 1) % NPINS;   // wrong PIN? the next common one is tried on the next attempt
-        if (!scanReq && !reconnectReq) vTaskDelay(1500);
-        continue;
-      }
-      if (demoMode || scanReq || reconnectReq) continue;
-      if (!elmInit()) {
-        if (sb && !elmAlive && gen == selGen) bleTry = bleTry + 1;      // silent: try the next GATT candidate (an ELM that talks but has no car yet is not a reason)
-        if (!(scanReq || reconnectReq || demoMode)) { linkDown(); vTaskDelay(2000); }
-        continue;
-      }
-      if (!sb && gen == selGen && (!pinOk || pinIdx != pinSaved)) { pinOk = true; pinDirty = true; }   // this PIN works: remember it
-      discoverPids(); detectVehicle(); ftBegin(); fails = 0; iter = 0; linkState = 2; lastMil = millis();
-    }
-    while (!demoMode && linkIsUp() && fails < 8 && !scanReq && !reconnectReq) {
-      if (req == 1) { req = 0; doReadCodes(); }
-      else if (req == 2) { req = 0; doClearCodes(); }
-      else if (req == 3) { req = 0; doFreeze(); }
-      else if (req == 4) { req = 0; doEcuInfo(); }
-      if (listenWant && !demoMode) {
-        if (protoNum == 6 || protoNum == 8) { doListen(); fails = 0; lastMil = millis(); continue; }      // 11-bit CAN: the polling waits while the page listens
-        listenSt = 4;                                                                                    // anything else: nothing to listen to, the polling goes on
-      }
-      iter++; iterNow = (uint32_t)iter;
-      uint16_t ftA0 = ftAsk, ftS0 = ftSilent;
-      { uint8_t cp = crpPid(); crpFastPid = (cp && psup[cp] && want[cp] == 2 && (int32_t)(iterNow - pskip[cp]) >= 0) ? cp : 0; }
-      thrFast = 0;
-      if (multiOk && protoNum >= 6) {                                                       // CAN: the pedal (else the throttle) on screen travels with RPM in every request; K-line has no room for it
-        static const uint8_t TP[2] = {0x49, 0x11};                                          // accelerator pedal D first, then throttle position (they follow each other)
-        for (int i = 0; i < 2 && !thrFast; i++) if (psup[TP[i]] && want[TP[i]] == 2 && (int32_t)(iterNow - pskip[TP[i]]) >= 0) thrFast = TP[i];
-      }
-      if (vinPending && iter >= 6) { vinPending = false; readVin(); }
-      if (multiOk && protoNum >= 6) {
-        // CAN: RPM, speed and up to 4 more PIDs travel in ONE request (the last place rotates the background PIDs: alerts, trip, graphs)
-        uint8_t ids[6]; int cnt = 0, single = -1;
-        ids[cnt++] = 0x0C; ids[cnt++] = 0x0D;
-        if (crpFastPid && pidLen(crpFastPid)) ids[cnt++] = crpFastPid;                      // the rail pressure on screen: in every request
-        if (thrFast) ids[cnt++] = thrFast;                                                  // so is the pedal / throttle (at most 2 pinned in all: 2 places stay for the rotation)
-        int nOther = 6 - cnt;
-        for (int k = 0; k < nOther; k++) {
-          bool bg = (k == nOther - 1);
-          int p = nextWanted(bg ? rrBg : rrFg, bg ? 1 : 2);
-          if (p < 0) p = nextWanted(bg ? rrFg : rrBg, bg ? 2 : 1);
-          if (p < 0) continue;
-          bool dup = false; for (int q = 0; q < cnt; q++) if (ids[q] == p) dup = true;
-          if (dup) continue;
-          if (pidLen((uint8_t)p)) ids[cnt++] = (uint8_t)p; else if (single < 0) single = p;
-        }
-        pollGroup(ids, cnt, fails);
-        if (single >= 0 && multiOk) pollPid((uint8_t)single, fails);
-      } else if (kMulti && protoNum >= 3 && protoNum <= 5) {
-        // K-line, pair mode: RPM + speed in ONE request, then one ordinary PID, twice per round -> RPM every 2nd request
-        static const uint8_t RS[2] = {0x0C, 0x0D};
-        for (int h = 0; h < 2 && kMulti && fails < 8 && !abortWait(); h++) {
-          if (pollGroup(RS, 2, fails) < 2 && !abortWait()) pollPid(0x0D, fails);        // the car gave only one of them: speed is asked alone
-          if (crpFastPid && h == 0) pollPid(crpFastPid, fails);                         // rail pressure on screen: once per round
-          else pollOther(rrFg, rrBg, iter % 4 == 3 && h == (crpFastPid ? 1 : 0), fails);
-        }
-      } else {
-        // one PID per request: RPM twice per round (the gauge people watch), speed once, then the others (K-line: 1, CAN fallback: 2)
-        pollPid(0x0C, fails); pollPid(0x0D, fails); pollPid(0x0C, fails);
-        int others = protoNum >= 6 || protoNum == 0 ? 2 : 1;
-        int bgk = (crpFastPid && others > 1) ? 1 : 0;
-        for (int k = 0; k < others; k++) {
-          if (crpFastPid && ((others > 1 && k == 0) || (others == 1 && (iter & 1) == 0))) pollPid(crpFastPid, fails);   // rail pressure on screen: every round (CAN fallback) / every 2nd round (K-line)
-          else pollOther(rrFg, rrBg, iter % 4 == 3 && k == bgk, fails);                // on-screen PIDs 3 rounds out of 4, background ones in between
-        }
-      }
-      ftWatch((uint16_t)(ftAsk - ftA0), (uint16_t)(ftSilent - ftS0));
-      if (millis() - lastMil > (protoNum >= 6 ? 2000u : 4000u)) { pollPid(0x01, fails); lastMil = millis(); }   // warning lamp / readiness bits (K-line: every request counts, so less often)
-      vTaskDelay(1);
-    }
-    linkDown();
-    linkState = 1; if (!scanReq && !reconnectReq) vTaskDelay(300);
-  }
-}
+void obdTask(void*) { for (;;) klRun(); }                          // the only link of the gauge: Honda K-line (v1.0.14)
 
 static float crpMn = 1e9f, crpMx = -1e9f;             // lowest / highest rail pressure (MPa) seen since the CRP page was opened or reset
 
@@ -1706,34 +935,22 @@ static int firstSupported(const int* cand, int n, int fallback) {
   for (int i = 0; i < n; i++) if ((demoMode || metSupported(cand[i])) && !inSlots(cand[i], -1)) return cand[i];
   return fallback;
 }
-static void autoSlots() {                                       // default tiles for this car (until the user picks tiles themselves)
+static void autoSlots() {                                       // default tiles (until the user picks tiles themselves)
   if (slotsCustom) return;
-  for (int i = 0; i < 6; i++) slots[i] = 255;
-  bool d = vehDiesel();
-  static const int C0[] = {MI_COOL}, C1[] = {MI_OIL, MI_THR, MI_MAP}, C2[] = {MI_LOAD, MI_THR, MI_PEDAL, MI_TIMING}, C3[] = {MI_INTAKE, MI_AMB},
-                   C4[] = {MI_BATT}, C5P[] = {MI_AFR, MI_LAMBDA, MI_MAP, MI_TIMING}, C5D[] = {MI_BOOST, MI_RAIL, MI_MAP, MI_EGT};
-  slots[0] = (uint8_t)firstSupported(C0, 1, MI_COOL);
-  slots[3] = (uint8_t)firstSupported(C3, 2, MI_INTAKE);
-  slots[1] = (uint8_t)firstSupported(C1, 3, MI_OIL);
-  slots[4] = (uint8_t)firstSupported(C4, 1, MI_BATT);
-  slots[2] = (uint8_t)firstSupported(C2, 4, MI_LOAD);
-  slots[5] = (uint8_t)firstSupported(d ? C5D : C5P, 4, MI_AFR);
-  for (int i = 0; i < 6; i++) if (slots[i] >= NMET) slots[i] = (uint8_t)i;
+  slots[0] = MI_COOL; slots[1] = MI_THR; slots[2] = MI_TIMING; slots[3] = MI_INTAKE; slots[4] = MI_BATT; slots[5] = MI_MAP;
 }
 
-// data page: 16 tiles (petrol / diesel sets), items are metric indexes
-static const uint8_t DSET_P[16] = {MI_LAMBDA, MI_LAMBDA, MI_STFT, MI_LTFT, 255, MI_CAT, MI_LOAD, MI_THR, MI_TIMING, MI_MAP, MI_MAF, MI_PEDAL, MI_RAIL, MI_RUNT, MI_BARO, MI_FUEL};
-static const uint8_t DSET_D[16] = {MI_LOAD, MI_THR, MI_PEDAL, MI_TORQ, MI_MAP, MI_BOOST, MI_MAF, MI_BARO, MI_RAIL, MI_EGT, MI_INTAKE, MI_COOL, MI_OIL, MI_FRATE, MI_FUEL, MI_RUNT};
+// data page: 16 tiles, the Honda set. 0..8 are readings from the ECU, 200.. are derived on the gauge (trip, peaks)
+enum { D_TRIP = 300, D_AVGS, D_DRIVE, D_PKRPM, D_PKSPD, D_PKCOOL, D_MINB };
+static const uint8_t DSET_H[16] = {MI_RPM, MI_SPEED, MI_THR, MI_MAP, MI_COOL, MI_INTAKE, MI_BATT, MI_TIMING, 200, 201, 202, 203, 204, 205, 206, 207};
 struct DTile { StrId lab; const char* unit; uint8_t dec; int16_t src; float mul; float bmin, bmax; int8_t mi; };
-static const DTile DT_O2B = {S_O2REAR, "V", 2, 0x15, 1, 0, 1, -1}, DT_CMD = {S_CMDLAM, "", 2, 0x44, 1, 0.6f, 1.4f, -1};
-static void dtileOf(int i, DTile& t) {                           // tile i of the data page for the current vehicle
-  const uint8_t* set = vehDiesel() ? DSET_D : DSET_P;
-  int m = set[i];
-  if (!vehDiesel() && i == 1) { t = DT_CMD; return; }
-  if (!vehDiesel() && i == 4) { t = DT_O2B; return; }
+static const DTile DT_HX[8] = {{S_INJ, "ms", 2, 0xF1, 1, 0, 0, -1}, {S_DIST, "km", 1, D_TRIP, 1, 0, 0, -1}, {S_ASPD, "km/h", 0, D_AVGS, 1, 0, 0, -1}, {S_DTIME, "min", 0, D_DRIVE, 1, 0, 0, -1},
+                              {S_MAXRPM, "", 0, D_PKRPM, 1, 0, 0, -1}, {S_TOPSPEED, "km/h", 0, D_PKSPD, 1, 0, 0, -1}, {S_MAXCOOL, DEGC, 0, D_PKCOOL, 1, 0, 0, -1}, {S_MINBATT, "V", 1, D_MINB, 1, 0, 0, -1}};
+static void dtileOf(int i, DTile& t) {                           // tile i of the data page
+  int m = DSET_H[i];
+  if (m >= 200) { t = DT_HX[m - 200]; return; }
   const Met& M = MET[m]; t.lab = M.lab; t.unit = M.unit; t.dec = M.dec; t.src = M.src; t.mul = M.mul; t.bmin = M.bmin; t.bmax = M.bmax; t.mi = (int8_t)m;
 }
-
 
 // ---------- trip ----------
 static float tDist = 0, tSec = 0, tFuel = 0, tNow = 0, tNowKmL = 0; static bool tEst = false;
@@ -1825,21 +1042,17 @@ static void graphSample() {
 static void loadPrefs() {
   prefs.begin("gauge", true);
   firstRun = !prefs.isKey("inv");
-  thai = prefs.getBool("thai", false); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true);
+  thai = prefs.getBool("thai", false); warnOn = prefs.getBool("warn", true); parkOn = prefs.getBool("park", true); colorful = prefs.getBool("colr", true);
   shiftRpm = prefs.getInt("shift", 6500); bright = prefs.getInt("bright", 80); int th = prefs.getInt("theme", 0);
-  dashMain = prefs.getUChar("dmain", prefs.getBool("crpm", false) ? 1 : 0); if (dashMain > 2) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100); crpFs = prefs.getInt("crpfs2", 180); crpV0 = prefs.getInt("crpv0", 50); crpTrim = prefs.getInt("crptrim", 100); crpSrc = (uint8_t)prefs.getInt("crpsrc", 0);
+  dashMain = prefs.getUChar("dmain", 0); if (dashMain > 1) dashMain = 0; tankL = prefs.getInt("tank", 44); fuelCal = prefs.getInt("fcal", 100); crpFs = prefs.getInt("crpfs2", 180); crpV0 = prefs.getInt("crpv0", 50); crpTrim = prefs.getInt("crptrim", 100); crpSrc = (uint8_t)prefs.getInt("crpsrc", 0);
 #ifdef TFT_INVERSION_ON
   invScreen = prefs.getBool("inv", true);                    // ST7789 boards normally need the inversion on
 #else
   invScreen = prefs.getBool("inv", false);
 #endif
-  linkMode = prefs.getUChar("lmode", 0) == 1 ? 1 : 0;
-  { String fb = prefs.getString("ftbad", ""); strncpy(ftBadAddr, fb.c_str(), sizeof ftBadAddr - 1); ftBadAddr[sizeof ftBadAddr - 1] = 0; }
-  vehModel = prefs.getInt("veh", -1); lastProto = prefs.getInt("proto", 0); userProto = prefs.getInt("uproto", 0); unitL100 = prefs.getBool("unitl", false); slotsCustom = prefs.getBool("slc", false);
+  vehModel = prefs.getInt("veh", -1); unitL100 = prefs.getBool("unitl", false); slotsCustom = prefs.getBool("slc", false);
   flipScr = prefs.getBool("flip", false); autoBike = prefs.getBool("abike", false); autoModel = prefs.getInt("amodel", -1);
   nvmap = prefs.getInt("nvmap", 0); if (nvmap < 0 || nvmap > 8 || prefs.getBytes("vmap", vmap, sizeof vmap) != sizeof vmap) nvmap = 0;
-  String ba = prefs.getString("btaddr", ""), bn = prefs.getString("btname", "");
-  int bk = prefs.getInt("btkind", 0), bp = prefs.getInt("btpin", 0); bool bo = prefs.getBool("btpinok", false);
   uint8_t s[6]; if (prefs.getBytes("slots", s, 6) == 6) { bool good = true; for (int i = 0; i < 6; i++) if (s[i] >= NMET) good = false; if (good) memcpy(slots, s, 6); }
   peaksClear(pkA); { Peaks tmp; if (prefs.getBytes("pkall", &tmp, sizeof tmp) == sizeof tmp) pkA = tmp; }
   prefs.end();
@@ -1854,28 +1067,18 @@ static void loadPrefs() {
   if (vehModel < -1 || vehModel >= NMODEL) vehModel = -1;
   if (autoModel < -1 || autoModel >= NMODEL) autoModel = -1;
   for (int i = 0; i < nvmap; i++) { vmap[i].c[5] = 0; if (vmap[i].m >= NMODEL) vmap[i].m = 0; }
-  if (lastProto < 0 || lastProto > 9) lastProto = 0;
-  if (userProto < 0 || userProto > 9) userProto = 0;
-  uint8_t tmp6[6];
-  pinIdx = pinSaved = (bp >= 0 && bp < NPINS) ? bp : 0; pinOk = bo;
-  if (ba.length() == 17 && parseAddr(ba.c_str(), tmp6)) {
-    strncpy(selAddr, ba.c_str(), sizeof selAddr - 1); cleanName(selName, sizeof selName, bn.c_str());
-    selBle = bk >= 1 && bk <= 5; selAType = selBle ? (uint8_t)(bk - 1) : 0;
-  }
 }
 static void savePrefs() {
   prefs.begin("gauge", false);
-  prefs.putBool("thai", thai); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putUChar("dmain", dashMain);
+  prefs.putBool("thai", thai); prefs.putBool("warn", warnOn); prefs.putBool("park", parkOn); prefs.putBool("colr", colorful); prefs.putUChar("dmain", dashMain);
   prefs.putInt("shift", shiftRpm); prefs.putInt("theme", theme); prefs.putInt("bright", bright); prefs.putBytes("slots", slots, 6); prefs.putBool("slc", slotsCustom);
-  prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putInt("crpfs2", crpFs); prefs.putInt("crpv0", crpV0); prefs.putInt("crptrim", crpTrim); prefs.putInt("crpsrc", crpSrc); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel); prefs.putInt("proto", lastProto); prefs.putInt("uproto", userProto);
+  prefs.putInt("tank", tankL); prefs.putInt("fcal", fuelCal); prefs.putInt("crpfs2", crpFs); prefs.putInt("crpv0", crpV0); prefs.putInt("crptrim", crpTrim); prefs.putInt("crpsrc", crpSrc); prefs.putBool("inv", invScreen); prefs.putInt("veh", vehModel);
   prefs.putBool("unitl", unitL100);
   prefs.putBool("flip", flipScr); prefs.putBool("abike", autoBike); prefs.putInt("amodel", autoModel);
   prefs.putInt("nvmap", nvmap); prefs.putBytes("vmap", vmap, sizeof vmap);
-  prefs.putString("btaddr", selAddr); prefs.putString("btname", selName); prefs.putString("ftbad", ftBadAddr); prefs.putUChar("lmode", linkMode);
-  prefs.putInt("btkind", selBle ? 1 + selAType : 0); prefs.putInt("btpin", pinIdx); prefs.putBool("btpinok", pinOk);
   prefs.putBytes("pkall", &pkA, sizeof pkA);
   prefs.end();
-  pinSaved = pinIdx; firstRun = false;
+  firstRun = false;
 }
 static void applyBright() { ledcWrite(0, map(bright, 0, 100, 5, 255)); }
 static void applyInvert() { tft.invertDisplay(invScreen); }
@@ -1883,7 +1086,7 @@ static void applyInvert() { tft.invertDisplay(invScreen); }
 // =====================================================================================
 //  Screens
 // =====================================================================================
-enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG, PG_UPD, PG_CRP, PG_CRPCAL, PG_LISTEN };
+enum Page { PG_SPLASH, PG_DASH, PG_DATA, PG_ALL, PG_GRAPH, PG_TRIP, PG_PEAKS, PG_CODES, PG_STATUS, PG_FREEZE, PG_ECU, PG_SETUP, PG_SETUP2, PG_BT, PG_VEH, PG_PARK, PG_LOG, PG_UPD, PG_CRP, PG_CRPCAL };
 static Page scr = PG_SPLASH;
 static bool redraw = true;
 static void applyFlip() { tft.setRotation(flipScr ? 3 : 1); invalidatePanel(); redraw = true; }      // the picture is turned 180 degrees; every band is sent again
@@ -1909,7 +1112,7 @@ static void updateWants() {
   markSrc(M_CRP, 1);                                   // rail pressure: asked slowly in the background so the CRP log keeps filling
   markWant(0x0C, 2); markWant(0x0D, 2);
   markWant(0x5E, 2); markWant(0x10, 2); markWant(0x24, 2); markWant(0x44, 2);      // fuel rate / air flow / lambda feed the trip and consumption figures all the time
-  if (scr == PG_DASH) { for (int i = 0; i < 6; i++) markSrc(MET[slots[i]].src, 2); if (dashMain != 2) markSrc(M_CRP, 2); }
+  if (scr == PG_DASH) { for (int i = 0; i < 6; i++) markSrc(MET[slots[i]].src, 2); }
   else if (scr == PG_DATA) { for (int i = 0; i < 16; i++) { DTile t; dtileOf(i, t); markSrc(t.src, 2); } }
   else if (scr == PG_ALL) {
     for (int i = 0; i < NPID; i++) markWant(PIDS[i].id, 1);
@@ -1922,7 +1125,6 @@ static void updateWants() {
   else if (scr == PG_TRIP || scr == PG_PARK) { markSrc(M_FUELRATE, 2); markWant(0x2F, 2); }
   else if (scr == PG_STATUS) { markWant(0x21, 2); markWant(0x30, 2); markWant(0x31, 2); }
   else if (scr == PG_LOG || scr == PG_CRP || scr == PG_CRPCAL) markSrc(M_CRP, 2);
-  listenWant = (scr == PG_LISTEN);
 }
 
 static const char* protoName(int p) {
@@ -1951,7 +1153,45 @@ static const int GX[4] = {9, 86, 163, 240}, GY[4] = {56, 92, 128, 164};         
 
 // ---------- colours of values ----------
 static bool tileGood(const Met& m, float v) { (void)m; (void)v; return false; }
-static uint16_t valCol(const Met& m, float v) { return v >= m.b ? T.hot : v >= m.w ? T.warn : v < m.lo ? T.warn : T.text; }     // white unless it is high or low
+static uint16_t hueOf(int src) {                                       // the colour of a reading while it is normal (white when COLOURFUL is off)
+  if (!colorful) return T.text;
+  switch (src) {
+    case 0x05: return C(92, 210, 255);                                  // coolant: ice blue
+    case 0x5C: return C(255, 170, 90);                                  // oil: amber
+    case 0x0F: return C(110, 235, 200);                                 // intake air: mint
+    case 0x42: return C(255, 214, 82);                                  // battery: yellow
+    case 0x11: case 0x49: case 0x45: return C(120, 236, 120);           // throttle / pedal: green
+    case 0x0B: case M_BOOST: return C(176, 146, 255);                   // manifold pressure: violet
+    case 0x0E: return C(255, 122, 200);                                 // ignition timing: pink
+    case 0x04: case 0x43: return C(255, 140, 120);                      // engine load: coral
+    case 0x2F: return C(110, 200, 255);                                 // fuel level: sky
+    case M_AFR: case M_LAMBDA: return C(190, 150, 255);                 // air / fuel: lilac
+    case 0x0C: return T.accL;
+    case 0xF1: return C(180, 235, 90);                                  // injector pulse: lime
+    case D_TRIP: return C(130, 200, 255); case D_AVGS: return C(150, 225, 170); case D_DRIVE: return C(200, 190, 255);
+    case D_PKRPM: return C(255, 160, 60); case D_PKSPD: return C(255, 200, 120);
+    case D_PKCOOL: return C(92, 210, 255); case D_MINB: return C(255, 214, 82);
+  }
+  return T.text;
+}
+static const uint16_t RPM_RED = C(255, 64, 64);
+static uint16_t rpmCol(float q) {                                       // q = rpm / shift rpm: green -> lime -> yellow -> orange -> red
+  static const Rgb S[5] = {{50, 225, 150}, {170, 230, 80}, {255, 214, 82}, {255, 140, 50}, {255, 64, 64}};
+  static const float Q[5] = {0.0f, 0.4f, 0.65f, 0.88f, 1.0f};
+  if (q <= 0) return c565(S[0]);
+  if (q >= 1) return c565(S[4]);
+  int i = 0; while (i < 3 && q > Q[i + 1]) i++;
+  return mixRgb(S[i], S[i + 1], (int)((q - Q[i]) / (Q[i + 1] - Q[i]) * 256.0f + 0.5f));
+}
+static float fastAtan2(float y, float x) {                              // 1e-4 rad is plenty for a colour
+  float ax = fabsf(x), ay = fabsf(y), mx = fmaxf(ax, ay), mn = fminf(ax, ay);
+  if (mx == 0) return 0;
+  float a = mn / mx, s = a * a, r = ((-0.0464964749f * s + 0.15931422f) * s - 0.327622764f) * s * a + a;
+  if (ay > ax) r = 1.57079637f - r;
+  if (x < 0) r = 3.14159274f - r;
+  return y < 0 ? -r : r;
+}
+static uint16_t valCol(const Met& m, float v) { return v >= m.b ? T.hot : v >= m.w ? T.warn : v < m.lo ? T.warn : hueOf(m.src); }     // its own colour unless it is high or low
 static void clockStr(char* d, size_t n, uint32_t s) { if (s >= 3600) snprintf(d, n, "%u:%02u", (unsigned)(s / 3600), (unsigned)(s / 60 % 60)); else snprintf(d, n, "%u:%02u", (unsigned)(s / 60), (unsigned)(s % 60)); }
 
 static void valueFit(const char* b, const char* unit, int x, int by, uint16_t col, int al, int maxw) {
@@ -1971,7 +1211,7 @@ static void shiftStrip(float rpm) {
   float r0 = (float)max(1800, shiftRpm - 3000); bool over = rpm >= shiftRpm, blink = over && ((uiNow / 140) & 1);
   for (int i = 0; i < 14; i++) {
     float th = r0 + i * (shiftRpm - r0) / 14; bool lit = rpm >= th && !blink, hot = over || i >= 11;
-    uint16_t col = hot ? T.hot : T.acc;
+    uint16_t col = colorful ? (over ? RPM_RED : rpmCol(i / 13.0f)) : (hot ? T.hot : T.acc);
     if (over && blink) { rr(SPX[i], 24, 19, 4, 2, mixRgb(TA.bg, TA.hot, 85)); continue; }
     if (lit) halo(SPX[i], 24, 19, 4, 2, col, 2);
     rr(SPX[i], 24, 19, 4, 2, lit ? col : T.dark);
@@ -1982,15 +1222,14 @@ static void topBar(float rpm) {
   uint16_t dc = linkOk ? T.good : T.warn;
   discA(14, 13, 4.6f, dc, 41); discA(14, 13, 3.6f, dc, 71); disc(14, 13, 2.5f, dc);
   StrId sid = linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_SELDEV;
-  if (linkState == 2) txt(F_LM, linkMode == 1 ? "K-LINE" : selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
+  if (linkState == 2) txt(F_LM, "K-LINE", 22, 16, T.dim);
   else lab(sid, LB_SM, 22, thai ? 17 : 16, T.dim);
-  const char* pn = linkState == 2 ? (linkMode == 1 ? "HONDA" : protoName(protoNum)) : "";
+  const char* pn = linkState == 2 ? "HONDA" : "";
   if (pn[0]) txt(F_LM, pn, 311, 16, T.dim, AL_R);
   else if (linkState != 2) txt(F_LM, FW_VERSION, 311, 16, T.dim, AL_R);         // the screen's firmware version while there is no link
   char nm[32]; carName(nm, sizeof nm);
   if (nm[0]) { char t[32]; if (textW(F_UM, nm) > 150) fitText(t, sizeof t, nm, F_UM, 150); else strcpy(t, nm); txt(F_UM, t, 160, 16, T.accL, AL_C); }
   else if (!demoMode && linkState == 2) lab(S_UNKNOWN, LB_BTNM, 160, thai ? 17 : 16, T.dim, AL_C);
-  else if (!demoMode && linkMode == 0 && linkState == 1 && selName[0]) { char t[32]; fitText(t, sizeof t, selName, F_UM, 150); txt(F_UM, t, 160, 16, T.dim, AL_C); }
   shiftStrip(rpm);
 }
 // mode chips on the first row of the Data / Trip / Codes pages
@@ -2016,7 +1255,8 @@ static void dtile(int i) {
 static const int RCX = 160, RCY = 97, RR = 53;
 static void ringDraw(float rpm) {                                 // tacho: track, glow, gradient arc with round caps, inner disc (per pixel, no angle maths)
   float frac = clampf(rpm / (ringMaxK() * 1000.0f), 0, 1); bool over = rpm >= shiftRpm;
-  uint16_t glow = over ? T.hot : T.acc;
+  uint16_t glow = colorful ? (over ? RPM_RED : rpmCol(rpm / (float)shiftRpm)) : (over ? T.hot : T.acc);
+  const float rq = ringMaxK() * 1000.0f / (float)shiftRpm;                          // rpm per shift rpm at the end of the full sweep (colour of the arc)
   const float PI_ = 3.14159265f, s2 = 0.70710678f;
   float S = 1.5f * PI_ * frac + 0.0001f, ae = 0.75f * PI_ + S;
   float u0x = -s2, u0y = s2, uex = cosf(ae), uey = sinf(ae);
@@ -2052,16 +1292,20 @@ static void ringDraw(float rpm) {                                 // tacho: trac
       for (int k = 0; k < 4; k++) { float cv = clampf(GW[k] - dL + 0.5f, 0, 1); if (cv > 0.004f) *p = blendA(*p, glow, (uint32_t)(GA[k] * cv + 0.5f)); }
       float c5 = clampf(2.5f - dL + 0.5f, 0, 1);
       if (c5 > 0.004f) {
-        uint16_t lc = over ? T.hot : mixRgb(TA.accD, TA.accL, clampi((px - py + 43) * 256 / 212, 0, 256));
+        uint16_t lc;
+        if (colorful) {                                                                // the colour follows the rpm it stands for: green ... red at the shift point
+          float sw = fastAtan2((float)dy, (float)dx) - 0.75f * PI_; if (sw < 0) sw += 2 * PI_;
+          float sf = sw > 1.75f * PI_ ? 0.0f : fminf(sw / (1.5f * PI_), 1.0f);
+          lc = rpmCol(sf * rq);
+        } else lc = over ? T.hot : mixRgb(TA.accD, TA.accL, clampi((px - py + 43) * 256 / 212, 0, 256));
         *p = blendA(*p, lc, (uint32_t)(c5 * 255 + 0.5f));
       }
     }
   }
 }
-// dash centre + bottom bar show one of three values: 0 speed, 1 CRP volts, 2 AFR (a tap on the ring or the bar steps to the next)
+// dash centre + bottom bar show one of two values: 0 speed, 1 trip distance (a tap on the ring or the bar steps to the other)
 static void dashOf(int m, char* t, size_t n, const char*& unit, float& frac, StrId& lid) {
-  if (m == 1) { bool o; float v = metricVal(M_CRP, o); if (o) { int cv = (int)lroundf(clampf(v, 0, 9.99f) * 100); snprintf(t, n, "%d.%02d", cv / 100, cv % 100); } else strcpy(t, "--"); unit = "V"; frac = o ? v / 5 : 0; lid = S_CRPV; }
-  else if (m == 2) { bool o; float a = metricVal(M_AFR, o); if (o) fmtv(t, n, clampf(a, 0, 99.9f), 1); else strcpy(t, "--"); unit = ""; frac = o ? (a - 10) / 10 : 0; lid = S_AFR; }
+  if (m == 1) { fmtv(t, n, tDist, 1); unit = "km"; frac = fmodf(tDist, 10.0f) / 10.0f; lid = S_DIST; }
   else { float sp = gv0(0x0D); snprintf(t, n, "%d", (int)sp); unit = "km/h"; frac = sp / 200; lid = S_SPEED; }
 }
 static void drawDash() {
@@ -2072,9 +1316,9 @@ static void drawDash() {
   char b[16]; fmtThou(b, sizeof b, (int)rpm);
   txtVU(F_NS, b, F_LS, "rpm", RCX, 76, T.accL, T.accL, AL_C);
   char ct[12], bt[12]; const char *cu, *bu; float cf, bf; StrId cl, lid;
-  dashOf(dashMain, ct, sizeof ct, cu, cf, cl); dashOf((dashMain + 1) % 3, bt, sizeof bt, bu, bf, lid);   // centre value, and the one a tap brings next
+  dashOf(dashMain, ct, sizeof ct, cu, cf, cl); dashOf((dashMain + 1) % 2, bt, sizeof bt, bu, bf, lid);   // centre value, and the one a tap brings next
   if (dashMain == 0) { txt(F_NXL, ct, RCX, 115, T.text, AL_C); txt(F_LS, "km/h", RCX, 131, T.dim, AL_C); }
-  else { txt(F_NXM, ct, RCX, 111, T.accL, AL_C); txt(F_LS, dashMain == 1 ? "CRP volts" : "AFR", RCX, 131, T.dim, AL_C); }
+  else { txt(F_NXM, ct, RCX, 111, T.accL, AL_C); txt(F_LS, "trip km", RCX, 131, T.dim, AL_C); }
   tile(9, 168, 302, 29);
   int lw = labW(lid, LB_TILE), vx = max(67, 18 + lw + 8);
   lab(lid, LB_TILE, 18, thai ? 188 : 185, T.dim);
@@ -2088,10 +1332,23 @@ static void tapDash(int x, int y, bool first) {
   if (!first) return;
   if (tabTap(x, y, PG_DASH)) return;
   for (int i = 0; i < 6; i++) if (hit(x, y, DT_X[i], DT_Y[i], 83, 38)) { slots[i] = (uint8_t)nextMetric(slots[i], i); slotsCustom = true; updateWants(); saveSoon(); return; }
-  if (hit(x, y, 94, 34, 132, 132) || hit(x, y, 9, 168, 302, 29)) { dashMain = (uint8_t)((dashMain + 1) % 3); updateWants(); saveSoon(); }
+  if (hit(x, y, 94, 34, 132, 132) || hit(x, y, 9, 168, 302, 29)) { dashMain = (uint8_t)((dashMain + 1) % 2); updateWants(); saveSoon(); }
 }
 
 // ---------- data grid ----------
+static float derivedVal(int s, bool& ok) {                      // the data page's trip / peak tiles
+  ok = true;
+  switch (s) {
+    case D_TRIP: return tDist;
+    case D_AVGS: ok = tSec > 5; return ok ? tDist / (tSec / 3600.0f) : 0;
+    case D_DRIVE: return tSec / 60.0f;
+    case D_PKRPM: ok = pkD.rpm > 0; return pkD.rpm;
+    case D_PKSPD: ok = pkD.spd > 0; return pkD.spd;
+    case D_PKCOOL: ok = pkD.cool > 0; return pkD.cool;
+    case D_MINB: ok = pkD.minB > 1 && pkD.minB < 90; return pkD.minB;
+  }
+  ok = false; return 0;
+}
 static const ModeChip DATA_MODES[4] = {{S_MAIN, 9, 44}, {S_ALLPID, 57, 58}, {S_CRPLOG, 119, 64}, {S_AFRLOG, 187, 64}};
 static void fuelTag() {                                         // Petrol / Diesel / Hybrid: green = read from the car (ECU), grey = from the chosen model until the car has answered
   StrId id = vehDiesel() ? S_FUELD : vehHybrid() ? S_FUELH : S_FUELP;
@@ -2099,13 +1356,13 @@ static void fuelTag() {                                         // Petrol / Dies
 }
 static uint8_t logKind = 0;                                     // log page: 0 = CRP volts, 1 = AFR
 static void drawData() {
-  topBar(rpmUi); modeChips(DATA_MODES, 4, 0); fuelTag();
+  topBar(rpmUi); modeChips(DATA_MODES, 2, 0);
   for (int i = 0; i < 16; i++) {
     DTile t; dtileOf(i, t); int x = GX[i & 3], y = GY[i >> 2];
     tile(x, y, 71, 33);
     lab(t.lab, LB_TILE, x + 6, thai ? y + 14 : y + 11, T.dim, AL_L, 62);
-    bool ok; float f = metricVal(t.src, ok); char b[16] = "--"; uint16_t col = T.dim;
-    if (ok) { float v = f * t.mul; fmtv(b, sizeof b, v, t.dec); col = t.mi >= 0 ? valCol(MET[t.mi], v) : T.text; }
+    bool ok; float f = t.src >= D_TRIP ? derivedVal(t.src, ok) : metricVal(t.src, ok); char b[16] = "--"; uint16_t col = T.dim;
+    if (ok) { float v = f * t.mul; fmtv(b, sizeof b, v, t.dec); col = t.mi >= 0 ? valCol(MET[t.mi], v) : hueOf(t.src); }
     valueFit(b, t.unit, x + 7, y + 28, col, AL_L, 58);
   }
   tabBar(1);
@@ -2113,8 +1370,8 @@ static void drawData() {
 static void tapData(int x, int y, bool first) {
   if (!first) return;
   if (tabTap(x, y, PG_DATA)) return;
-  int m = modeTap(DATA_MODES, 4, x, y);
-  if (m == 1) nav(PG_ALL); else if (m == 2 || m == 3) { logKind = (uint8_t)(m - 2); nav(PG_LOG); }
+  int m = modeTap(DATA_MODES, 2, x, y);
+  if (m == 1) nav(PG_ALL);
 }
 
 // ---------- data log: CRP volts (diesel) or AFR (petrol) for each 1000 rpm band ----------
@@ -2224,11 +1481,20 @@ struct GSer { int8_t ch; uint16_t col; float lo, hi; StrId lab; const char* unit
 static const int CP_X = 36, CP_Y = 70, CP_W = 244, CP_H = 76;                         // plot area
 static void gDefs(GSer* s, int& n) {
   uint16_t c1 = c565(TA.acc2), cy = T.accL;
+  uint16_t k0 = c1, k1 = cy, k2 = T.warn, k3 = VIOLET;                       // series colours: the theme's blues, or one colour per reading
+  if (colorful) {
+    switch (gsel) {
+      case 0: k0 = C(255, 160, 60); k1 = C(92, 210, 255); break;
+      case 1: k0 = hueOf(0x05); k1 = hueOf(0x5C); k2 = hueOf(0x0F); break;
+      case 2: k0 = hueOf(M_AFR); k1 = C(255, 122, 200); break;
+      default: k0 = hueOf(0x42); break;
+    }
+  }
   switch (gsel) {
-    case 0: n = 2; s[0] = GSer{GC_RPM, c1, 0, (float)(ringMaxK() * 1000), S_GRPM, "", 0}; s[1] = GSer{GC_SPD, cy, 0, 200, S_SPEED, "km/h", 0}; break;
-    case 1: n = 3; s[0] = GSer{GC_COOL, c1, 20, 140, S_COOLANT, DEGC, 0}; s[1] = GSer{GC_OIL, T.warn, 20, 140, S_OIL, DEGC, 0}; s[2] = GSer{GC_INT, VIOLET, 20, 140, S_INTAKE, DEGC, 0}; break;
-    case 2: n = 2; s[0] = GSer{GC_AFR, c1, 10, 20, S_AFR, "", 1}; s[1] = GSer{GC_STFT, cy, -25, 25, S_STFT, "%", 1}; break;
-    default: n = 1; s[0] = GSer{GC_BATT, c1, 10, 16, S_BATT, "V", 1}; break;
+    case 0: n = 2; s[0] = GSer{GC_RPM, k0, 0, (float)(ringMaxK() * 1000), S_GRPM, "", 0}; s[1] = GSer{GC_SPD, k1, 0, 200, S_SPEED, "km/h", 0}; break;
+    case 1: n = 3; s[0] = GSer{GC_COOL, colorful ? k0 : c1, 20, 140, S_COOLANT, DEGC, 0}; s[1] = GSer{GC_OIL, colorful ? k1 : k2, 20, 140, S_OIL, DEGC, 0}; s[2] = GSer{GC_INT, colorful ? k2 : k3, 20, 140, S_INTAKE, DEGC, 0}; break;
+    case 2: n = 2; s[0] = GSer{GC_AFR, k0, 10, 20, S_AFR, "", 1}; s[1] = GSer{GC_STFT, k1, -25, 25, S_STFT, "%", 1}; break;
+    default: n = 1; s[0] = GSer{GC_BATT, k0, 10, 16, S_BATT, "V", 1}; break;
   }
 }
 static int16_t gY[3][GN];
@@ -2704,62 +1970,13 @@ static void ecuBox(int y, StrId lb, const char* v) {
   txt(f, t, 18, y + 30, v[0] ? T.text : T.dim);
 }
 static void hexBytes(char* d, size_t cap, const uint8_t* b, int n) { size_t k = 0; d[0] = 0; for (int i = 0; i < n && k + 3 < cap; i++) k += snprintf(d + k, cap - k, i ? " %02X" : "%02X", b[i]); }
-static void drawListen() {
-  subHeader(S_LISTEN, S_COUNT, false);
-  uint8_t mode = listenMode; char b[48];
-  chipS("ID 202", 9, 30, 146, 22, mode == 0); chipId(S_LSALL, 165, 30, 146, 22, mode == 1);
-  tile(9, 58, 302, 50);
-  lab(S_LSRATE, LB_TILE, 18, thai ? 75 : 73, T.dim);
-  snprintf(b, sizeof b, "%u", (unsigned)lsRate);
-  txtVU(F_NL, b, F_LS, "/s", 18, 100, T.text, T.dim, AL_L);
-  lab(S_LSTIM, LB_TILE, 303, thai ? 75 : 73, T.dim, AL_R);
-  txt(F_UM, (ftState == 1 || ftState == 2) ? "ATAT2  ATST19" : "ATAT1  ATST32", 303, 98, T.text, AL_R);
-  tile(9, 112, 302, 96);
-  uint32_t el = uiNow - lsStart; uint32_t tot = lsTotal; bool have = tot > 0;
-  if (mode == 0) {
-    lab(S_LSLAST, LB_TILE, 18, thai ? 129 : 127, T.dim);
-    lab(S_LSDEC, LB_TILE, 303, thai ? 129 : 127, T.dim, AL_R, 190);
-    if (lsLast.n && lsLast.dn) { hexBytes(b, sizeof b, lsLast.d, lsLast.dn); txt(F_UL, b, 18, 156, T.text); } else txt(F_UL, "--", 18, 156, T.dim);
-    if (lsLast.n && lsLast.dn >= 5) {
-      const uint8_t* d = lsLast.d;
-      int rpm = ((d[0] << 8) | d[1]) / 4, spd = ((d[2] << 8) | d[3]) / 100;
-      snprintf(b, sizeof b, "RPM %d   km/h %d   B4 %d", rpm, spd, d[4]); txt(F_UM, b, 18, 190, T.accL);
-    } else txt(F_UM, "RPM --   km/h --   B4 --", 18, 190, T.dim);
-  } else {
-    lab(S_LSIDS, LB_TILE, 18, thai ? 129 : 127, T.dim);
-    snprintf(b, sizeof b, "%u", (unsigned)lsDistinct); txt(F_UM, b, 303, 130, T.text, AL_R);
-    for (int i = 0; i < 5; i++) {
-      int by = 145 + i * 14;
-      if (i < lsTopN) {
-        snprintf(b, sizeof b, "%03X", lsTop[i].id); txt(F_UM, b, 18, by, T.accL);
-        snprintf(b, sizeof b, "%u/s", (unsigned)lsTop[i].n); txt(F_UM, b, 100, by, T.dim, AL_R);
-        hexBytes(b, sizeof b, lsTop[i].d, lsTop[i].dn); txt(F_UM, b, 114, by, T.text);
-      } else if (i == 0) txt(F_UM, "--", 18, by, T.dim);
-    }
-  }
-  StrId st = S_LSWAIT; uint16_t col = T.dim;
-  if (!demoMode && linkState != 2) { st = S_CRPNOLINK; col = T.warn; }
-  else if (!demoMode && listenSt == 4) { st = S_LSCAN; col = T.warn; }
-  else if (have && lsBuf) { st = S_LSFULL; col = T.warn; }
-  else if (have) { st = S_LSOK; col = T.good; }
-  else if (el > 2500) { st = S_LSNONE; col = T.warn; }
-  tile(9, 212, 302, 24, 8);
-  lab(st, LB_ROW, 160, thai ? 228 : 226, col, AL_C, 290);
-}
-static void tapListen(int x, int y, bool first) {
-  if (!first) return;
-  if (hitBack(x, y)) { nav(PG_ECU); return; }
-  int m = hit(x, y, 9, 30, 146, 22) ? 0 : hit(x, y, 165, 30, 146, 22) ? 1 : -1;
-  if (m >= 0 && m != listenMode) { listenMode = (uint8_t)m; listenGen = listenGen + 1; lsTotal = 0; lsRate = 0; lsTopN = 0; lsDistinct = 0; lsBuf = 0; lsLast.n = 0; lsStart = millis(); }
-}
 static void drawEcu() {
   topBar(rpmUi); codeChips(3);
   ecuBox(56, S_VIN, vinBuf); ecuBox(96, S_ECUNAME, ecuName); ecuBox(136, S_CALID, calId);
-  tile(9, 175, 198, 22, 8);
+  tile(9, 175, 302, 22, 8);
   lab(S_PROTO, LB_TILE, 18, tby(189), T.dim);
-  chipId(S_LISTEN, 215, 175, 96, 22, false);
-  char pn[32]; if (linkMode == 1) { if (obdRpmMs && linkState == 2) snprintf(pn, sizeof pn, "HONDA  %u ms", (unsigned)obdRpmMs); else strcpy(pn, "HONDA K-LINE"); } else if (!protoNum) strcpy(pn, "--"); else if (obdRpmMs && linkState == 2) snprintf(pn, sizeof pn, "%s  %u ms", protoName(protoNum), (unsigned)obdRpmMs); else snprintf(pn, sizeof pn, "%s", protoName(protoNum));
-  txt(F_UM, pn, 199, thai ? 192 : 189, T.text, AL_R);
+  char pn[32]; if (obdRpmMs && linkState == 2) snprintf(pn, sizeof pn, "HONDA  %u ms", (unsigned)obdRpmMs); else strcpy(pn, "HONDA K-LINE");
+  txt(F_UM, pn, 303, thai ? 192 : 189, T.text, AL_R);
   tabBar(4);
 }
 // the four code pages share one row of chips (and its Read chip); returns true when the touch was handled
@@ -2815,7 +2032,7 @@ static void drawSetup() {
   topBar(rpmUi);
   themeCard(0); themeCard(1);
   for (int i = 0; i < SU_N; i++) setupRow(i);
-  chipId(S_BTNAME, 9, 177, 71, 20, false); chipId(S_VEHICLE, 86, 177, 71, 20, false); chipId(S_MORE, 163, 177, 71, 20, false); chipId(S_UPDTITLE, 240, 177, 71, 20, false);
+  chipId(S_KLINE, 9, 177, 71, 20, false); chipId(S_VEHICLE, 86, 177, 71, 20, false); chipId(S_MORE, 163, 177, 71, 20, false); chipId(S_UPDTITLE, 240, 177, 71, 20, false);
   tabBar(5);
 }
 static bool vmapPut(const char* key, int m) {          // true when something changed
@@ -2878,7 +2095,6 @@ static void tapSetup(int x, int y, bool first) {
 
 // ---------- more settings (setup 2) ----------
 static const int S2_Y0 = 32, S2_H = 29;
-static uint32_t uprotoAt = 0;
 static void setup2Row(int i) {
   int y = S2_Y0 + i * S2_H, h = S2_H; char b[16];
   switch (i) {
@@ -2887,18 +2103,14 @@ static void setup2Row(int i) {
     case 2: rowLabel(y, h, S_BRIGHT, S_COUNT, false); snprintf(b, sizeof b, "%d", bright); stepBtns(y, h, b, "%"); break;
     case 3: rowLabel(y, h, S_TANK, S_TANKD, true); snprintf(b, sizeof b, "%d", tankL); stepBtns(y, h, b, "L"); break;
     case 4: rowLabel(y, h, S_FUELCAL, S_FUELCALD, true); snprintf(b, sizeof b, "%d", fuelCal); stepBtns(y, h, b, "%"); break;
-    case 5:
-      rowLabel(y, h, S_PROTO, S_PROTOD, true);
-      chipS("-", 164, y + 4, 30, h - 9, false); chipS("+", 281, y + 4, 30, h - 9, false);
-      if (userProto == 0) lab(S_AUTO, LB_BTNM, 237, y + (h >> 1) + (thai ? 6 : 5), T.text, AL_C); else txt(F_UM, protoName(userProto), 237, y + (h >> 1) + 5, T.text, AL_C);
-      break;
+    case 5: rowLabel(y, h, S_COLORFUL, S_COLORFULD, true); chipId(S_ON, 164, y + 4, 70, h - 9, colorful); chipId(S_OFF, 238, y + 4, 73, h - 9, !colorful); break;
   }
 }
 static void drawSetup2() {
   subHeader(S_SETUP2, S_COUNT, false);
   txt(F_LM, FW_VERSION, 311, 18, T.dim, AL_R);
   for (int i = 0; i < 6; i++) setup2Row(i);
-  chipId(S_TESTALERT, 9, 210, 96, 22, false); chipId(S_RESETPK, 112, 210, 96, 22, false); chipId(S_CRPCAL, 215, 210, 96, 22, false);
+  chipId(S_TESTALERT, 9, 210, 96, 22, false); chipId(S_RESETPK, 112, 210, 96, 22, false);
 }
 static void startTestAlert();
 static void tapSetup2(int x, int y, bool first) {
@@ -2906,7 +2118,6 @@ static void tapSetup2(int x, int y, bool first) {
     if (hitBack(x, y)) { savePrefs(); nav(PG_SETUP); return; }
     if (hit(x, y, 9, 210, 96, 22)) { startTestAlert(); return; }
     if (hit(x, y, 112, 210, 96, 22)) { peaksClear(pkA); peaksClear(pkD); pkDirty = true; savePrefs(); return; }
-    if (hit(x, y, 215, 210, 96, 22)) { nav(PG_CRP); return; }
   }
   for (int i = 0; i < 6; i++) {
     int ry = S2_Y0 + i * S2_H + 4, rh = S2_H - 9;
@@ -2917,7 +2128,7 @@ static void tapSetup2(int x, int y, bool first) {
     else if (i == 2 && (minus || plus)) { stepVal(bright, 10, 100, plus ? 1 : -1, 10); applyBright(); saveSoon(); }
     else if (i == 3 && (minus || plus)) { stepVal(tankL, 3, 200, plus ? 1 : -1, 1); saveSoon(); }
     else if (i == 4 && (minus || plus)) { stepVal(fuelCal, 70, 130, plus ? 1 : -1, 1); saveSoon(); }
-    else if (i == 5 && first && (minus || plus)) { userProto = (userProto + (plus ? 1 : 9)) % 10; uprotoAt = millis(); saveSoon(); }
+    else if (i == 5 && first && (on || off)) { colorful = on; saveSoon(); }
   }
 }
 
@@ -3013,59 +2224,9 @@ static void tapCrpCalib(int x, int y, bool first) {
   }
 }
 
-// ---------- Bluetooth ----------
-static BtDev btView[MAXBT]; static int nBtView = 0, btOff = 0;
-static void btBuildView() {
-  portENTER_CRITICAL(&btMux); nBtView = btCount; memcpy(btView, btList, sizeof(BtDev) * nBtView); portEXIT_CRITICAL(&btMux);
-  bool byRssi = scanState != 1;                 // keep the rows still while the scan is running
-  for (int i = 1; i < nBtView; i++) {
-    BtDev t = btView[i]; int j = i - 1;
-    while (j >= 0 && btBetter(t, btView[j], byRssi)) { btView[j + 1] = btView[j]; j--; }
-    btView[j + 1] = t;
-  }
-  if (btOff > max(0, nBtView - 4)) btOff = max(0, nBtView - 4);
-}
-static void btStartScan() { if (scanState != 1) { scanState = 1; btVer = btVer + 1; scanReq = true; btOff = 0; } }
-static void btSelRow() {
-  halo(9, 32, 196, 26, 9, T.acc, 2);
-  rr(9, 32, 196, 26, 9, T.panel2, T.acc);
-  if (selAddr[0]) {
-    char t[32]; fitText(t, sizeof t, selName[0] ? selName : selAddr, F_UM, 108); txt(F_UM, t, 19, 49, T.text);
-    StrId s = linkState == 2 ? S_CONNECTED : S_CONNECTING; uint16_t c = linkState == 2 ? T.good : T.warn;
-    lab(s, LB_TILE, 198, tby(48), c, AL_R);
-  } else lab(S_NOSEL, LB_BTNM, 107, 49, T.dim, AL_C);
-  chipId(S_KLHONDA, 211, 32, 100, 26, false);                      // switch to the Honda K-line board
-}
-static void btRow(int r) {
-  int y = 76 + r * 28, i = btOff + r;
-  if (i >= nBtView) return;
-  const BtDev& d = btView[i]; bool sel = d.ble == selBle && !strcmp(d.addr, selAddr);
-  if (sel) rr(9, y, 302, 26, 8, T.panel2, T.acc); else rrG(9, y, 302, 26, 8, TA.panel2, TA.panel, T.line);
-  int x = 19;
-  if (d.obd) { rr(16, y + 6, 30, 14, 5, T.acc); txt(F_LS, "OBD", 31, y + 16, T.onacc, AL_C); x = 54; }
-  const char* nm = d.name[0] ? d.name : d.addr; char t[32]; fitText(t, sizeof t, nm, F_UM, (d.ble ? 176 : 196) - x);
-  txt(F_UM, t, x, y + 18, d.name[0] ? (sel ? T.text : T.accL) : T.dim);
-  if (d.ble) { rr(194, y + 6, 28, 14, 5, T.panel, T.accL); txt(F_LS, "BLE", 208, y + 16, T.accL, AL_C); }
-  if (sel) { ln(228, y + 13, 232, y + 17, T.good); ln(229, y + 13, 233, y + 17, T.good); ln(233, y + 17, 241, y + 7, T.good); ln(234, y + 17, 242, y + 7, T.good); }
-  int lv = !d.rssi ? 0 : d.rssi >= -55 ? 4 : d.rssi >= -67 ? 3 : d.rssi >= -78 ? 2 : 1;
-  for (int k = 0; k < 4; k++) { int h = 4 + k * 3; rr(268 + k * 8, y + 22 - h, 5, h, 1, k < lv ? T.accL : T.dark); }
-}
-static void linkModeSet(uint8_t m) {                                 // Bluetooth ELM327 <-> Honda K-line board
-  if (m == linkMode) return;
-  linkMode = m;
-  carBuf[0] = 0; vinBuf[0] = 0; memset(psup, 0, sizeof psup); engineRan = false; klT11n = 0; klIdN = 0; klOk = 0; klBad = 0; klRate = 0;
-  if (vehModel < 0) {                                              // no model picked: a K-line link is a Honda bike, Bluetooth is whatever the VIN says
-    autoModel = -1;
-    if (m == 1) { autoBike = true; if (tankL == 44) tankL = 6; if (shiftRpm == 6500) shiftRpm = 8500; }
-    else { autoBike = false; if (tankL < 20) tankL = 44; if (shiftRpm > 8000) shiftRpm = 6500; }
-  }
-  autoSlots(); logClear();
-  linkState = (m == 1 || selAddr[0]) ? 1 : 3;
-  scanStop = true; reconnectReq = true;
-  savePrefs(); updateWants(); redraw = true;
-}
+// ---------- K-line page (SETUP > K-LINE) ----------
 static void drawKline() {
-  subHeader(S_KLINE, S_KLBT, true);
+  subHeader(S_KLINE, S_COUNT, false);
   char b[48]; bool up = klSt == 2;
   halo(9, 32, 302, 26, 9, T.acc, 2);
   rr(9, 32, 302, 26, 9, T.panel2, T.acc);
@@ -3093,49 +2254,13 @@ static void drawKline() {
   lab(S_KLECU, LB_TILE, 18, tby(197), T.dim);
   if (klIdN) { uint8_t id[10]; memcpy(id, klId, sizeof id); hexBytes(b, sizeof b, id, klIdN > 8 ? 8 : klIdN); txt(F_UM, b, 303, 198, T.text, AL_R); } else txt(F_UM, "--", 303, 198, T.dim, AL_R);
   StrId st = S_KLWAIT; uint16_t col = T.dim;
-  if (klSt == 2 && klRate > 0) { st = S_KLOKMSG; col = T.good; } else if (klSt == 3) { st = S_KLNONE; col = T.warn; }
+  if (mfbActive()) { st = S_APPLINK; col = T.accL; } else if (klSt == 2 && klRate > 0) { st = S_KLOKMSG; col = T.good; } else if (klSt == 3) { st = S_KLNONE; col = T.warn; }
   tile(9, 210, 302, 26, 8);
   lab(st, LB_ROW, 160, thai ? 227 : 226, col, AL_C, 290);
 }
 static void tapKline(int x, int y, bool first) {
   if (!first) return;
   if (hitBack(x, y)) { nav(PG_SETUP); return; }
-  if (hit(x, y, 247, 4, 64, 20)) linkModeSet(0);
-}
-static void drawBt() {
-  if (linkMode == 1) { drawKline(); return; }
-  subHeader(S_BTDEV, S_SCAN, true);
-  btSelRow();
-  int n = nBtView, st = scanState;
-  lab(S_NEARBY, LB_TILE, 11, tby(70), T.dim);
-  if (st == 1) lab(S_SCANNING, LB_TILE, 309, tby(70), T.warn, AL_R);
-  else if (n > 0) { char c[8]; snprintf(c, sizeof c, "%d", n); int w = labW(S_FOUND, LB_TILE), cw = textW(F_LS, c); txt(F_LS, c, 309 - w - 4 - cw, tby(70), T.accL); lab(S_FOUND, LB_TILE, 309, tby(70), T.dim, AL_R); }
-  for (int r = 0; r < 4; r++) btRow(r);
-  if (n == 0) { StrId m = st == 1 ? S_SCANNING : st == 2 ? S_NOTFOUND : st == 3 ? S_SCANFAIL : S_PRESSSCAN; lab(m, LB_BTNM, 160, 134, st == 3 ? T.hot : T.dim, AL_C); }
-  chipArrow(9, 210, 50, 22, -1, btOff > 0); chipArrow(65, 210, 50, 22, 1, btOff + 4 < n);
-  lab(S_TAPPICK, LB_TILE, 215, tby(225), T.dim, AL_C, 190);
-}
-static void btPick(int i) {                  // the user tapped a device: remember it, switch to OBD mode and connect
-  BtDev d = btView[i];
-  portENTER_CRITICAL(&btMux);
-  bool same = !strcmp(d.addr, selAddr);                         // tapping the adapter that is already chosen keeps what we learned about its PIN
-  memcpy(selAddr, d.addr, sizeof selAddr); strcpy(selName, d.name[0] ? d.name : d.addr);
-  selBle = d.ble; selAType = d.atype; bleTry = 0; selGen = selGen + 1;
-  if (!same) { pinIdx = 0; pinOk = false; }
-  portEXIT_CRITICAL(&btMux);
-  carBuf[0] = 0; vinBuf[0] = 0; linkState = 1; memset(psup, 0, sizeof psup); engineRan = false;
-  scanStop = true; reconnectReq = true;
-  savePrefs(); updateWants();
-}
-static void tapBt(int x, int y, bool first) {
-  if (linkMode == 1) { tapKline(x, y, first); return; }
-  if (!first) return;
-  if (hitBack(x, y)) { nav(PG_SETUP); return; }
-  if (hit(x, y, 211, 32, 100, 26)) { linkModeSet(1); return; }
-  if (hit(x, y, 247, 4, 64, 20)) { btStartScan(); return; }
-  if (hit(x, y, 9, 210, 50, 22)) { if (btOff > 0) btOff = max(0, btOff - 4); return; }
-  if (hit(x, y, 65, 210, 50, 22)) { if (btOff + 4 < nBtView) btOff += 4; return; }
-  for (int r = 0; r < 4; r++) if (hit(x, y, 9, 76 + r * 28, 302, 26) && btOff + r < nBtView) { btPick(btOff + r); return; }
 }
 
 // ---------- vehicle ----------
@@ -3837,11 +2962,9 @@ static void nav(Page p) {
     case PG_FREEZE: freezeRead(); break;
     case PG_ECU: ecuRead(); break;
     case PG_VEH: vehStep = 0; break;
-    case PG_BT: btOff = 0; if (linkMode == 0 && !selAddr[0] && scanState != 1 && !demoMode) btStartScan(); break;
     case PG_PARK: parkAt = millis(); break;
     case PG_UPD: updErr = UE_NONE; break;
     case PG_CRP: crpMn = 1e9f; crpMx = -1e9f; break;
-    case PG_LISTEN: listenMode = 0; listenGen = listenGen + 1; lsTotal = 0; lsRate = 0; lsTopN = 0; lsDistinct = 0; lsBuf = 0; lsLast.n = 0; lsStart = millis(); listenSt = 1; break;
     case PG_CRPCAL: { bool o; float v = metricVal(M_CRP, o); crpMeter = o ? clampi((int)lroundf(v * 100), 50, 450) : 125; crpMsg = 0; } break;
     default: break;
   }
@@ -3867,13 +2990,12 @@ static void drawScene() {
     case PG_ECU: drawEcu(); break;
     case PG_SETUP: drawSetup(); break;
     case PG_SETUP2: drawSetup2(); break;
-    case PG_BT: drawBt(); break;
+    case PG_BT: drawKline(); break;
     case PG_VEH: drawVeh(); break;
     case PG_PARK: drawPark(); break;
     case PG_UPD: drawUpd(); break;
     case PG_CRP: drawCrpCal(); break;
     case PG_CRPCAL: drawCrpCalib(); break;
-    case PG_LISTEN: drawListen(); break;
   }
 #endif
 }
@@ -3905,7 +3027,6 @@ static void renderFrame() {
 #ifndef UPD_BUILD
   rpmUi = rpmFollow();
   if (scr == PG_ALL) { int oN = allN, oP = allPg; allBuild(); if (allN != oN || allPg != oP) updateWants(); }
-  if (scr == PG_BT) btBuildView();
 #endif
   for (int b = 0; b < NBAND; b++) {
     bandY0 = b * BAND_H; bandY1 = bandY0 + BAND_H;
@@ -3922,7 +3043,6 @@ static void renderFrame() {
 
 #ifndef UPD_BUILD
 static void tapStatus(int x, int y, bool first) {
-  if (first && scr == PG_ECU && hit(x, y, 215, 175, 96, 22)) { nav(PG_LISTEN); return; }
   if (first) codeTouch(x, y, scr);
 }
 #endif
@@ -3948,13 +3068,12 @@ static void handleTouch(int x, int y, bool first) {
     case PG_STATUS: case PG_FREEZE: case PG_ECU: tapStatus(x, y, first); return;
     case PG_SETUP: tapSetup(x, y, first); return;
     case PG_SETUP2: tapSetup2(x, y, first); return;
-    case PG_BT: tapBt(x, y, first); return;
+    case PG_BT: tapKline(x, y, first); return;
     case PG_VEH: tapVeh(x, y, first); return;
     case PG_PARK: if (first) nav(PG_DASH); return;
     case PG_UPD: tapUpd(x, y, first); return;
     case PG_CRP: tapCrpCal(x, y, first); return;
     case PG_CRPCAL: tapCrpCalib(x, y, first); return;
-    case PG_LISTEN: tapListen(x, y, first); return;
   }
 #endif
 }
@@ -4015,28 +3134,27 @@ static void parkStep(uint32_t now) {
 }
 
 void setup() {
+  Serial.setRxBufferSize(1024);                                                // the Jet Honda APP link (MFB-LINK) arrives here
   Serial.begin(115200);
   pinMode(4, OUTPUT); pinMode(16, OUTPUT); pinMode(17, OUTPUT);              // CYD RGB LED off (active low)
   digitalWrite(4, HIGH); digitalWrite(16, HIGH); digitalWrite(17, HIGH);
   loadPrefs(); updNoteVersion();
   initPanel();
-  linkState = demoMode ? 0 : ((linkMode == 1 || selAddr[0]) ? 1 : 3);
+  linkState = 1;
+  if (vehModel < 0 && !autoBike) { autoBike = true; autoModel = -1; if (tankL == 44) tankL = 6; if (shiftRpm == 6500) shiftRpm = 8500; }   // no model picked: this gauge is for a Honda bike
   if (demoMode && !slotsCustom) autoSlots();
   tripReset(); peaksClear(pkD); logClear();
   scr = PG_SPLASH; splashAt = millis(); redraw = true; updateWants();
-  xTaskCreatePinnedToCore(obdTask, "obd", 16384, nullptr, 1, nullptr, 0);   // BLE service discovery runs on this stack too
+  xTaskCreatePinnedToCore(obdTask, "obd", 8192, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
   uint32_t now = millis();
   pollTouch(now);
 
-  btBrowsing = (scr == PG_BT && linkMode == 0);
   if (vinNew) { vinNew = false; vinApply(); }
-  if (pinDirty || protoDirty) { pinDirty = false; protoDirty = false; savePrefs(); }
   if (prefsDirty && now - prefsAt > 1500) { prefsDirty = false; savePrefs(); }
   if (pkDirty && now - pkSaved > 60000u) { pkDirty = false; pkSaved = now; savePrefs(); }
-  if (uprotoAt && now - uprotoAt > 1500) { uprotoAt = 0; if (!demoMode) reconnectReq = true; }
   updLoop(now);
 
   static uint32_t tSim = 0, tUI = 0, tGraph = 0; static int lastLs = -1;
