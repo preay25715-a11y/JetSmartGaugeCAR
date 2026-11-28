@@ -1,4 +1,5 @@
 // JetOBD2 Smart Gauge - ESP32 CYD (ESP32-2432S028R), 320x240 landscape
+// v1.0.16: sync icon while the Jet Honda APP is linked; all screen data goes to the app over USB (PIDS, TRIP, INFO, CODES, GRAPH).
 // v1.0.15: Honda K-line board on the OBD2 / 6-pin plug or an ELM327 (Bluetooth Classic or BLE); AFR log (petrol), CRP log (diesel); USB link to the Jet Honda APP (MFB-LINK).
 // OBD-II over ELM327 (Bluetooth Classic or BLE) for Toyota / Honda / Isuzu / Mitsubishi / Nissan / Mazda (and any OBD-II car),
 // demo mode, Thai/English UI, black-blue / black-red themes, boot logo.   Needs ui_assets.h next to this file.
@@ -45,7 +46,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.15"
+#define FW_VERSION "v1.0.16"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -1018,14 +1019,16 @@ static void klStore(const KlLive& o) {                               // the gaug
 // Frames: 55 AA | type | lenL lenH | payload | xor(type, lenL, lenH, payload). The answer is type|0x80 with payload[0] = 0 ok, 1 no answer from the ECU, 2 refused.
 // K wire: PING, WAKE (K low 70 ms, high 130 ms), SENSE (K level) and TXRX (a Honda frame goes out, the ECU's frame comes back, echo removed). While the app uses the wire the
 // gauge in the K-line mode keeps its own hands off it, and shows what the app reads (a table 0x11 answer passing through).
-// Gauge data (no wire, any mode): SENSORS 0x20 (afr, oil temp, O2 volts, CRP volts), LIVE 0x21 (all live readings), LOG_GET 0x22 (the AFR / CRP log tables).
-enum { MFB_PING = 1, MFB_WAKE = 2, MFB_TXRX = 3, MFB_SENSE = 4, MFB_FLIST = 0x13, MFB_SENSORS = 0x20, MFB_LIVE = 0x21, MFB_LOGGET = 0x22 };
+// Gauge data (no wire, any mode): SENSORS 0x20 (afr, oil temp, O2 volts, CRP volts), LIVE 0x21 (all live readings), LOG_GET 0x22 (the AFR / CRP log tables), and from v1.0.16 everything
+// else the screens show: PIDS 0x23 (all PIDs), TRIP 0x24 (trip, per-minute history, peaks), INFO 0x25 (link, settings, tiles, VIN / ECU / monitors), CODES 0x26 (DTCs + freeze frame), GRAPH 0x27.
+enum { MFB_PING = 1, MFB_WAKE = 2, MFB_TXRX = 3, MFB_SENSE = 4, MFB_FLIST = 0x13, MFB_SENSORS = 0x20, MFB_LIVE = 0x21, MFB_LOGGET = 0x22, MFB_PIDS = 0x23, MFB_TRIP = 0x24, MFB_INFO = 0x25, MFB_CODES = 0x26, MFB_GRAPH = 0x27 };
 #define MFB_ID "JET SMART GAUGE " FW_VERSION
 static uint8_t mfbB[300]; static uint16_t mfbN = 0;
 static volatile uint32_t mfbAt = 0, mfbHold = 0, mfbSeenAt = 0, mfbFrames = 0; static volatile uint16_t mfbRn = 0; static volatile bool mfbSeen = false;
 static SemaphoreHandle_t mfbMx = nullptr;                              // one reader of the USB port at a time (obdTask in the K-line mode, mfbTask otherwise)
 static bool mfbActive() { return linkMode == 1 && mfbSeen && (uint32_t)(millis() - mfbAt) < mfbHold; }     // the app has the K wire (K-line mode: the gauge keeps off it)
 static bool mfbLinked() { return mfbSeen && (uint32_t)(millis() - mfbSeenAt) < 8000; }                     // the app talked to the gauge within the last 8 s
+static bool mfbBusy() { return mfbSeen && (uint32_t)(millis() - mfbSeenAt) < 1500; }                       // ... and it is asking right now: the sync icon turns
 static void mfbReply(uint8_t type, uint8_t st, const uint8_t* d = nullptr, uint16_t n = 0) {
   uint8_t h[6]; uint16_t L = (uint16_t)(n + 1);
   h[0] = 0x55; h[1] = 0xAA; h[2] = (uint8_t)(type | 0x80); h[3] = (uint8_t)(L & 255); h[4] = (uint8_t)(L >> 8); h[5] = st;
@@ -1042,7 +1045,7 @@ static void mfbWatch(const uint8_t* r, int L) {                      // an ECU a
     if (m >= 14 && klDecode(r + 4, m, lv)) { memcpy(klT11, r + 4, m); klT11n = (uint8_t)m; klStore(lv); klOk = klOk + 1; mfbRn = mfbRn + 1; klSt = 2; linkState = 2; }
   } else if (r[3] == 0x00) { klIdN = (uint8_t)(m > 10 ? 10 : m); memcpy(klId, r + 4, klIdN); }
 }
-static void mfbSync(uint8_t type, const uint8_t* p, uint16_t n);       // SENSORS / LIVE / LOG_GET: defined with the data log, further down
+static void mfbSync(uint8_t type, const uint8_t* p, uint16_t n);       // SENSORS / LIVE / LOG_GET / PIDS / TRIP / INFO / CODES / GRAPH: defined with the data log, further down
 static void mfbHandle(uint8_t type, const uint8_t* p, uint16_t n) {
   uint32_t now = millis(); mfbSeenAt = now; mfbSeen = true; mfbFrames = mfbFrames + 1;
   if (type == MFB_PING || type == MFB_WAKE || type == MFB_SENSE || type == MFB_TXRX) { mfbAt = now; mfbHold = 8000; }       // the K wire is the app's for a while
@@ -1059,7 +1062,7 @@ static void mfbHandle(uint8_t type, const uint8_t* p, uint16_t n) {
       if (L) { mfbReply(type, 0, rx, (uint16_t)L); mfbWatch(rx, L); } else mfbReply(type, 1);
     } break;
     case MFB_FLIST: mfbReply(type, 0); break;                         // no file store on this gauge
-    case MFB_SENSORS: case MFB_LIVE: case MFB_LOGGET: mfbSync(type, p, n); break;
+    case MFB_SENSORS: case MFB_LIVE: case MFB_LOGGET: case MFB_PIDS: case MFB_TRIP: case MFB_INFO: case MFB_CODES: case MFB_GRAPH: mfbSync(type, p, n); break;
     default: mfbReply(type, 2);                                       // files: not on this gauge
   }
 }
@@ -1548,6 +1551,25 @@ static void strokeSeg(float x0, float y0, float x1, float y1, float wd, uint16_t
   }
 }
 static inline void ln(int x0, int y0, int x1, int y1, uint16_t col) { strokeSeg((float)x0, (float)y0, (float)x1, (float)y1, 1.0f, col, false); }
+// two circular arrows (the sync icon): rotated by ph (radians), radius 5.2, with an arrow head at the end of each half
+static void syncIcon(float cx, float cy, uint16_t col, float ph) {
+  const float R = 5.2f, SW = 2.35f;
+  for (int k = 0; k < 2; k++) {
+    float a0 = ph + k * 3.14159265f;
+    for (int i = 0; i < 6; i++) {
+      float s0 = a0 + SW * i / 6, s1 = a0 + SW * (i + 1) / 6;
+      strokeSeg(cx + R * cosf(s0), cy + R * sinf(s0), cx + R * cosf(s1), cy + R * sinf(s1), 1.7f, col, true);
+    }
+    float e = a0 + SW, ex = cx + R * cosf(e), ey = cy + R * sinf(e), tx = -sinf(e), ty = cosf(e), nx = cosf(e), ny = sinf(e);
+    strokeSeg(ex, ey, ex - tx * 3.4f + nx * 2.5f, ey - ty * 3.4f + ny * 2.5f, 1.7f, col, true);
+    strokeSeg(ex, ey, ex - tx * 3.4f - nx * 2.5f, ey - ty * 3.4f - ny * 2.5f, 1.7f, col, true);
+  }
+}
+// the app link mark: turns (bright) while the app is asking, still (dim) while it is only linked
+static void appSyncMark(float cx, float cy) {
+  bool busy = mfbBusy();
+  syncIcon(cx, cy, busy ? T.accL : T.dim, busy ? (float)(uiNow % 1200) * (6.2831853f / 1200.0f) : 0.6f);
+}
 // "<" or ">" arrow head used on the pager chips (two round-capped strokes, width 1.6)
 static void chevron(int cx, int cy, int dir, uint16_t col) {
   float x0 = (float)(cx - dir * 2), y0 = (float)(cy - 4), x1 = (float)(cx + dir * 2), y1 = (float)cy, x2 = x0, y2 = (float)(cy + 4);
@@ -1685,6 +1707,10 @@ static void subHeader(StrId title, StrId rightId, bool hasRight) {
   chipBox(9, 4, 64, 20, false); chevron(22, 14, -1, T.text); lab(S_BACK, LB_BTNM, 46, chipBy(4, 20), T.text, AL_C, 44);
   lab(title, LB_TTL, 160, thai ? 22 : 20, T.text, AL_C, 150);
   if (hasRight) chipId(rightId, 247, 4, 64, 20, false);
+  if (mfbLinked()) {                                                              // the Jet Honda APP is on the USB port: the mark sits left of the right chip, or of the version text on the setup pages
+    bool ver = title == S_SETUP2 || title == S_CRPCAL || title == S_CRPCALT;
+    appSyncMark(hasRight ? 232.0f : ver ? 311.0f - textW(F_LM, FW_VERSION) - 14.0f : 299.0f, 14.0f);
+  }
 }
 static bool hitBack(int x, int y) { return hit(x, y, 9, 4, 64, 20); }
 
@@ -2124,9 +2150,15 @@ static void topBar(float rpm) {
   if (linkState == 2) txt(F_LM, linkMode == 1 ? "K-LINE" : selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
   else lab(sid, LB_SM, 22, thai ? 17 : 16, T.dim);
   const char* pn = linkState == 2 ? (linkMode == 1 ? "HONDA" : protoName(protoNum)) : "";
-  if (mfbLinked()) { char ap[24]; snprintf(ap, sizeof ap, "APP %s", pn[0] ? pn : "USB"); txt(F_LM, ap, 311, 16, T.accL, AL_R); }     // the Jet Honda APP is on the USB port
-  else if (pn[0]) txt(F_LM, pn, 311, 16, T.dim, AL_R);
-  else if (linkState != 2) txt(F_LM, FW_VERSION, 311, 16, T.dim, AL_R);         // the screen's firmware version while there is no link
+  const char* rt = pn[0] ? pn : linkState != 2 ? FW_VERSION : "";               // right side: the bus / protocol, or the firmware version while there is no link
+  if (rt[0]) txt(F_LM, rt, 311, 16, T.dim, AL_R);
+  if (mfbLinked()) {                                                            // the Jet Honda APP is on the USB port: the sync icon (it turns while the app is asking), and "APP" when there is room
+    uint16_t ic = mfbBusy() ? T.accL : T.dim; int rw = rt[0] ? textW(F_LM, rt) : 0;
+    float icx = 311.0f - rw - (rw ? 14.0f : 8.0f);
+    appSyncMark(icx, 12.0f);
+    char an[32]; carName(an, sizeof an); int nw = an[0] ? min(150, textW(F_UM, an)) : 100, lw = textW(F_LM, "APP");      // "APP" only where the car name (centred) leaves room
+    if (icx - 10 - lw - 3 >= 160 + nw / 2 + 8) txt(F_LM, "APP", (int)icx - 11, 16, ic, AL_R);
+  }
   char nm[32]; carName(nm, sizeof nm);
   if (nm[0]) { char t[32]; if (textW(F_UM, nm) > 150) fitText(t, sizeof t, nm, F_UM, 150); else strcpy(t, nm); txt(F_UM, t, 160, 16, T.accL, AL_C); }
   else if (!demoMode && linkState == 2) lab(S_UNKNOWN, LB_BTNM, 160, thai ? 17 : 16, T.dim, AL_C);
@@ -2351,6 +2383,16 @@ static void tapLog(int x, int y, bool first) {
 static void mP16(uint8_t* b, int o, float v) { int i = (int)lroundf(v); if (i < 0) i = 0; if (i > 65535) i = 65535; b[o] = (uint8_t)i; b[o + 1] = (uint8_t)(i >> 8); }
 static void mS16(uint8_t* b, int o, float v) { int i = (int)lroundf(v); if (i < -32768) i = -32768; if (i > 32767) i = 32767; b[o] = (uint8_t)(i & 255); b[o + 1] = (uint8_t)((i >> 8) & 255); }
 static void mP32(uint8_t* b, int o, uint32_t v) { for (int k = 0; k < 4; k++) b[o + k] = (uint8_t)(v >> (8 * k)); }
+static void mS32(uint8_t* b, int o, float v) { float r = roundf(v); int32_t i = r > 2147483000.0f ? 2147483000 : r < -2147483000.0f ? -2147483000 : (int32_t)r; mP32(b, o, (uint32_t)i); }
+static const uint32_t MFB_NODATA = 0x80000000u;                         // PIDS / CODES: "no value" in a signed 32-bit field
+static void mfbPeaks(uint8_t* b, int& m, const Peaks& p) {              // 50 bytes: rpm, speed x10, coolant x10, oil x10, load x10, intake x10, min / max battery x100, best 0-100 s x100, then 8 times (s)
+  mP16(b, m, p.rpm); mP16(b, m + 2, p.spd * 10); mS16(b, m + 4, p.cool * 10); mS16(b, m + 6, p.oil * 10); mP16(b, m + 8, p.load * 10); mS16(b, m + 10, p.intake * 10);
+  mP16(b, m + 12, p.minB * 100); mP16(b, m + 14, p.maxB * 100); mP16(b, m + 16, p.best * 100); m += 18;
+  const uint32_t t[8] = {p.tr, p.ts, p.tc, p.to, p.tl, p.ti, p.tmin, p.tmax}; for (int i = 0; i < 8; i++) { mP32(b, m, t[i]); m += 4; }
+}
+static void mfbStr(uint8_t* b, int& m, const char* s, int mx) { int L = (int)strlen(s); if (L > mx) L = mx; b[m++] = (uint8_t)L; memcpy(b + m, s, L); m += L; }
+static uint8_t mfbO[256];                                                // reply buffer of the bigger answers (one user at a time: mfbMx)
+
 static void mfbSync(uint8_t type, const uint8_t* p, uint16_t n) {
   bool ok;
   if (type == MFB_SENSORS) {                                          // the app's gauge sensor block: AFR, oil temperature, O2 volts, CRP volts. No GPS and no gear on this gauge (flags stay 0)
@@ -2384,6 +2426,61 @@ static void mfbSync(uint8_t type, const uint8_t* p, uint16_t n) {
     o[4] = (uint8_t)(f & 255); o[5] = (uint8_t)(f >> 8);
     mP32(o, 40, (uint32_t)lroundf(fmaxf(tDist, 0) * 1000)); mP32(o, 44, (uint32_t)lroundf(fmaxf(tSec, 0)));
     mfbReply(type, 0, o, sizeof o); return;
+  }
+  if (type == MFB_PIDS) {                                             // every PID the gauge reads (the ALL PIDS page): page p[0] (default 0), 40 per page. id u8, value x100 s32 (0x80000000 = no data)
+    uint8_t pg = n >= 1 ? p[0] : 0; uint8_t ids[NPID + 1]; int tot = 0;
+    for (int i = 0; i < NPID; i++) if (demoMode || psup[PIDS[i].id]) ids[tot++] = PIDS[i].id;
+    if (demoMode || psup[0xF1]) ids[tot++] = 0xF1;                      // the injector pulse (K-line dash tile) is a gauge-only reading, it has no row in PIDS[]
+    int pages = tot ? (tot + 39) / 40 : 1;
+    if (pg >= pages) { mfbReply(type, 2); return; }
+    int a = pg * 40, c = min(40, tot - a); if (c < 0) c = 0; int m = 4;
+    mfbO[0] = pg; mfbO[1] = (uint8_t)pages; mfbO[2] = (uint8_t)c; mfbO[3] = (uint8_t)tot;
+    for (int k = 0; k < c; k++) {
+      uint8_t id = ids[a + k]; float v = getVal(id, ok); mfbO[m] = id;
+      if (ok) mS32(mfbO, m + 1, v * 100); else mP32(mfbO, m + 1, MFB_NODATA);
+      m += 5;
+    }
+    mfbReply(type, 0, mfbO, (uint16_t)m); return;
+  }
+  if (type == MFB_TRIP) {                                             // the TRIP and PEAKS pages
+    uint8_t* o = mfbO; int m = 0; int nm = nMin > NMIN ? NMIN : nMin;
+    float rk = rangeKm(); float avg = tripAvgL100();
+    o[0] = 1; o[1] = (uint8_t)((tEst ? 1 : 0) | (rk >= 0 ? 2 : 0) | (unitL100 ? 4 : 0)); o[2] = (uint8_t)constrain(tankL, 0, 255); o[3] = (uint8_t)nm;
+    mP32(o, 4, (uint32_t)lroundf(fmaxf(tDist, 0) * 1000)); mP32(o, 8, (uint32_t)lroundf(fmaxf(tSec, 0))); mP32(o, 12, (uint32_t)lroundf(fmaxf(tFuel, 0) * 1000));
+    mP16(o, 16, tNow * 100); mP16(o, 18, tNowKmL * 100); mP16(o, 20, avg * 100); if (rk >= 0) mP16(o, 22, rk); else { o[22] = 0xFF; o[23] = 0xFF; }
+    m = 24;
+    for (int i = 0; i < nm; i++) { mP16(o, m, minFuel[i] * 1000); mP16(o, m + 2, minDist[i] * 1000); m += 4; }        // per minute (oldest first): fuel in ml, distance in m
+    mfbPeaks(o, m, pkD); mfbPeaks(o, m, pkA);                         // this drive, then all time
+    mfbReply(type, 0, o, (uint16_t)m); return;
+  }
+  if (type == MFB_INFO) {                                             // link, settings, the six dash tiles, vehicle, ECU info, readiness monitors
+    uint8_t* o = mfbO; int m = 0; char b[32]; int em = effModel();
+    o[0] = 1; o[1] = linkMode; o[2] = (uint8_t)((linkState == 2 ? 1 : 0) | (demoMode ? 2 : 0) | (vehDiesel() ? 4 : 0) | (vehHybrid() ? 8 : 0) | (vehBike() ? 16 : 0) | (mil ? 32 : 0) | (monValid ? 128 : 0));
+    o[3] = (uint8_t)protoNum; o[4] = (uint8_t)constrain((int)dtcCount, 0, 255); o[5] = (uint8_t)codeState;
+    mP16(o, 6, em >= 0 ? em : 65535); mP16(o, 8, shiftRpm); o[10] = (uint8_t)constrain(tankL, 0, 255); o[11] = (uint8_t)constrain(fuelCal, 0, 255); o[12] = (uint8_t)constrain(bright, 0, 255); o[13] = (uint8_t)theme;
+    o[14] = (uint8_t)((thai ? 1 : 0) | (warnOn ? 2 : 0) | (parkOn ? 4 : 0) | (colorful ? 8 : 0) | (invScreen ? 16 : 0) | (flipScr ? 32 : 0) | (unitL100 ? 64 : 0));
+    o[15] = dashMain; for (int i = 0; i < 6; i++) o[16 + i] = slots[i];
+    mP32(o, 22, monRaw); uint8_t kn = klIdN > 10 ? 10 : klIdN; o[26] = kn; memset(o + 27, 0, 10); memcpy(o + 27, klId, kn); m = 37;
+    mfbStr(o, m, FW_VERSION, 12); carName(b, sizeof b); mfbStr(o, m, b, 27); mfbStr(o, m, vinBuf, 17); mfbStr(o, m, ecuName, 23); mfbStr(o, m, calId, 19);
+    mfbReply(type, 0, o, (uint16_t)m); return;
+  }
+  if (type == MFB_CODES) {                                            // the CODES and FREEZE pages
+    static const uint8_t FZ[12] = {MI_RPM, MI_SPEED, MI_COOL, MI_LOAD, MI_STFT, MI_LTFT, MI_MAP, MI_INTAKE, MI_THR, MI_MAF, MI_TIMING, MI_BATT};      // same order as FZM
+    uint8_t* o = mfbO; int cn = codeCount < 0 ? 0 : codeCount > 24 ? 24 : codeCount, m = 4;
+    o[0] = 1; o[1] = (uint8_t)codeState; o[2] = (uint8_t)cn; o[3] = mil ? 1 : 0;
+    for (int i = 0; i < cn; i++) { memset(o + m, 0, 5); memcpy(o + m, codeList[i].code, strnlen(codeList[i].code, 5)); o[m + 5] = codeList[i].pend; m += 6; }
+    o[m++] = (uint8_t)frzState; memset(o + m, 0, 5); memcpy(o + m, frzCode, strnlen(frzCode, 5)); m += 5;
+    uint16_t vm = 0; for (int i = 0; i < 12; i++) if (frzState == 2 && frzOk[i]) vm |= (uint16_t)(1 << i);
+    mP16(o, m, vm); m += 2;
+    for (int i = 0; i < 12; i++) { if (vm & (1 << i)) mS32(o, m, frzVal[i] * MET[FZ[i]].mul * 100); else mP32(o, m, MFB_NODATA); m += 4; }
+    mfbReply(type, 0, o, (uint16_t)m); return;
+  }
+  if (type == MFB_GRAPH) {                                            // payload: mode (0 = 60 s, 1 = 15 min), channel (rpm, speed, coolant, oil, intake, AFR, STFT, battery)
+    if (n < 2 || p[0] > 1 || p[1] >= GC_N) { mfbReply(type, 2); return; }
+    int md = p[0], ch = p[1], cnt = gCnt[md] > GN ? GN : gCnt[md], m = 8; uint8_t* o = mfbO;
+    o[0] = (uint8_t)md; o[1] = (uint8_t)ch; o[2] = (uint8_t)cnt; o[3] = (uint8_t)gScale(ch); mP32(o, 4, gPush[md]);     // scale = the divisor of the values; the push counter moves with every new sample
+    for (int i = 0; i < cnt; i++) { int16_t v = gH[ch][md][i]; o[m] = (uint8_t)(v & 255); o[m + 1] = (uint8_t)((v >> 8) & 255); m += 2; }                      // -32768 = no data
+    mfbReply(type, 0, o, (uint16_t)m); return;
   }
   // LOG_GET: payload[0] = kind: 0 = AFR per rpm band, 1 = CRP volts per rpm band, 2 = AFR map (throttle rows x rpm columns)
   if (n < 1 || p[0] > 2) { mfbReply(type, 2); return; }
