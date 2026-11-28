@@ -46,7 +46,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.16"
+#define FW_VERSION "v1.0.17"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -264,6 +264,7 @@ static bool selBle = false; static uint8_t selAType = 0;   // ... its radio (Cla
 static volatile uint32_t selGen = 0;              // counts picks, so a connect attempt that was already running for the old pick cannot change the new pick's PIN / GATT choice
 static portMUX_TYPE btMux = portMUX_INITIALIZER_UNLOCKED;
 static bool btReady = false, bleReady = false, linkActiveBle = false;
+static void syncDown();                                  // phone sync over BLE (below, next to bleUp())
 static BLEClient* bleClient = nullptr;             // the one BLE client (created with the BLE stack)
 static BLERemoteCharacteristic* bleTx = nullptr;   // characteristic that takes our commands
 
@@ -340,7 +341,7 @@ static bool startDiscovery() {
   if (BT.discoverAsync(onBtFound)) return true;
   BT.discoverAsyncStop(); vTaskDelay(400);                 // an unfinished earlier inquiry can block a new one
   if (BT.discoverAsync(onBtFound)) return true;
-  if (bleReady) { bleDeinit<BLEDevice>(0); bleReady = false; bleClient = nullptr; bleTx = nullptr; }   // the restart below takes BLE down too; it is set up again when needed
+  if (bleReady) { bleDeinit<BLEDevice>(0); bleReady = false; bleClient = nullptr; bleTx = nullptr; syncDown(); }   // the restart below takes BLE down too; it is set up again when needed
   BT.end(); btReady = false; vTaskDelay(400);              // last resort: restart the Bluetooth stack
   btUp(); vTaskDelay(400);
   btForget(BT, 0);
@@ -364,11 +365,79 @@ static bool bleTxResp = true;                      // write with response (only 
 static int bleTry = 0;                             // which GATT UART candidate to use; advances after a failed ELM handshake
 static uint8_t bleRx[1024]; static uint16_t bleHead = 0, bleTail = 0;   // notification bytes -> ELM reader (guarded by btMux)
 
+// ---- Phone sync over BLE (v1.0.17): the Jet Honda APP link (MFB-LINK) as a Nordic UART service, DATA ONLY ----
+// The gauge stays the central towards the ELM327 adapter and is a peripheral towards the phone at the same time (two GATT connections, one radio).
+// The phone can read everything the screens show (PING, SENSORS, LIVE, LOG_GET, PIDS, TRIP, INFO, CODES, GRAPH); the K wire and the ECU (WAKE, SENSE, TXRX) stay USB-only.
+// Build with -DSYNC_BLE=0 to leave the BLE server out.
+#ifndef SYNC_BLE
+#define SYNC_BLE 1
+#endif
+#if defined(UPD_BUILD) || !SYNC_BLE
+static void syncUp() {}
+static void syncDown() {}
+static int syncReadByte() { return -1; }
+static void syncSend(const uint8_t*, uint16_t) {}
+#else
+#include <BLE2902.h>
+#define SYNC_SVC "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define SYNC_RX  "6e400002-b5a3-f393-e0a9-e50e24dcca9e"          // the phone writes its requests here
+#define SYNC_TX  "6e400003-b5a3-f393-e0a9-e50e24dcca9e"          // the gauge notifies its answers here
+static BLEServer* syncSrv = nullptr; static BLECharacteristic* syncTx = nullptr;
+static volatile bool syncConn = false; static volatile uint16_t syncId = 0;
+static uint8_t syncBuf[512]; static volatile uint16_t syncHead = 0, syncTail = 0;     // bytes written by the phone -> the MFB-LINK parser (guarded by btMux)
+template <class S> static auto syncMtuOf(S* sv, uint16_t id, int) -> decltype(sv->getPeerMTU(id)) { return sv->getPeerMTU(id); }
+template <class S> static uint16_t syncMtuOf(S*, uint16_t, long) { return 23; }
+class SyncSrvCb : public BLEServerCallbacks {
+  void onConnect(BLEServer*, esp_ble_gatts_cb_param_t* p) override { syncId = p->connect.conn_id; syncConn = true; }
+  void onDisconnect(BLEServer*) override { syncConn = false; syncHead = syncTail = 0; BLEDevice::startAdvertising(); }    // the phone left: be found again
+};
+class SyncRxCb : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override {                  // BLE task: just store the bytes, mfbPoll() parses them
+    auto v = c->getValue(); const uint8_t* d = (const uint8_t*)v.c_str(); size_t n = v.length();
+    portENTER_CRITICAL(&btMux);
+    for (size_t i = 0; i < n; i++) { uint16_t nx = (uint16_t)((syncHead + 1) & 511); if (nx == syncTail) break; syncBuf[syncHead] = d[i]; syncHead = nx; }
+    portEXIT_CRITICAL(&btMux);
+  }
+};
+static int syncReadByte() {
+  int c = -1;
+  portENTER_CRITICAL(&btMux);
+  if (syncHead != syncTail) { c = syncBuf[syncTail]; syncTail = (uint16_t)((syncTail + 1) & 511); }
+  portEXIT_CRITICAL(&btMux);
+  return c;
+}
+static void syncSend(const uint8_t* d, uint16_t n) {             // one answer to the phone, in pieces that fit the connection (MTU - 3, at most 180)
+  if (!syncConn || !syncTx || !syncSrv) return;
+  uint16_t mtu = syncMtuOf(syncSrv, (uint16_t)syncId, 0), ch = mtu > 23 ? (uint16_t)(mtu - 3) : 20; if (ch > 180) ch = 180;
+  for (uint16_t o = 0; o < n && syncConn; o += ch) {
+    uint16_t m = (uint16_t)((n - o) > ch ? ch : (n - o));
+    syncTx->setValue((uint8_t*)d + o, m); syncTx->notify();
+    vTaskDelay(2);                                              // the radio queue is small: do not flood it
+  }
+}
+static void syncDown() { syncSrv = nullptr; syncTx = nullptr; syncConn = false; syncHead = syncTail = 0; }   // the Bluetooth stack was restarted: the server is gone
+static void syncUp() {                                           // after BLEDevice::init()
+  if (syncSrv) return;
+  syncSrv = BLEDevice::createServer();
+  syncSrv->setCallbacks(new SyncSrvCb());
+  BLEService* sv = syncSrv->createService(SYNC_SVC);
+  syncTx = sv->createCharacteristic(SYNC_TX, BLECharacteristic::PROPERTY_NOTIFY);
+  syncTx->addDescriptor(new BLE2902());
+  BLECharacteristic* rx = sv->createCharacteristic(SYNC_RX, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  rx->setCallbacks(new SyncRxCb());
+  sv->start();
+  BLEAdvertising* ad = BLEDevice::getAdvertising();
+  ad->addServiceUUID(SYNC_SVC); ad->setScanResponse(true);
+  BLEDevice::startAdvertising();
+}
+#endif
+
 static void bleUp() {
   if (bleReady) return;
   BLEDevice::init("JETOBD-GAUGE");
   bleClient = BLEDevice::createClient();           // one client for the whole run (each createClient() takes a GATT slot)
   bleReady = true;
+  syncUp();                                        // v1.0.17: and the phone can find the gauge over BLE
 }
 static void bleNotify(BLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {   // BLE task: just store the bytes
   portENTER_CRITICAL(&btMux);
@@ -1023,16 +1092,21 @@ static void klStore(const KlLive& o) {                               // the gaug
 // else the screens show: PIDS 0x23 (all PIDs), TRIP 0x24 (trip, per-minute history, peaks), INFO 0x25 (link, settings, tiles, VIN / ECU / monitors), CODES 0x26 (DTCs + freeze frame), GRAPH 0x27.
 enum { MFB_PING = 1, MFB_WAKE = 2, MFB_TXRX = 3, MFB_SENSE = 4, MFB_FLIST = 0x13, MFB_SENSORS = 0x20, MFB_LIVE = 0x21, MFB_LOGGET = 0x22, MFB_PIDS = 0x23, MFB_TRIP = 0x24, MFB_INFO = 0x25, MFB_CODES = 0x26, MFB_GRAPH = 0x27 };
 #define MFB_ID "JET SMART GAUGE " FW_VERSION
-static uint8_t mfbB[300]; static uint16_t mfbN = 0;
+struct MfbP { uint8_t b[300]; uint16_t n; };                            // one frame parser per link
+static MfbP mfbU, mfbBl;                                              // USB, and the phone over BLE (v1.0.17)
+static uint8_t mfbSrc = 0;                                            // which link the frame in hand came in on: 0 = USB, 1 = BLE (data only)
 static volatile uint32_t mfbAt = 0, mfbHold = 0, mfbSeenAt = 0, mfbFrames = 0; static volatile uint16_t mfbRn = 0; static volatile bool mfbSeen = false;
 static SemaphoreHandle_t mfbMx = nullptr;                              // one reader of the USB port at a time (obdTask in the K-line mode, mfbTask otherwise)
 static bool mfbActive() { return linkMode == 1 && mfbSeen && (uint32_t)(millis() - mfbAt) < mfbHold; }     // the app has the K wire (K-line mode: the gauge keeps off it)
 static bool mfbLinked() { return mfbSeen && (uint32_t)(millis() - mfbSeenAt) < 8000; }                     // the app talked to the gauge within the last 8 s
 static bool mfbBusy() { return mfbSeen && (uint32_t)(millis() - mfbSeenAt) < 1500; }                       // ... and it is asking right now: the sync icon turns
 static void mfbReply(uint8_t type, uint8_t st, const uint8_t* d = nullptr, uint16_t n = 0) {
-  uint8_t h[6]; uint16_t L = (uint16_t)(n + 1);
+  uint8_t h[6]; if (n > 256) n = 256; uint16_t L = (uint16_t)(n + 1);
   h[0] = 0x55; h[1] = 0xAA; h[2] = (uint8_t)(type | 0x80); h[3] = (uint8_t)(L & 255); h[4] = (uint8_t)(L >> 8); h[5] = st;
   uint8_t x = h[2] ^ h[3] ^ h[4] ^ h[5]; for (uint16_t i = 0; i < n; i++) x ^= d[i];
+  if (mfbSrc == 1) {                                                  // the request came over BLE: the answer goes back the same way, in one piece for syncSend()
+    uint8_t f[6 + 256 + 1]; memcpy(f, h, 6); if (n) memcpy(f + 6, d, n); f[6 + n] = x; syncSend(f, (uint16_t)(7 + n)); return;
+  }
   Serial.write(h, 6); if (n) Serial.write(d, n); Serial.write(x);
 }
 static void mfbWatch(const uint8_t* r, int L) {                      // an ECU answer on its way to the app: table 0x11 feeds the gauge's screens, table 0x00 the ECU id (K-line mode only)
@@ -1048,7 +1122,8 @@ static void mfbWatch(const uint8_t* r, int L) {                      // an ECU a
 static void mfbSync(uint8_t type, const uint8_t* p, uint16_t n);       // SENSORS / LIVE / LOG_GET / PIDS / TRIP / INFO / CODES / GRAPH: defined with the data log, further down
 static void mfbHandle(uint8_t type, const uint8_t* p, uint16_t n) {
   uint32_t now = millis(); mfbSeenAt = now; mfbSeen = true; mfbFrames = mfbFrames + 1;
-  if (type == MFB_PING || type == MFB_WAKE || type == MFB_SENSE || type == MFB_TXRX) { mfbAt = now; mfbHold = 8000; }       // the K wire is the app's for a while
+  if (mfbSrc == 1 && (type == MFB_WAKE || type == MFB_SENSE || type == MFB_TXRX)) { mfbReply(type, 2); return; }      // the K wire and the ECU are USB-only: nothing wireless ever reaches them
+  if (mfbSrc == 0 && (type == MFB_PING || type == MFB_WAKE || type == MFB_SENSE || type == MFB_TXRX)) { mfbAt = now; mfbHold = 8000; }       // the K wire is the app's for a while
   switch (type) {
     case MFB_PING: mfbReply(type, 0, (const uint8_t*)MFB_ID, (uint16_t)strlen(MFB_ID)); break;
     case MFB_WAKE: klWake(); mfbReply(type, 0); break;
@@ -1066,25 +1141,27 @@ static void mfbHandle(uint8_t type, const uint8_t* p, uint16_t n) {
     default: mfbReply(type, 2);                                       // files: not on this gauge
   }
 }
-static void mfbFeed(uint8_t v) {
-  if (mfbN == 0) { if (v == 0x55) mfbB[mfbN++] = v; return; }
-  if (mfbN == 1) { if (v == 0xAA) mfbB[mfbN++] = v; else if (v != 0x55) mfbN = 0; return; }
-  if (mfbN >= sizeof mfbB) { mfbN = 0; return; }
-  mfbB[mfbN++] = v;
-  if (mfbN >= 5) {
-    uint16_t L = (uint16_t)(mfbB[3] | (mfbB[4] << 8));
-    if (L > sizeof mfbB - 6) { mfbN = 0; return; }
-    if (mfbN == 6 + L) {
-      uint8_t x = mfbB[2] ^ mfbB[3] ^ mfbB[4]; for (uint16_t i = 0; i < L; i++) x ^= mfbB[5 + i];
-      if (x == mfbB[5 + L]) mfbHandle(mfbB[2], mfbB + 5, L);
-      mfbN = 0;
+static void mfbFeedP(MfbP& m, uint8_t v) {
+  if (m.n == 0) { if (v == 0x55) m.b[m.n++] = v; return; }
+  if (m.n == 1) { if (v == 0xAA) m.b[m.n++] = v; else if (v != 0x55) m.n = 0; return; }
+  if (m.n >= sizeof m.b) { m.n = 0; return; }
+  m.b[m.n++] = v;
+  if (m.n >= 5) {
+    uint16_t L = (uint16_t)(m.b[3] | (m.b[4] << 8));
+    if (L > sizeof m.b - 6) { m.n = 0; return; }
+    if (m.n == 6 + L) {
+      uint8_t x = m.b[2] ^ m.b[3] ^ m.b[4]; for (uint16_t i = 0; i < L; i++) x ^= m.b[5 + i];
+      if (x == m.b[5 + L]) mfbHandle(m.b[2], m.b + 5, L);
+      m.n = 0;
     }
   }
 }
 static void mfbPoll() {
   bool lk = mfbMx && xSemaphoreTake(mfbMx, 0) == pdTRUE;
   if (mfbMx && !lk) return;                                           // the other task is serving the app right now
-  while (Serial.available()) mfbFeed((uint8_t)Serial.read());
+  mfbSrc = 0; while (Serial.available()) mfbFeedP(mfbU, (uint8_t)Serial.read());
+  mfbSrc = 1; for (int c, k = 0; k < 400 && (c = syncReadByte()) >= 0; k++) mfbFeedP(mfbBl, (uint8_t)c);       // the phone over BLE (data only)
+  mfbSrc = 0;
   if (lk) xSemaphoreGive(mfbMx);
 }
 static void mfbTask(void*) { for (;;) { if (linkMode != 1) mfbPoll(); vTaskDelay(2); } }       // car mode: obdTask is busy with the ELM327, so the app link has its own little task
@@ -1220,7 +1297,13 @@ static void pollOther(int& rrFg, int& rrBg, bool bg, int& fails) {   // one PID 
 }
 void obdTask(void*) {
   int rrFg = 0, rrBg = 0, fails = 0, iter = 0; uint32_t lastMil = 0;
+#if SYNC_BLE && !defined(UPD_BUILD)
+  bleUp();                                                         // v1.0.17: the BLE stack (and the phone-sync server) is up from the start, in both modes
+#endif
   for (;;) {
+#if SYNC_BLE && !defined(UPD_BUILD)
+    if (!bleReady) bleUp();                                        // ... and again after the Bluetooth stack was restarted
+#endif
     if (scanReq) { scanReq = false; doScan(); continue; }
     if (linkMode == 1) { klRun(); continue; }                       // Honda K-line board: no Bluetooth, no ELM327
     if (demoMode || !selAddr[0]) {            // demo, or OBD mode with no adapter chosen yet
