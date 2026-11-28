@@ -49,7 +49,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.17"
+#define FW_VERSION "v1.0.18"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -59,7 +59,7 @@ Preferences prefs;
 
 
 // ---------- settings ----------
-static const bool demoMode = false;               // the built-in demo was removed in v1.0.2; the constant keeps the old branches compiled out
+static volatile bool demoMode = false;            // DEMO (SETUP 2): a simulated car for the bench. Never saved: after a restart the gauge is back on the real car
 static bool warnOn = true, parkOn = true;
 static bool appBleOn = true;                    // the phone link over Bluetooth LE (Jet Honda APP, Nordic UART): off = no BLE advertising at all
 static bool colorful = true;                     // each reading in its own colour, rainbow tacho (off = the old white / blue look)
@@ -955,7 +955,7 @@ static bool klUp = false;
 struct KlLive { int rpm, spd, ect, iat, map; float tps, batt, inj, ign; bool injOk, ignOk; };
 static bool mfbActive();
 static bool appRxPending();
-static bool klAbort() { return linkMode != 1 || scanReq || reconnectReq || mfbActive() || Serial.available() > 0 || appRxPending(); }       // the Jet Honda APP wants the line (or its first bytes are waiting): the gauge steps back
+static bool klAbort() { return linkMode != 1 || demoMode || scanReq || reconnectReq || mfbActive() || Serial.available() > 0 || appRxPending(); }       // the Jet Honda APP wants the line (or its first bytes are waiting): the gauge steps back
 static void klOpen() { if (!klUp) { Serial2.begin(10400, SERIAL_8N1, KL_RX, KL_TX); klUp = true; } while (Serial2.available()) Serial2.read(); }
 static void klClose() { if (klUp) { Serial2.end(); klUp = false; } pinMode(KL_TX, OUTPUT); digitalWrite(KL_TX, HIGH); }     // the TX pin rests high: a floating pin must not pull the K line down
 static void klWake() {                                               // K line low for 70 ms, then high for 130 ms: the ECU starts to listen
@@ -1048,7 +1048,7 @@ static void mfbReply(uint8_t type, uint8_t st, const uint8_t* d = nullptr, uint1
   Serial.write(h, 6); if (n) Serial.write(d, n); Serial.write(x);
 }
 static void mfbWatch(const uint8_t* r, int L) {                      // an ECU answer on its way to the app: table 0x11 feeds the gauge's screens, table 0x00 the ECU id (K-line mode only)
-  if (linkMode != 1) return;
+  if (linkMode != 1 || demoMode) return;                              // (DEMO: the simulated readings are the only ones the screens see)
   uint8_t sum = 0; for (int i = 0; i < L; i++) sum = (uint8_t)(sum + r[i]);
   if (sum || L < 6 || r[0] != 0x02 || r[2] != 0x71) return;
   int m = L - 5; if (m > 24) m = 24;
@@ -1207,6 +1207,7 @@ static void klRun() {                                                // obdTask:
       if (now - tRate >= 1000) { klRate = mfbRn; mfbRn = 0; tRate = now; }
       vTaskDelay(1); continue;
     }
+    if (demoMode) { linked = false; klSt = 0; klRate = 0; linkState = 0; vTaskDelay(5); continue; }     // DEMO: no wake-ups on the K line, the app link above is still served
     if (!linked) {
       if (!klConnect()) {
         if (!klAbort()) { linkState = 1; klSt = 3; klRate = 0; }
@@ -1409,6 +1410,36 @@ void obdTask(void*) {
   }
 }
 
+// ---------- DEMO: a simulated car (a petrol hatchback; pick a diesel model on the vehicle page for the rail pressure log) ----------
+static float simT = 0;
+static void simStep(float dt) {
+  simT += dt;
+  float ph = sinf(simT / 4) * .5f + .5f, spd = roundf(ph * 110);
+  int g = spd < 15 ? 1 : spd < 35 ? 2 : spd < 55 ? 3 : spd < 80 ? 4 : 5;
+  static const float K[6] = {0, 90, 55, 40, 32, 27};
+  float rpm = fmaxf(850, spd * K[g]) + 700 * fabsf(sinf(simT * 1.3f)), q = spd / 110, w = fminf(1, simT / 60);
+  float cyc = fmodf(simT, 40.0f);                                                  // every 40 s a 4 s pull to the shift point: the shift strip and the alert can be tested
+  if (cyc >= 34 && cyc < 38) rpm += sinf((cyc - 34) * 0.785398f) * (fmaxf((float)shiftRpm + 300.0f, 4000.0f) - rpm);
+  uint32_t t = millis();
+  for (int i = 0; i < NPID; i++) {
+    const Pid& p = PIDS[i]; float f;
+    switch (p.drv) {
+      case 'l': f = q * .8f + .1f * fabsf(sinf(simT)); break;
+      case 's': f = q; break;
+      case 'r': f = fminf(rpm / 7000, 1); break;
+      case 't': f = w; break;
+      case 'o': f = .5f + .5f * sinf(simT * 3 + p.id); break;
+      case 'k': f = simT / 3600; break;
+      default: f = .5f;
+    }
+    pv[p.id] = p.mn + (p.mx - p.mn) * f; page[p.id] = t; psup[p.id] = true;
+  }
+  pv[0x0C] = rpm; pv[0x0D] = spd; pv[0x44] = 1.0f + 0.03f * sinf(simT * 3); pv[0x24] = pv[0x44]; pv[0x5C] = 35 + 57 * w;
+  pv[0x51] = 1; psup[0x5B] = false; psup[0x78] = false; psup[0x59] = false;
+  pv[0x42] = 13.9f + 0.4f * sinf(simT * 0.7f);
+  pv[0x23] = (32.0f + 88.0f * fminf(rpm / 4500.0f, 1.0f) * (.45f + .55f * fminf(1.0f, q + .25f)) + 6.0f * sinf(simT * 5)) * 1000.0f;       // rail pressure (kPa): ~35 MPa idle, up to ~125 MPa
+  pv[0xF1] = 1.6f + 5.4f * q + 0.3f * sinf(simT * 4); page[0xF1] = t; psup[0xF1] = true;                                                   // injector pulse (the K-line tile)
+}
 static float crpMn = 1e9f, crpMx = -1e9f;             // lowest / highest rail pressure (MPa) seen since the CRP page was opened or reset
 
 // =====================================================================================
@@ -1994,6 +2025,7 @@ static Peaks pkD, pkA; static bool pkAllMode = false; static uint32_t pkSaved = 
 static void peaksClear(Peaks& p) { memset(&p, 0, sizeof p); p.minB = 99; }
 static bool upd(float& dst, uint32_t& tdst, float v, bool hi, uint32_t t) { if (hi ? v > dst : v < dst) { dst = v; tdst = t; return true; } return false; }
 static void peaksStep() {
+  Peaks keepA; bool dm = demoMode; if (dm) keepA = pkA;                  // DEMO: this drive's peaks move, the all-time records (saved) do not
   bool ok; uint32_t t = (millis() - driveStart) / 1000; bool ch = false;
   float v = getVal(0x0C, ok); if (ok) { ch |= upd(pkD.rpm, pkD.tr, v, true, t); ch |= upd(pkA.rpm, pkA.tr, v, true, t); }
   v = getVal(0x0D, ok);
@@ -2018,6 +2050,7 @@ static void peaksStep() {
     if (orp && rp > 500) ch |= upd(pkD.minB, pkD.tmin, v, false, t), ch |= upd(pkA.minB, pkA.tmin, v, false, t);
     ch |= upd(pkD.maxB, pkD.tmax, v, true, t); ch |= upd(pkA.maxB, pkA.tmax, v, true, t);
   }
+  if (dm) { pkA = keepA; return; }
   if (ch) pkDirty = true;
 }
 
@@ -2156,7 +2189,7 @@ static void carName(char* d, size_t n) {
   if (em >= 0) {
     const Model& m = MODELS[em]; const char* br = m.brand == 6 ? "HONDA" : BRANDS[m.brand];     // the bike tile is named HONDA BIKE, the car name just HONDA
     if (!strncmp(m.name, br, strlen(br))) snprintf(d, n, "%s", m.name); else snprintf(d, n, "%s %s", br, m.name);
-  } else if (demoMode) snprintf(d, n, "MAZDA 2");
+  } else if (demoMode && linkMode != 1) snprintf(d, n, "MAZDA 2");
   else if (linkMode == 1) snprintf(d, n, "HONDA BIKE");                 // K-line link, no model picked
   else snprintf(d, n, "%s", carBuf);
 }
@@ -2241,7 +2274,8 @@ static void topBar(float rpm) {
   uint16_t dc = linkOk ? T.good : T.warn;
   discA(14, 13, 4.6f, dc, 41); discA(14, 13, 3.6f, dc, 71); disc(14, 13, 2.5f, dc);
   StrId sid = linkState == 2 ? S_CONNECTED : linkState == 1 ? S_CONNECTING : S_SELDEV;
-  if (linkState == 2) txt(F_LM, linkMode == 1 ? "K-LINE" : selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
+  if (demoMode) txt(F_LM, "DEMO", 22, 16, T.warn);                                    // the simulated car: amber, so it is never taken for the real one
+  else if (linkState == 2) txt(F_LM, linkMode == 1 ? "K-LINE" : selBle ? "OBD BLE" : "OBD BT", 22, 16, T.dim);
   else lab(sid, LB_SM, 22, thai ? 17 : 16, T.dim);
   const char* pn = linkState == 2 ? (linkMode == 1 ? "HONDA" : protoName(protoNum)) : "";
   const char* rt = pn[0] ? pn : linkState != 2 ? FW_VERSION : "";               // right side: the bus / protocol, or the firmware version while there is no link
@@ -3296,11 +3330,11 @@ static void tapSetup(int x, int y, bool first) {
 }
 
 // ---------- more settings (setup 2) ----------
-static const int S2_Y0 = 32, S2_H = 29;
+static const int S2_Y0 = 32, S2_H = 27, S2_CY0 = 197, S2_CY1 = 218, S2_CH = 19;
 static uint32_t uprotoAt = 0;
-struct S2Chip { StrId id; int x, w; };
-static const S2Chip S2C_K[3] = {{S_TESTALERT, 9, 96}, {S_RESETPK, 112, 96}, {S_COLORFUL, 215, 96}};                              // K-line mode: no CRP sensor
-static const S2Chip S2C_C[4] = {{S_TESTALERT, 9, 73}, {S_RESETPK, 85, 73}, {S_CRPCAL, 161, 73}, {S_COLORFUL, 237, 73}};         // car mode
+struct S2Chip { StrId id; int x, y, w; };
+static const S2Chip S2C_K[4] = {{S_TESTALERT, 9, S2_CY0, 148}, {S_RESETPK, 163, S2_CY0, 148}, {S_COLORFUL, 9, S2_CY1, 148}, {S_DEMO, 163, S2_CY1, 148}};     // K-line mode: no CRP sensor
+static const S2Chip S2C_C[5] = {{S_TESTALERT, 9, S2_CY0, 96}, {S_RESETPK, 112, S2_CY0, 96}, {S_CRPCAL, 215, S2_CY0, 96}, {S_COLORFUL, 9, S2_CY1, 148}, {S_DEMO, 163, S2_CY1, 148}};   // car mode
 static void setup2Row(int i) {
   int y = S2_Y0 + i * S2_H, h = S2_H; char b[16];
   switch (i) {
@@ -3321,17 +3355,28 @@ static void drawSetup2() {
   subHeader(S_SETUP2, S_COUNT, false);
   chipS("BLE", 247, 4, 64, 20, appBleOn);                              // the phone link over Bluetooth LE (Jet Honda APP) on / off
   for (int i = 0; i < 6; i++) setup2Row(i);
-  const S2Chip* cs = linkMode == 1 ? S2C_K : S2C_C; int ncs = linkMode == 1 ? 3 : 4;
-  for (int i = 0; i < ncs; i++) chipId(cs[i].id, cs[i].x, 210, cs[i].w, 22, cs[i].id == S_COLORFUL && colorful);
+  const S2Chip* cs = linkMode == 1 ? S2C_K : S2C_C; int ncs = linkMode == 1 ? 4 : 5;
+  for (int i = 0; i < ncs; i++) chipId(cs[i].id, cs[i].x, cs[i].y, cs[i].w, S2_CH, (cs[i].id == S_COLORFUL && colorful) || (cs[i].id == S_DEMO && demoMode));
+}
+static void demoSet(bool on) {                                       // SETUP 2: the simulated car on / off. The trip, the log, the graph and this drive's peaks start clean both ways
+  if (on == demoMode) return;
+  demoMode = on; simT = 0;
+  carBuf[0] = 0; vinBuf[0] = 0; ecuName[0] = 0; calId[0] = 0; memset(psup, 0, sizeof psup); engineRan = false;
+  mil = false; dtcCount = 0; codeCount = 0; codeState = 0; frzState = 0; monValid = false; demoCleared = false; clearArmed = false; ecuInfoVer = ecuInfoVer + 1; codeVer = codeVer + 1; frzVer = frzVer + 1;
+  tripReset(); peaksClear(pkD); logClear(); gCnt[0] = gCnt[1] = 0; gAcc15 = 0; gPush[0] = gPush[0] + 1; gPush[1] = gPush[1] + 1;
+  if (on) linkState = 0;
+  else { linkState = (linkMode == 1 || selAddr[0]) ? 1 : 3; scanStop = true; reconnectReq = true; }      // back to the real car: the link is made again
+  autoSlots(); updateWants(); redraw = true;
 }
 static void startTestAlert();
 static void tapSetup2(int x, int y, bool first) {
   if (first) {
     if (hitBack(x, y)) { savePrefs(); nav(PG_SETUP); return; }
     if (hit(x, y, 247, 4, 64, 20)) { appBleOn = !appBleOn; saveSoon(); return; }
-    const S2Chip* cs = linkMode == 1 ? S2C_K : S2C_C; int ncs = linkMode == 1 ? 3 : 4;
-    for (int i = 0; i < ncs; i++) if (hit(x, y, cs[i].x, 210, cs[i].w, 22)) {
-      if (cs[i].id == S_TESTALERT) startTestAlert();
+    const S2Chip* cs = linkMode == 1 ? S2C_K : S2C_C; int ncs = linkMode == 1 ? 4 : 5;
+    for (int i = 0; i < ncs; i++) if (hit(x, y, cs[i].x, cs[i].y, cs[i].w, S2_CH)) {
+      if (cs[i].id == S_DEMO) demoSet(!demoMode);
+      else if (cs[i].id == S_TESTALERT) startTestAlert();
       else if (cs[i].id == S_RESETPK) { peaksClear(pkA); peaksClear(pkD); pkDirty = true; savePrefs(); }
       else if (cs[i].id == S_CRPCAL) nav(PG_CRP);
       else { colorful = !colorful; saveSoon(); }
@@ -3500,7 +3545,7 @@ static void drawKline() {
   halo(9, 32, 302, 26, 9, T.acc, 2);
   rr(9, 32, 302, 26, 9, T.panel2, T.acc);
   txt(F_UM, "HONDA K-LINE  10400", 19, 49, T.text);
-  lab(up ? S_CONNECTED : S_CONNECTING, LB_TILE, 303, tby(48), up ? T.good : T.warn, AL_R);
+  lab(demoMode ? S_DEMO : up ? S_CONNECTED : S_CONNECTING, LB_TILE, 303, tby(48), demoMode ? T.warn : up ? T.good : T.warn, AL_R);
   tile(9, 64, 302, 54);
   lab(S_KLTABLE, LB_TILE, 18, tby(77), T.dim);
   snprintf(b, sizeof b, "%u/s", (unsigned)klRate); txt(F_UM, up ? b : "--", 303, 78, T.text, AL_R);
@@ -3523,7 +3568,7 @@ static void drawKline() {
   lab(S_KLECU, LB_TILE, 18, tby(197), T.dim);
   if (klIdN) { uint8_t id[10]; memcpy(id, klId, sizeof id); hexBytes(b, sizeof b, id, klIdN > 8 ? 8 : klIdN); txt(F_UM, b, 303, 198, T.text, AL_R); } else txt(F_UM, "--", 303, 198, T.dim, AL_R);
   StrId st = S_KLWAIT; uint16_t col = T.dim;
-  if (mfbActive()) { st = S_APPLINK; col = T.accL; } else if (klSt == 2 && klRate > 0) { st = S_KLOKMSG; col = T.good; } else if (klSt == 3) { st = S_KLNONE; col = T.warn; }
+  if (demoMode) { st = S_DEMO; col = T.warn; } else if (mfbActive()) { st = S_APPLINK; col = T.accL; } else if (klSt == 2 && klRate > 0) { st = S_KLOKMSG; col = T.good; } else if (klSt == 3) { st = S_KLNONE; col = T.warn; }
   tile(9, 210, 302, 26, 8);
   lab(st, LB_ROW, 160, thai ? 227 : 226, col, AL_C, 290);
 }
@@ -4475,6 +4520,7 @@ void loop() {
   static uint32_t tSim = 0, tUI = 0, tGraph = 0; static int lastLs = -1;
   if (now - tSim >= 100) {
     float dt = (now - tSim) / 1000.0f; tSim = now;
+    if (demoMode) simStep(dt);
     tripStep(dt); peaksStep(); logStep(); alertsStep(); parkStep(now);
     if (linkState != lastLs) { lastLs = linkState; if (linkState == 2 && !slotsCustom) autoSlots(); }
     if (scr == PG_SPLASH && now - splashAt > splashMs()) { if (firstRun) savePrefs(); nav(PG_DASH); }
