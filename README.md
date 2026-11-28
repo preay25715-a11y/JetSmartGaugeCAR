@@ -308,7 +308,7 @@ function decodeLog(p) {                                      // ชนิด 0 =
 3. แฟลชที่ https://espressif.github.io/esptool-js/ → Connect → Flash Address `0x0` → เลือกไฟล์ `smart-gauge-…-full.bin` → Program
 
 ## ออกเวอร์ชันใหม่ให้ลูกค้า (สำหรับเจ้าของ)
-1. แก้เลขเวอร์ชันใน `main.cpp` บรรทัด `#define FW_VERSION "v1.0.19"` (เช่น `v1.0.20`) พร้อมแก้โค้ดที่ต้องการ แล้ว Commit
+1. แก้เลขเวอร์ชันใน `main.cpp` บรรทัด `#define FW_VERSION "v1.0.19"` (รุ่นถัดไปคือ **`v1.2.0`**) พร้อมแก้โค้ดที่ต้องการ แล้ว Commit
 2. ออก Release ได้ 2 วิธี (เลือกอย่างใดอย่างหนึ่ง):
    - ใส่คำว่า `[release]` ในข้อความ commit บน main → Actions บิลด์แล้วสร้างแท็กและ Release ให้เองตามเลขใน FW_VERSION (ถ้าบิลด์ไม่ผ่านจะไม่ออก Release)
    - หรือ GitHub → **Releases → Draft a new release** → ช่อง *Choose a tag* พิมพ์ `v1.0.16` (ต้องตรงกับ FW_VERSION เป๊ะ) → **Create new tag** → **Publish release**
