@@ -2433,10 +2433,10 @@ enum StrId : uint16_t {
 static const char* const EN[S_COUNT] = {
   "Dash",
   "Main",
-  "Data",
+  "Grid",
   "Graph",
   "Trip",
-  "Codes",
+  "DTC",
   "Setup",
   "Setup 2",
   "Engine",

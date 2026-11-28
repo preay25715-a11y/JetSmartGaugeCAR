@@ -49,7 +49,7 @@ struct BLEDevice { static void init(const char*) {} static BLEClient* createClie
 #include <string>
 #include "ui_assets.h"
 
-#define FW_VERSION "v1.0.18"
+#define FW_VERSION "v1.0.19"
 
 TFT_eSPI tft;
 SPIClass tsSPI(VSPI);
@@ -1920,10 +1920,11 @@ static const Met MET[] = {
   {S_HVBATT, "%", 0, NOW_, NOW_, 20, 0x5B, 1, 0, 100},       {S_CATT, DEGC, 0, 850, 950, -NOW_, 0x3C, 1, 0, 900},
   {S_BARO, "kPa", 0, NOW_, NOW_, -NOW_, 0x33, 1, 80, 110},   {S_LAMBDA, "", 2, NOW_, NOW_, -NOW_, M_LAMBDA, 1, 0.6f, 1.4f},
   {S_RUNTIME, "min", 0, NOW_, NOW_, -NOW_, 0x1F, 1.0f / 60, 0, 60}, {S_CRPV, "V", 2, NOW_, NOW_, -NOW_, M_CRP, 1, 0, 5},
+  {S_INJ, "ms", 2, NOW_, NOW_, -NOW_, 0xF1, 1, 0, 20},        // K-line: the injector pulse (a Dash tile, as on the app)
 };
 static const int NMET = sizeof(MET) / sizeof(MET[0]);
 enum { MI_COOL = 0, MI_OIL, MI_INTAKE, MI_BATT, MI_AFR, MI_LOAD, MI_THR, MI_MAP, MI_BOOST, MI_MAF, MI_TIMING, MI_STFT, MI_LTFT, MI_FUEL, MI_RPM, MI_SPEED,
-       MI_EGT, MI_AMB, MI_RAIL, MI_PEDAL, MI_TORQ, MI_FRATE, MI_HV, MI_CAT, MI_BARO, MI_LAMBDA, MI_RUNT, MI_CRP };
+       MI_EGT, MI_AMB, MI_RAIL, MI_PEDAL, MI_TORQ, MI_FRATE, MI_HV, MI_CAT, MI_BARO, MI_LAMBDA, MI_RUNT, MI_CRP, MI_INJ };
 static bool metSupported(int i) {
   int s = MET[i].src;
   if (s == M_CRP) return crpHave();
@@ -1950,7 +1951,7 @@ static int firstSupported(const int* cand, int n, int fallback) {
 }
 static void autoSlots() {                                       // default tiles for this car (until the user picks tiles themselves)
   if (slotsCustom) return;
-  if (linkMode == 1) { slots[0] = MI_COOL; slots[1] = MI_THR; slots[2] = MI_TIMING; slots[3] = MI_INTAKE; slots[4] = MI_BATT; slots[5] = MI_MAP; return; }     // the Honda K-line readings, nothing to guess
+  if (linkMode == 1) { slots[0] = MI_COOL; slots[1] = MI_INTAKE; slots[2] = MI_MAP; slots[3] = MI_BATT; slots[4] = MI_INJ; slots[5] = MI_TIMING; return; }     // the Honda K-line readings, nothing to guess
   for (int i = 0; i < 6; i++) slots[i] = 255;
   bool d = vehDiesel();
   static const int C0[] = {MI_COOL}, C1[] = {MI_OIL, MI_THR, MI_MAP}, C2[] = {MI_LOAD, MI_THR, MI_PEDAL, MI_TIMING}, C3[] = {MI_INTAKE, MI_AMB},
@@ -2163,7 +2164,7 @@ static void updateWants() {
   markSrc(M_CRP, 1);                                   // rail pressure: asked slowly in the background so the CRP log keeps filling
   markWant(0x0C, 2); markWant(0x0D, 2);
   markWant(0x5E, 2); markWant(0x10, 2); markWant(0x24, 2); markWant(0x44, 2);      // fuel rate / air flow / lambda feed the trip and consumption figures all the time
-  if (scr == PG_DASH) { for (int i = 0; i < 6; i++) markSrc(MET[slots[i]].src, 2); if (dashMain != 2) markSrc(M_CRP, 2); }
+  if (scr == PG_DASH) { for (int i = 0; i < 6; i++) markSrc(MET[slots[i]].src, 2); markWant(0x11, 2); if (dashMain == 1) markSrc(M_CRP, 2); }      // (the throttle bar under the dial; CRP volts only when they are in the centre)
   else if (scr == PG_DATA) { for (int i = 0; i < 16; i++) { DTile t; dtileOf(i, t); markSrc(t.src, 2); } }
   else if (scr == PG_ALL) {
     for (int i = 0; i < NPID; i++) markWant(PIDS[i].id, 1);
@@ -2314,17 +2315,14 @@ static void dtile(int i) {
   valueFit(b, m.unit, x + 8, y + 30, col, AL_L, 67);
 }
 static const int RCX = 160, RCY = 97, RR = 53;
-static void ringDraw(float rpm) {                                 // tacho: track, glow, gradient arc with round caps, inner disc (per pixel, no angle maths)
+static const int RSEG = 48;                                                         // the tacho is 48 segments with thin gaps, as on the Jet Smart Gauge app (v1.6.12)
+static void ringDraw(float rpm) {                                                   // tacho: inner disc, then the segments (per pixel: one atan2 for each pixel of the ring)
   float frac = clampf(rpm / (ringMaxK() * 1000.0f), 0, 1); bool over = rpm >= shiftRpm;
-  uint16_t glow = colorful ? (over ? RPM_RED : rpmCol(rpm / (float)shiftRpm)) : (over ? T.hot : T.acc);
-  const float rq = ringMaxK() * 1000.0f / (float)shiftRpm;                          // rpm per shift rpm at the end of the full sweep (colour of the arc)
-  const float PI_ = 3.14159265f, s2 = 0.70710678f;
-  float S = 1.5f * PI_ * frac + 0.0001f, ae = 0.75f * PI_ + S;
-  float u0x = -s2, u0y = s2, uex = cosf(ae), uey = sinf(ae);
-  float e0x = RR * u0x, e0y = RR * u0y, e1x = RR * uex, e1y = RR * uey;           // ends of the lit arc (relative to the centre)
-  float t0x = -RR * s2, t0y = RR * s2, t1x = RR * s2, t1y = RR * s2;               // ends of the track
-  static const float GW[4] = {7.5f, 6.0f, 4.5f, 3.5f};                               // half widths of the glow strokes
-  static const uint8_t GA[4] = {13, 18, 26, 36};                                     // alphas .05 .07 .10 .14
+  int nLit = (int)lroundf(frac * RSEG);                                             // whole segments, as on the app
+  const float rq = ringMaxK() * 1000.0f / (float)shiftRpm;                          // rpm per shift rpm at the end of the full sweep (colour of the segments)
+  const float PI_ = 3.14159265f, SEGW = 1.5f * PI_ / RSEG;
+  uint16_t sc[RSEG];                                                                // lit colour of every segment: green ... red at the shift point (colourful), or the accent (hot over the shift point)
+  for (int i = 0; i < RSEG; i++) sc[i] = colorful ? rpmCol((i + 0.5f) / RSEG * rq) : (over ? T.hot : mixRgb(TA.accD, TA.accL, i * 256 / (RSEG - 1)));
   int ya = max(RCY - 62, bandY0), yb = min(RCY + 62, bandY1 - 1);
   for (int py = ya; py <= yb; py++) {
     uint16_t* row = rowPtr(py); int dy = py - RCY;
@@ -2339,32 +2337,19 @@ static void ringDraw(float rpm) {                                 // tacho: trac
         float c2 = clampf(1.0f - fabsf(d - 42.5f), 0, 1); if (c2 > 0.004f) *p = blendA(*p, T.discLine, (uint32_t)(c2 * 255 + 0.5f));
         continue;
       }
-      float ro = fabsf(d - RR), fx = (float)dx, fy = (float)dy;
-      // track (full sweep, round caps)
-      bool inT = !(dy > abs(dx)); float dT = ro;
-      if (!inT) { float a = (fx - t0x) * (fx - t0x) + (fy - t0y) * (fy - t0y), b = (fx - t1x) * (fx - t1x) + (fy - t1y) * (fy - t1y); dT = sqrtf(a < b ? a : b); }
-      float cT = clampf(2.5f - dT + 0.5f, 0, 1);
-      if (cT > 0.004f) *p = blendA(*p, T.track, (uint32_t)(cT * 255 + 0.5f));
-      // lit arc
-      float c0 = u0x * fy - u0y * fx, ce = fx * uey - fy * uex;
-      bool inL = S <= PI_ ? (c0 >= 0 && ce >= 0) : (c0 >= 0 || ce >= 0); float dL = ro;
-      if (!inL) { float a = (fx - e0x) * (fx - e0x) + (fy - e0y) * (fy - e0y), b = (fx - e1x) * (fx - e1x) + (fy - e1y) * (fy - e1y); float m = a < b ? a : b; dL = m > 72.25f ? 99.0f : sqrtf(m); }
-      if (dL > 8.0f) continue;
-      for (int k = 0; k < 4; k++) { float cv = clampf(GW[k] - dL + 0.5f, 0, 1); if (cv > 0.004f) *p = blendA(*p, glow, (uint32_t)(GA[k] * cv + 0.5f)); }
-      float c5 = clampf(2.5f - dL + 0.5f, 0, 1);
-      if (c5 > 0.004f) {
-        uint16_t lc;
-        if (colorful) {                                                                // the colour follows the rpm it stands for: green ... red at the shift point
-          float sw = fastAtan2((float)dy, (float)dx) - 0.75f * PI_; if (sw < 0) sw += 2 * PI_;
-          float sf = sw > 1.75f * PI_ ? 0.0f : fminf(sw / (1.5f * PI_), 1.0f);
-          lc = rpmCol(sf * rq);
-        } else lc = over ? T.hot : mixRgb(TA.accD, TA.accL, clampi((px - py + 43) * 256 / 212, 0, 256));
-        *p = blendA(*p, lc, (uint32_t)(c5 * 255 + 0.5f));
-      }
+      float cv = clampf(3.5f - fabsf(d - RR) + 0.5f, 0, 1);                         // the ring is 7 px wide
+      if (cv < 0.004f) continue;
+      float sw = fastAtan2((float)dy, (float)dx) - 0.75f * PI_; if (sw < 0) sw += 2 * PI_;
+      if (sw >= 1.5f * PI_) continue;                                               // the open part at the bottom
+      int si = (int)(sw / SEGW); if (si >= RSEG) si = RSEG - 1;
+      float loc = sw - si * SEGW, ed = fminf(loc, SEGW - loc) * RR;                 // px from the nearest edge of the segment
+      cv *= clampf(ed - 0.35f + 0.5f, 0, 1);                                        // a gap of about 0.7 px between the segments, and a clean cut at both ends
+      if (cv < 0.004f) continue;
+      *p = blendA(*p, si < nLit ? sc[si] : T.track, (uint32_t)(cv * 255 + 0.5f));
     }
   }
 }
-// dash centre + bottom bar show one of three values: 0 speed, 1 CRP volts, 2 AFR (a tap on the ring or the bar steps to the next)
+// dash centre shows one of three values: 0 speed, 1 CRP volts (K-line mode: trip km), 2 AFR (a tap on the ring steps to the next)
 static int dashN() { return linkMode == 1 ? 2 : 3; }
 static void dashOf(int m, char* t, size_t n, const char*& unit, float& frac, StrId& lid) {
   if (m == 1 && linkMode == 1) { fmtv(t, n, tDist, 1); unit = "km"; frac = fmodf(tDist, 10.0f) / 10.0f; lid = S_DIST; }      // K-line mode: trip distance
@@ -2379,24 +2364,25 @@ static void drawDash() {
   ringDraw(rpm);
   char b[16]; fmtThou(b, sizeof b, (int)rpm);
   txtVU(F_NS, b, F_LS, "rpm", RCX, 76, T.accL, T.accL, AL_C);
-  char ct[12], bt[12]; const char *cu, *bu; float cf, bf; StrId cl, lid;
-  dashOf(dashMain, ct, sizeof ct, cu, cf, cl); dashOf((dashMain + 1) % dashN(), bt, sizeof bt, bu, bf, lid);   // centre value, and the one a tap brings next
+  char ct[12]; const char* cu; float cf; StrId cl;
+  dashOf(dashMain, ct, sizeof ct, cu, cf, cl);                                      // centre value
   if (dashMain == 0) { txt(F_NXL, ct, RCX, 115, T.text, AL_C); txt(F_LS, "km/h", RCX, 131, T.dim, AL_C); }
   else { txt(F_NXM, ct, RCX, 111, T.accL, AL_C); txt(F_LS, dashMain == 1 ? (linkMode == 1 ? "trip km" : "CRP volts") : "AFR", RCX, 131, T.dim, AL_C); }
-  tile(9, 168, 302, 29);
-  int lw = labW(lid, LB_TILE), vx = max(67, 18 + lw + 8);
-  lab(lid, LB_TILE, 18, thai ? 188 : 185, T.dim);
-  txtVU(F_NL, bt, F_LS, bu, vx, 188, T.text, T.dim, AL_L);
-  int bx = max(122, vx + textW(F_NL, bt) + 2 + textW(F_LS, bu) + 10), bl = 302 - bx;
+  tile(9, 168, 302, 29);                                                            // Throttle: label, value in %, bar (the same strip as under the dial on the app)
+  bool tok; float tp = metricVal(0x11, tok); char tb[12]; if (tok) fmtv(tb, sizeof tb, clampf(tp, 0, 100), 1); else strcpy(tb, "--");
+  int lw = labW(S_THR, LB_TILE), vx = max(67, 18 + lw + 8);
+  lab(S_THR, LB_TILE, 18, thai ? 188 : 185, T.dim);
+  txtVU(F_NL, tb, F_LS, "%", vx, 188, T.text, T.dim, AL_L);
+  int bx = max(122, vx + textW(F_NL, tb) + 2 + textW(F_LS, "%") + 10), bl = 302 - bx;
   rr(bx, 181, bl, 3, 1, T.dark);
-  int bw = (int)lroundf(bl * clampf(bf, 0, 1)); if (bw >= 2) rr(bx, 181, bw, 3, 1, T.acc);
+  int bw = tok ? (int)lroundf(bl * clampf(tp / 100.0f, 0, 1)) : 0; if (bw >= 2) rr(bx, 181, bw, 3, 1, T.acc);
   tabBar(0);
 }
 static void tapDash(int x, int y, bool first) {
   if (!first) return;
   if (tabTap(x, y, PG_DASH)) return;
   for (int i = 0; i < 6; i++) if (hit(x, y, DT_X[i], DT_Y[i], 83, 38)) { slots[i] = (uint8_t)nextMetric(slots[i], i); slotsCustom = true; updateWants(); saveSoon(); return; }
-  if (hit(x, y, 94, 34, 132, 132) || hit(x, y, 9, 168, 302, 29)) { dashMain = (uint8_t)((dashMain + 1) % dashN()); updateWants(); saveSoon(); }
+  if (hit(x, y, 94, 34, 132, 132)) { dashMain = (uint8_t)((dashMain + 1) % dashN()); updateWants(); saveSoon(); }
 }
 
 // ---------- data grid ----------
